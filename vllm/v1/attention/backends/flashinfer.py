@@ -1384,7 +1384,7 @@ class FlashInferImpl(AttentionImpl):
         """
         if attn_metadata is None:
             # Profiling run.
-            return output.fill_(0)
+            return output.zero_()
 
         # Ensure query dtype matches the expected dtype from attention metadata
         assert attn_metadata.q_data_type == query.dtype, (

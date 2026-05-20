@@ -1933,7 +1933,8 @@ class GPUModelRunner(
             torch.from_numpy(num_scheduled_tokens),
             out=self.optimistic_seq_lens_cpu[:num_reqs],
         )
-        self.optimistic_seq_lens_cpu[num_reqs:].fill_(0)
+        if num_reqs < self.optimistic_seq_lens_cpu.shape[0]:
+            self.optimistic_seq_lens_cpu[num_reqs:].zero_()
 
         # Build prev_positions mapping: current pos -> prev pos (-1 if new).
         # Used for gathering from previous iteration's GPU tensors.
@@ -2021,7 +2022,8 @@ class GPUModelRunner(
         self.seq_lens[:num_reqs] = (
             self.num_computed_tokens[:num_reqs] + num_scheduled_tokens_gpu
         )
-        self.seq_lens[num_reqs:].fill_(0)
+        if num_reqs < self.seq_lens.shape[0]:
+            self.seq_lens[num_reqs:].zero_()
 
         self.input_batch.block_table.compute_slot_mapping(
             num_reqs,
@@ -2223,7 +2225,8 @@ class GPUModelRunner(
                 self.dcp_rank,
                 self.parallel_config.cp_kv_cache_interleave_size,
             )
-            self.dcp_local_seq_lens.cpu[num_reqs:].fill_(0)
+            if num_reqs < self.dcp_local_seq_lens.cpu.shape[0]:
+                self.dcp_local_seq_lens.cpu[num_reqs:].zero_()
             self.dcp_local_seq_lens.copy_to_gpu(num_reqs_padded)
 
             cm_base.dcp_local_seq_lens = self.dcp_local_seq_lens.gpu[:num_reqs_padded]
@@ -5265,7 +5268,7 @@ class GPUModelRunner(
             logger.debug_once("Randomizing dummy input_ids for DP Rank")
             input_ids.copy_(rand_input_ids()[: input_ids.size(0)], non_blocking=True)
             yield
-            input_ids.fill_(0)
+            input_ids.zero_()
         else:
 
             @functools.cache
@@ -5280,7 +5283,7 @@ class GPUModelRunner(
                 rand_inputs_embeds()[: inputs_embeds.size(0)], non_blocking=True
             )
             yield
-            inputs_embeds.fill_(0)
+            inputs_embeds.zero_()
 
     def _get_mm_dummy_batch(
         self,
@@ -5502,7 +5505,8 @@ class GPUModelRunner(
                 else:
                     seq_lens = max_query_len  # type: ignore[assignment]
                 self.optimistic_seq_lens_cpu[:num_reqs] = seq_lens
-                self.optimistic_seq_lens_cpu[num_reqs:].fill_(0)
+                if num_reqs < self.optimistic_seq_lens_cpu.shape[0]:
+                    self.optimistic_seq_lens_cpu[num_reqs:].zero_()
                 self.seq_lens.copy_(self.optimistic_seq_lens_cpu, non_blocking=True)
 
                 cum_num_tokens = self._get_cumsum_and_arange(
