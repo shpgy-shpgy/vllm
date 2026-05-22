@@ -726,7 +726,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_USE_FLASHINFER_SAMPLER": lambda: (
         bool(int(os.environ["VLLM_USE_FLASHINFER_SAMPLER"]))
         if "VLLM_USE_FLASHINFER_SAMPLER" in os.environ
-        else True
+        else False
     ),
     # Pipeline stage partition strategy
     "VLLM_PP_LAYER_PARTITION": lambda: os.getenv("VLLM_PP_LAYER_PARTITION", None),
