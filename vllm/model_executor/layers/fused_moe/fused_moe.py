@@ -54,7 +54,6 @@ from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
 
-
 @triton.jit
 def _moe_sum_kernel(
     input_ptr,
@@ -244,7 +243,10 @@ def fused_moe_kernel_gptq_awq(
         )
         return
 
-    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
+    if EVEN_N:
+        offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
+    else:
+        offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     a_ptrs = a_ptr + (
         offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
@@ -397,12 +399,16 @@ def fused_moe_kernel(
     group_n: tl.constexpr,
     group_k: tl.constexpr,
     naive_block_assignment: tl.constexpr,
+    HAS_INVALID_EXPERTS: tl.constexpr,
     # Meta-parameters
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
     SPLIT_K: tl.constexpr,
+    EVEN_N: tl.constexpr,
+    EVEN_K: tl.constexpr,
+    SCALAR_B_SCALE_N: tl.constexpr,
     MUL_ROUTED_WEIGHT: tl.constexpr,
     top_k: tl.constexpr,
     compute_type: tl.constexpr,
@@ -480,7 +486,7 @@ def fused_moe_kernel(
     token_mask = offs_token < num_valid_tokens
 
     off_experts = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
-    if off_experts == -1:
+    if HAS_INVALID_EXPERTS and off_experts == -1:
         # -----------------------------------------------------------
         # Write back zeros to the output when the expert is not
         # in the current expert parallel rank.
@@ -498,7 +504,10 @@ def fused_moe_kernel(
         )
         return
 
-    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
+    if EVEN_N:
+        offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
+    else:
+        offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     a_ptrs = a_ptr + (
         offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
@@ -519,10 +528,16 @@ def fused_moe_kernel(
         # block-wise
         if group_k > 0 and group_n > 0:
             a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
-            offs_bsn = offs_bn // group_n
-            b_scale_ptrs = (
-                b_scale_ptr + off_experts * stride_bse + offs_bsn * stride_bsn
-            )
+            if SCALAR_B_SCALE_N:
+                bsn = (pid_n * BLOCK_SIZE_N) // group_n
+                b_scale_ptrs = (
+                    b_scale_ptr + off_experts * stride_bse + bsn * stride_bsn
+                )
+            else:
+                offs_bsn = offs_bn // group_n
+                b_scale_ptrs = (
+                    b_scale_ptr + off_experts * stride_bse + offs_bsn * stride_bsn
+                )
         # channel-wise
         elif per_channel_quant:
             b_scale_ptrs = (
@@ -549,12 +564,17 @@ def fused_moe_kernel(
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         # Load the next block of A and B, generate a mask by checking the
         # K dimension.
-        a = tl.load(
-            a_ptrs,
-            mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
-            other=0.0,
-        )
-        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+        if EVEN_K:
+            a = tl.load(a_ptrs, mask=token_mask[:, None], other=0.0)
+            b = tl.load(b_ptrs)
+        else:
+            k_remaining = K - k * BLOCK_SIZE_K
+            a = tl.load(
+                a_ptrs,
+                mask=token_mask[:, None] & (offs_k[None, :] < k_remaining),
+                other=0.0,
+            )
+            b = tl.load(b_ptrs, mask=offs_k[:, None] < k_remaining, other=0.0)
         # We accumulate along the K dimension.
         if use_int8_w8a16:
             accumulator = tl.dot(a, b.to(compute_type), acc=accumulator)
@@ -567,7 +587,10 @@ def fused_moe_kernel(
                 )
                 b_scale = tl.load(b_scale_ptrs + offs_ks * stride_bsk)
 
-                accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
+                if SCALAR_B_SCALE_N:
+                    accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale
+                else:
+                    accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
             else:
                 if use_fp8_w8a8:
                     # acc used to enable fp8_fast_accum
@@ -617,7 +640,10 @@ def fused_moe_kernel(
     # Write back the block of the output
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
-    c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
+    if EVEN_N:
+        c_mask = token_mask[:, None]
+    else:
+        c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
     tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
@@ -876,8 +902,18 @@ def invoke_fused_moe_triton_kernel(
         use_int8_w8a16=use_int8_w8a16,
         per_channel_quant=per_channel_quant,
         naive_block_assignment=(sorted_token_ids is None),
+        HAS_INVALID_EXPERTS=False,
         HAS_BIAS=HAS_BIAS,
         BLOCK_SIZE_K=BLOCK_SIZE_K,
+        EVEN_N=(B.size(1) % config["BLOCK_SIZE_N"]) == 0,
+        EVEN_K=(B.size(2) % BLOCK_SIZE_K) == 0,
+        SCALAR_B_SCALE_N=(
+            block_shape is not None
+            and block_shape[0] > 0
+            and num_tokens <= 128
+            and config["BLOCK_SIZE_N"] <= block_shape[0]
+            and block_shape[0] % config["BLOCK_SIZE_N"] == 0
+        ),
         **config,
     )
 
@@ -1619,7 +1655,10 @@ def _prepare_expert_assignment(
     # path of the fused_moe_kernel kernel
     naive_block_assignment = (
         expert_map is None
-        and num_tokens * top_k_num * 4 <= global_num_experts
+        and (
+            num_tokens <= 16
+            or num_tokens * top_k_num * 4 <= global_num_experts
+        )
         and not (
             (use_int8_w8a16 or use_int4_w4a16)
             and block_shape is not None
@@ -1811,7 +1850,6 @@ def fused_experts_impl(
     )
 
     config = get_config_func(M)
-
     # We can reuse the memory between these because by the time we need
     # cache3, we're done with cache1
     cache13 = torch.empty(
