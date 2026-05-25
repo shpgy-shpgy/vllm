@@ -653,7 +653,7 @@ void topkGatingKernelLauncher(
     const bool renormalize,
     const float* bias,
     cudaStream_t stream) {
-    static constexpr int WARPS_PER_TB = 4;
+    static constexpr int WARPS_PER_TB = 8;
     static constexpr int BYTES_PER_LDG_POWER_OF_2 = 16;
 #ifndef USE_ROCM
     // for bfloat16 dtype, we need 4 bytes loading to make sure num_experts
