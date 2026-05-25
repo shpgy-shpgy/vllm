@@ -99,11 +99,17 @@ class SharedExperts:
         if self._quant_method.mk_owns_shared_expert:
             return SharedExpertsOrder.MK_INTERNAL_OVERLAPPED
 
+        token_threshold = envs.VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD
+        if (
+            current_platform.is_cuda()
+            and current_platform.get_device_capability()[0] >= 10
+        ):
+            token_threshold = max(token_threshold, 4096)
+
         should_run_shared_in_aux_stream = (
             current_platform.is_cuda()
             and self._stream is not None
-            and hidden_states.shape[0]
-            <= envs.VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD
+            and hidden_states.shape[0] <= token_threshold
         )
 
         if should_run_shared_in_aux_stream:
