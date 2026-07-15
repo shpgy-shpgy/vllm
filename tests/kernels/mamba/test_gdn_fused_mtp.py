@@ -110,6 +110,8 @@ def _build_layer(
         num_v_heads=HV,
         head_k_dim=K,
         head_v_dim=V,
+        gqa_interleaved_layout=False,
+        hidden_size=1,
         key_dim=K,
         value_dim=HV * V,
         activation="silu",
@@ -126,6 +128,7 @@ def _build_layer(
     for name in (
         "rearrange_mixed_qkv",
         "_forward_core",
+        "_try_flashinfer_gdn_mtp_decode",
         "_forward_core_decode_spec_post_conv_fused_norm",
         "_forward_core_decode_spec_fused_norm",
         "_can_use_fused_gdn_mtp_decode",
@@ -213,11 +216,13 @@ def test_fused_forward_uses_packed_entrypoint() -> None:
         actual_qkvz: torch.Tensor,
         actual_ba: torch.Tensor,
         output: torch.Tensor,
+        actual_hidden_states: torch.Tensor,
         *,
         layer_name: str,
     ) -> None:
         assert actual_qkvz is mixed_qkvz
         assert actual_ba is ba
+        assert actual_hidden_states is hidden_states
         assert layer_name == _encode_layer_name(PREFIX)
         output.fill_(1)
 
@@ -228,6 +233,11 @@ def test_fused_forward_uses_packed_entrypoint() -> None:
             side_effect=packed_op,
         ) as packed_mock,
         patch.object(torch.ops.vllm, "qwen_gdn_attention_core") as triton_mock,
+        # Exercise the generic fused wrapper even when the test runs on an
+        # SM120 host, where production deliberately uses the legacy route.
+        patch.object(
+            current_platform, "is_device_capability_family", return_value=False
+        ),
     ):
         output = layer.forward_cuda(hidden_states)
 
@@ -376,9 +386,18 @@ def test_fused_model_path_matches_reference(
             mixed_qkvz.clone(),
             ba,
             fused_out,
+            torch.empty(num_tokens, H, dtype=torch.bfloat16, device=device),
             layer_name=_encode_layer_name(PREFIX),
         )
 
+    # SM120 keeps the old FlashInfer/FLA MTP route because it is faster than
+    # the generic fused CUDA MTP kernel.  Other CUDA architectures exercise
+    # the fused kernel when the metadata contract is satisfied.
+    if (
+        expected_fused_calls
+        and current_platform.is_device_capability_family(120)
+    ):
+        expected_fused_calls = 0
     assert fused_mock.call_count == expected_fused_calls
     torch.testing.assert_close(
         fused_layer.kv_cache[0], reference_layer.kv_cache[0], atol=0, rtol=0

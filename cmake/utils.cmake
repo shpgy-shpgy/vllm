@@ -652,7 +652,17 @@ function (define_extension_target MOD_NAME)
   # Don't use `TORCH_LIBRARIES` for CUDA since it pulls in a bunch of
   # dependencies that are not necessary and may not be installed.
   if (ARG_LANGUAGE STREQUAL "CUDA")
-    target_link_libraries(${MOD_NAME} PRIVATE torch CUDA::cudart CUDA::cuda_driver ${ARG_LIBRARIES})
+    # Several CUDA extensions make direct CUDA Driver API calls from host
+    # code.  Keep libcuda in DT_NEEDED even when the toolchain enables
+    # --as-needed; otherwise those symbols are left unresolved in the Python
+    # module and importing it depends on libcuda having been loaded globally
+    # by some unrelated library first.
+    target_link_libraries(${MOD_NAME} PRIVATE
+      torch CUDA::cudart
+      $<$<PLATFORM_ID:Linux>:-Wl,--no-as-needed>
+      CUDA::cuda_driver
+      $<$<PLATFORM_ID:Linux>:-Wl,--as-needed>
+      ${ARG_LIBRARIES})
   else()
     target_link_libraries(${MOD_NAME} PRIVATE torch ${TORCH_LIBRARIES} ${ARG_LIBRARIES})
   endif()

@@ -134,6 +134,29 @@ def maybe_rocm_profiling_fallback(profile_result: MemoryProfilingResult) -> int 
     return torch_reserved
 
 
+def _get_cudagraph_memory_reservation(
+    cudagraph_memory_estimate: int,
+    init_free_memory: int,
+    requested_memory: int,
+) -> tuple[int, int]:
+    """Split the CUDA graph estimate across the two available memory budgets.
+
+    CUDA graphs are captured before the KV cache is allocated.  Therefore, the
+    graph pool can use memory that is free at startup but outside the
+    ``gpu_memory_utilization`` budget.  Only the part that does not fit in that
+    headroom needs to be reserved from the requested KV-cache budget.
+
+    Returns ``(requested_memory_reservation, unrequested_memory_reservation)``.
+    Keeping this calculation separate makes the accounting easy to test and
+    prevents the graph estimate from being charged twice.
+    """
+    estimate = max(cudagraph_memory_estimate, 0)
+    unrequested_memory = max(init_free_memory - requested_memory, 0)
+    from_unrequested = min(estimate, unrequested_memory)
+    from_requested = estimate - from_unrequested
+    return from_requested, from_unrequested
+
+
 if TYPE_CHECKING:
     from vllm.device_allocator.sleep_mode_backend import SleepModeBackend
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
@@ -344,6 +367,22 @@ class Worker(WorkerBase):
             restore = original_value if original_value else str(_SIZE_MAX_MB)
             torch._C._accelerator_setAllocatorSettings(f"max_split_size_mb:{restore}")
 
+    def _warmup_v2_tp_gather(self) -> None:
+        if (
+            not self.use_v2_model_runner
+            or self.model_config.runner_type != "generate"
+            or self.parallel_config.tensor_parallel_size == 1
+            or not get_pp_group().is_last_rank
+        ):
+            return
+
+        # V2 vocab-parallel sampling uses NCCL gather. ProcessGroupNCCL
+        # initializes its P2P channels lazily on the first gather, so warm them
+        # before the memory snapshot accounts for persistent non-Torch memory.
+        local_pair = torch.empty((1, 2), dtype=torch.float64, device=self.device)
+        get_tp_group().gather(local_pair, dst=0, dim=-1)
+        torch.accelerator.synchronize()
+
     @instrument(span_name="Init device")
     def init_device(self):
         if self.device_config.device_type == "cuda":
@@ -427,6 +466,7 @@ class Worker(WorkerBase):
 
             if self.use_v2_model_runner:
                 logger.info_once("Using V2 Model Runner")
+                self._warmup_v2_tp_gather()
 
             # Set random seed.
             set_random_seed(self.model_config.seed)
@@ -569,14 +609,26 @@ class Worker(WorkerBase):
         ):
             cudagraph_memory_estimate = self.model_runner.profile_cudagraph_memory()
 
-        # Respect the opt-in flag as originally designed.
-        cudagraph_memory_estimate_applied = (
-            cudagraph_memory_estimate
-            if envs.VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS
-            else 0
-        )
-
         init_free_memory = self.init_snapshot.free_memory
+        unrequested_memory = max(init_free_memory - self.requested_memory, 0)
+
+        # Respect the opt-in flag as originally designed.  When enabled, use
+        # the free memory outside the requested gpu_memory_utilization budget
+        # for the graph pool first.  Charging the full estimate to the
+        # requested budget unnecessarily shrinks the KV cache and can push
+        # larger batches over a cache-capacity cliff.
+        cudagraph_memory_estimate_applied = 0
+        cudagraph_memory_estimate_from_unrequested = 0
+        if envs.VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS:
+            (
+                cudagraph_memory_estimate_applied,
+                cudagraph_memory_estimate_from_unrequested,
+            ) = _get_cudagraph_memory_reservation(
+                cudagraph_memory_estimate,
+                init_free_memory,
+                self.requested_memory,
+            )
+
         free_gpu_memory = profile_result.after_profile.free_memory
         rocm_fallback = maybe_rocm_profiling_fallback(profile_result)
         if rocm_fallback is None:
@@ -609,7 +661,6 @@ class Worker(WorkerBase):
             - cudagraph_memory_estimate_applied
         )
 
-        unrequested_memory = self.init_snapshot.free_memory - self.requested_memory
         logger.debug(
             "Initial free memory: %s GiB; Requested memory: %f (util), %s GiB",
             format_gib(self.init_snapshot.free_memory),
@@ -630,26 +681,33 @@ class Worker(WorkerBase):
         if cudagraph_memory_estimate > 0:
             total_mem = self.init_snapshot.total_memory
             current_util = self.cache_config.gpu_memory_utilization
-            cg_util_delta = cudagraph_memory_estimate / total_mem
             if envs.VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS:
-                equiv_util = round(current_util - cg_util_delta, 4)
+                cg_util_delta = cudagraph_memory_estimate / total_mem
+                applied_util_delta = cudagraph_memory_estimate_applied / total_mem
+                equiv_util = round(current_util - applied_util_delta, 4)
                 suggested_util = min(
                     round(current_util + cg_util_delta, 4),
                     1.0,
                 )
                 logger.info(
                     "CUDA graph memory profiling is enabled (default since "
-                    "v0.21.0). The current --gpu-memory-utilization=%.4f is "
-                    "equivalent to --gpu-memory-utilization=%.4f without "
-                    "CUDA graph memory profiling. To maintain the same "
-                    "effective KV cache size as before, increase "
-                    "--gpu-memory-utilization to %.4f. To disable, set "
-                    "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0.",
+                    "v0.21.0). Estimated CUDA graph memory is %s GiB; %s GiB "
+                    "fits in memory outside the requested budget and %s GiB "
+                    "is reserved from the KV cache. The current "
+                    "--gpu-memory-utilization=%.4f is equivalent to "
+                    "--gpu-memory-utilization=%.4f without CUDA graph memory "
+                    "profiling. To maintain the same effective KV cache size "
+                    "as before, increase --gpu-memory-utilization to %.4f. "
+                    "To disable, set VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0.",
+                    format_gib(cudagraph_memory_estimate),
+                    format_gib(cudagraph_memory_estimate_from_unrequested),
+                    format_gib(cudagraph_memory_estimate_applied),
                     current_util,
                     equiv_util,
                     suggested_util,
                 )
             else:
+                cg_util_delta = cudagraph_memory_estimate / total_mem
                 suggested_util = min(
                     round(current_util + cg_util_delta, 4),
                     1.0,
@@ -860,6 +918,23 @@ class Worker(WorkerBase):
             logger.info(msg)
 
             maybe_save_startup_plan(self, kv_cache_memory_bytes_to_requested_limit)
+
+        # Qwen3.5's long-prefill kernels have shapes that are not covered by
+        # decode graph capture. Warm them for both model-runner generations.
+        if (
+            get_pp_group().is_last_rank
+            and "Qwen3_5MoeForConditionalGeneration" in self.model_config.architectures
+        ):
+            long_prefill_tokens = min(
+                3000,
+                self.scheduler_config.max_num_batched_tokens,
+                self.model_config.max_model_len - 1,
+            )
+            self.model_runner._dummy_run(
+                num_tokens=long_prefill_tokens,
+                skip_eplb=True,
+                cudagraph_runtime_mode=CUDAGraphMode.NONE,
+            )
 
         if self.use_v2_model_runner:
             # V2: Run full execute_model + sample_tokens to JIT compile triton kernels.
@@ -1102,7 +1177,13 @@ class Worker(WorkerBase):
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        return self.model_runner.sample_tokens(grammar_output)
+        context = (
+            self.profiler.annotate_context_manager("sample_tokens")
+            if self.profiler
+            else nullcontext()
+        )
+        with context:
+            return self.model_runner.sample_tokens(grammar_output)
 
     @torch.inference_mode()
     @with_gpu_sync_check

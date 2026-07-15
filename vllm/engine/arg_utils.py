@@ -2765,6 +2765,19 @@ class EngineArgs:
         default_chunked_prefill = model_config.is_chunked_prefill_supported
         default_prefix_caching = model_config.is_prefix_caching_supported
 
+        # Hybrid/Mamba prefix caching is supported when explicitly requested,
+        # but it is not a good default for latency/throughput serving.  The
+        # cache bookkeeping and Mamba state alignment add work to every
+        # request, including workloads with no reusable prefixes.  Keep the
+        # feature opt-in so hybrid-model benchmarks and serving commands that
+        # omit a prefix-cache flag retain the pre-HMA behavior.
+        if model_config.is_hybrid:
+            default_prefix_caching = False
+            logger.debug(
+                "Disabling prefix caching by default for hybrid models; "
+                "use --enable-prefix-caching to opt in."
+            )
+
         if self.enable_chunked_prefill is None:
             self.enable_chunked_prefill = default_chunked_prefill
 

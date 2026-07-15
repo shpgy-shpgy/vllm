@@ -65,6 +65,7 @@ def attach_router(app: FastAPI):
     Instrumentator(
         excluded_handlers=[
             "/metrics",
+            "/runtime-metrics",
             "/health",
             "/load",
             "/ping",
@@ -75,8 +76,8 @@ def attach_router(app: FastAPI):
     ).add().instrument(app).expose(app, response_class=PrometheusResponse)
 
     # Add prometheus asgi middleware to route /metrics requests
-    metrics_route = Mount("/metrics", make_asgi_app(registry=registry))
+    metrics_route = Mount("/runtime-metrics", make_asgi_app(registry=registry))
 
     # Workaround for 307 Redirect for /metrics
-    metrics_route.path_regex = re.compile("^/metrics(?P<path>.*)$")
+    metrics_route.path_regex = re.compile("^/runtime-metrics(?P<path>.*)$")
     app.routes.append(metrics_route)

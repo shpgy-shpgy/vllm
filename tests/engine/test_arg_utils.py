@@ -4,6 +4,7 @@
 import json
 from argparse import ArgumentError
 from contextlib import AbstractContextManager, nullcontext
+from types import SimpleNamespace
 from typing import Annotated, Literal
 
 import pytest
@@ -510,6 +511,23 @@ def test_prefix_cache_retention_interval_from_deprecated_env(
     args = parser.parse_args(["--prefix-cache-retention-interval", "32"])
     engine_args = EngineArgs.from_cli_args(args)
     assert engine_args.prefix_cache_retention_interval == 32
+
+
+def test_hybrid_prefix_caching_is_opt_in():
+    model_config = SimpleNamespace(
+        is_chunked_prefill_supported=True,
+        is_prefix_caching_supported=True,
+        is_hybrid=True,
+        runner_type="generate",
+    )
+
+    engine_args = EngineArgs()
+    engine_args._set_default_chunked_prefill_and_prefix_caching_args(model_config)
+    assert engine_args.enable_prefix_caching is False
+
+    explicit = EngineArgs(enable_prefix_caching=True)
+    explicit._set_default_chunked_prefill_and_prefix_caching_args(model_config)
+    assert explicit.enable_prefix_caching is True
 
 
 @pytest.mark.parametrize(

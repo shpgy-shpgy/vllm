@@ -645,6 +645,74 @@ class Qwen3MoeForCausalLM(
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
 
+    def get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.logits_processor.get_top_tokens(self.lm_head, hidden_states)
+
+    def get_topk_candidates(
+        self,
+        hidden_states: torch.Tensor,
+        top_k: int,
+        top_p: float,
+        temperature: float,
+        presence_penalties: torch.Tensor | None = None,
+        output_token_ids: torch.Tensor | None = None,
+        output_token_counts: torch.Tensor | None = None,
+        presence_request_indices: torch.Tensor | None = None,
+        output_unique_token_ids: torch.Tensor | None = None,
+        num_output_unique_tokens: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.logits_processor.get_topk_candidates(
+            self.lm_head,
+            hidden_states,
+            top_k=top_k,
+            top_p=top_p,
+            temperature=temperature,
+            presence_penalties=presence_penalties,
+            output_token_ids=output_token_ids,
+            output_token_counts=output_token_counts,
+            presence_request_indices=presence_request_indices,
+            output_unique_token_ids=output_unique_token_ids,
+            num_output_unique_tokens=num_output_unique_tokens,
+        )
+
+    def sample_topk_tokens(
+        self,
+        hidden_states: torch.Tensor,
+        top_k: int,
+        top_p: float,
+        temperature: float,
+        presence_penalties: torch.Tensor | None = None,
+        output_token_ids: torch.Tensor | None = None,
+        output_token_counts: torch.Tensor | None = None,
+        presence_request_indices: torch.Tensor | None = None,
+        output_unique_token_ids: torch.Tensor | None = None,
+        num_output_unique_tokens: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return self.logits_processor.sample_topk_tokens(
+            self.lm_head,
+            hidden_states,
+            top_k=top_k,
+            top_p=top_p,
+            temperature=temperature,
+            presence_penalties=presence_penalties,
+            output_token_ids=output_token_ids,
+            output_token_counts=output_token_counts,
+            presence_request_indices=presence_request_indices,
+            output_unique_token_ids=output_unique_token_ids,
+            num_output_unique_tokens=num_output_unique_tokens,
+        )
+
+    def sample_full_tokens(
+        self,
+        hidden_states: torch.Tensor,
+        temperature: float,
+    ) -> torch.Tensor:
+        return self.logits_processor.sample_full_tokens(
+            self.lm_head,
+            hidden_states,
+            temperature=temperature,
+        )
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights)

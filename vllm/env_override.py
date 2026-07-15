@@ -4,6 +4,10 @@
 import importlib.util
 import os
 
+from vllm._flashinfer_sm120 import prefer_validated_flashinfer
+
+prefer_validated_flashinfer()
+
 
 def _get_torch_cuda_version():
     """Peripheral function to _maybe_set_cuda_compatibility_path().

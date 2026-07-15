@@ -295,6 +295,7 @@ class MooncakeStoreCoordinator:
     def block_hashes_for_spec(
         self, block_hashes: Sequence[BlockHash], spec: KVCacheSpec
     ) -> Sequence[BlockHash]:
+        """Group hashes for Mooncake's per-spec external storage keys."""
         return chunk_hashes_for_block_size(
             block_hashes, self.hash_block_size, spec.block_size
         )

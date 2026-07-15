@@ -578,12 +578,10 @@ def precopy_mamba_align_fused_kernel(
     """Pre-copy mamba "align" state across block boundaries.
 
     Before the forward pass, copy each request's last SSM/conv state from its
-    previous block column into the new window block column, so the kernels read
-    the initial state from the write-side block as usual (V1 align semantics).
-    Same per-(layer, state) copy semantics as ``postprocess_mamba_fused_kernel``
-    (shared ``_copy_mamba_state_block`` body, i.e. the V1 ``preprocess_mamba``
-    copy specs), but driven by the GPU-resident src columns so it needs no
-    CPU-GPU sync (async-scheduling safe).
+    previous block column into the new window block column. The V2 runner maps
+    batch rows to persistent request slots through ``idx_mapping_ptr``; the V1
+    runner stages its inputs directly in batch order and sets
+    ``HAS_IDX_MAPPING=False``.
 
     Grid: (num_reqs, num_states [, TEMPORAL_TILES]). V2 passes a
     batch-to-state idx_mapping; V1 already stores the staged arrays in batch
@@ -821,11 +819,11 @@ class MambaSpecDecodeGPUContext:
     # reads the GPU side. These only exist when the postprocess kernel is
     # enabled (spec decode + hybrid + align mode).
     mamba_state_idx_buf: CpuGpuBuffer | None = None
+    precopy_src_col_buf: CpuGpuBuffer | None = None
+    precopy_token_bias_buf: CpuGpuBuffer | None = None
     num_scheduled_tokens_buf: CpuGpuBuffer | None = None
     num_computed_tokens_buf: CpuGpuBuffer | None = None
     num_draft_tokens_buf: CpuGpuBuffer | None = None
-    precopy_src_col_buf: CpuGpuBuffer | None = None
-    precopy_token_bias_buf: CpuGpuBuffer | None = None
 
     # Flag to track if metadata has been populated
     is_initialized: bool = False
@@ -912,11 +910,11 @@ class MambaSpecDecodeGPUContext:
                 device=device,
             ),
             mamba_state_idx_buf=make_buffer(max_num_reqs, dtype=torch.int32),
+            precopy_src_col_buf=make_buffer(max_num_reqs, dtype=torch.int32),
+            precopy_token_bias_buf=make_buffer(max_num_reqs, dtype=torch.int32),
             num_scheduled_tokens_buf=make_buffer(max_num_reqs, dtype=torch.int32),
             num_computed_tokens_buf=make_buffer(max_num_reqs, dtype=torch.int32),
             num_draft_tokens_buf=make_buffer(max_num_reqs, dtype=torch.int32),
-            precopy_src_col_buf=make_buffer(max_num_reqs, dtype=torch.int32),
-            precopy_token_bias_buf=make_buffer(max_num_reqs, dtype=torch.int32),
             is_initialized=False,
         )
 
@@ -979,7 +977,14 @@ class MambaSpecDecodeGPUContext:
         mamba_state_copy_funcs: MambaStateCopyFuncsByType,
         block_tables: list[torch.Tensor],
     ) -> None:
-        idx = 0
+        state_base_addrs: list[int] = []
+        state_block_strides: list[int] = []
+        state_elem_sizes: list[int] = []
+        state_inner_sizes: list[int] = []
+        state_conv_widths: list[int] = []
+        state_group_indices: list[int] = []
+        state_dim_row_count: list[int] = []
+        state_dim_row_stride: list[int] = []
         for group_local_idx, mamba_group_id in enumerate(self.mamba_group_ids):
             kv_cache_group = kv_cache_config.kv_cache_groups[mamba_group_id]
             layer_names = kv_cache_group.layer_names
@@ -995,23 +1000,14 @@ class MambaSpecDecodeGPUContext:
                     )
                 for state_type_idx, copy_func in enumerate(state_copy_funcs):
                     state = kv_caches[state_type_idx]
-                    # Base address
-                    self.state_base_addrs[idx] = _reinterpret_u64_as_i64(
-                        state.data_ptr()
+                    elem_size = state.element_size()
+                    block_stride_elems = (
+                        state.stride(0) if state.dim() > 1 else state.numel()
                     )
-
-                    # Block stride (bytes between consecutive blocks)
-                    # state shape: [num_blocks, ...], stride(0) = elements per block
-                    if state.dim() > 1:
-                        block_stride_elems = state.stride(0)
-                    else:
-                        block_stride_elems = state.numel()
-                    self.state_block_strides[idx] = (
-                        block_stride_elems * state.element_size()
-                    )
-
-                    # Element size
-                    self.state_elem_sizes[idx] = state.element_size()
+                    conv_width = 0
+                    inner_size = 1
+                    dim_row_count = 0
+                    dim_row_stride = 0
 
                     assert (
                         copy_func is get_conv_copy_spec
@@ -1024,27 +1020,17 @@ class MambaSpecDecodeGPUContext:
                                 f"shape {tuple(state.shape)}"
                             )
                         if is_conv_state_dim_first():
-                            # DS layout: state_len is the slide axis.
-                            self.state_conv_widths[idx] = state.size(2)
-                            self.state_inner_sizes[idx] = 1
-                            self.state_dim_row_count[idx] = state.size(1)
-                            self.state_dim_row_stride[idx] = (
-                                state.stride(1) * state.element_size()
-                            )
+                            conv_width = state.size(2)
+                            dim_row_count = state.size(1)
+                            dim_row_stride = state.stride(1) * elem_size
                         else:
-                            # SD layout: dim is contiguous.
-                            self.state_conv_widths[idx] = state.size(1)
-                            self.state_inner_sizes[idx] = state.stride(1)
+                            conv_width = state.size(1)
+                            inner_size = state.stride(1)
                     else:
-                        # Temporal state: inner_size = natural elements per
-                        # block (prod of inner dims).  The kernel uses this
-                        # to compute copy_size = inner_size * elem_size,
-                        # which gives the correct byte count even when the
-                        # state tensor is as_strided with padded page strides
-                        # (state_block_stride would be the page size, too big).
-                        self.state_conv_widths[idx] = 0
-                        self.state_inner_sizes[idx] = (
-                            state[0].numel() if state.dim() > 1 else 1
+                        # Use the natural block size rather than the padded page
+                        # stride. Avoid state[0], which enters Tensor indexing.
+                        inner_size = (
+                            state.numel() // state.size(0) if state.dim() > 1 else 1
                         )
                         # Temporal copies vectorize with uint64 loads/stores.
                         # The kernel's head/tail handles misalignment for
@@ -1069,10 +1055,31 @@ class MambaSpecDecodeGPUContext:
                                 block_stride_bytes,
                             )
 
-                    self.state_group_indices[idx] = group_local_idx
-                    idx += 1
+                    state_base_addrs.append(_reinterpret_u64_as_i64(state.data_ptr()))
+                    state_block_strides.append(block_stride_elems * elem_size)
+                    state_elem_sizes.append(elem_size)
+                    state_inner_sizes.append(inner_size)
+                    state_conv_widths.append(conv_width)
+                    state_group_indices.append(group_local_idx)
+                    state_dim_row_count.append(dim_row_count)
+                    state_dim_row_stride.append(dim_row_stride)
 
-        assert idx == self.num_states
+        assert len(state_base_addrs) == self.num_states
+        metadata = (
+            (self.state_base_addrs, state_base_addrs),
+            (self.state_block_strides, state_block_strides),
+            (self.state_elem_sizes, state_elem_sizes),
+            (self.state_inner_sizes, state_inner_sizes),
+            (self.state_conv_widths, state_conv_widths),
+            (self.state_group_indices, state_group_indices),
+            (self.state_dim_row_count, state_dim_row_count),
+            (self.state_dim_row_stride, state_dim_row_stride),
+        )
+        # Upload each static metadata array once. Scalar assignment to CUDA
+        # tensors emits one H2D operation per layer/state and creates a visible
+        # launch gap on large hybrid MoE models.
+        for dst, values in metadata:
+            dst.copy_(torch.tensor(values, dtype=dst.dtype))
 
         # Cache per-group block-table base addresses and per-request stride.
         # `block_tables[i]` is the persistent 2D int32 block-table tensor for
@@ -1193,7 +1200,7 @@ class MambaSpecDecodeGPUContext:
         state_idx_gpu: torch.Tensor,
         src_col_gpu: torch.Tensor,
         token_bias_gpu: torch.Tensor,
-        idx_mapping: torch.Tensor | None,
+        idx_mapping: torch.Tensor | None = None,
     ) -> None:
         """Pre-copy each request's previous running block into its new window
         block before the forward pass (align boundary migration).
@@ -1441,16 +1448,21 @@ def preprocess_mamba(
     mamba_state_copy_funcs: MambaStateCopyFuncsByType,
     copy_bufs: MambaCopyBuffers,
     align_ctx: MambaSpecDecodeGPUContext | None = None,
+    gpu_ctx: MambaSpecDecodeGPUContext | None = None,
 ):
     """
     Copy the mamba state of previous step to the last
     (1 + num_speculative_blocks) block.
     """
+    if align_ctx is not None and gpu_ctx is not None and align_ctx is not gpu_ctx:
+        raise ValueError("align_ctx and gpu_ctx must refer to the same context")
+    if gpu_ctx is not None:
+        align_ctx = gpu_ctx
+
     fused = _resolve_fused_precopy(align_ctx)
     mamba_group_ids = copy_bufs.mamba_group_ids
     mamba_spec = copy_bufs.mamba_spec
     num_speculative_blocks = mamba_spec.num_speculative_blocks
-    # TODO(Chen): we need to optimize this function a lot
     assert cache_config.enable_prefix_caching
     block_size = mamba_spec.block_size
     cleanup_mamba_state_idx(scheduler_output, mamba_state_idx)
@@ -1489,14 +1501,6 @@ def preprocess_mamba(
         )
         # We always save the current running state at the last
         # (1 + num_speculative_blocks) block.
-        # A corner case worth mention here: assume we have block_size = 4 and
-        # num_speculative_tokens = 2. The request is [A, B, C] and contains 2 draft
-        # tokens [draft 1, draft 2]. Then we will have:
-        # Block 0: [A, B, C, draft 1]
-        # Block 1: [draft 2, TOFILL, TOFILL, TOFILL]
-        # Block 2: speculative block
-        # Block 3: speculative block
-        # And use block 1 to save the running state.
         curr_state_idx = num_blocks - 1 - num_speculative_blocks
         mamba_state_idx[req_id] = curr_state_idx
         if fused is not None:
@@ -1523,16 +1527,23 @@ def preprocess_mamba(
             input_batch.num_accepted_tokens_cpu[i] = 1
 
     if fused is not None:
-        fused.state_idx.copy_to_gpu(num_reqs)
-        fused.src_col.copy_to_gpu(num_reqs)
-        fused.token_bias.copy_to_gpu(num_reqs)
-        fused.ctx.run_fused_precopy(
-            num_reqs=num_reqs,
-            state_idx_gpu=fused.state_idx.gpu,
-            src_col_gpu=fused.src_col.gpu,
-            token_bias_gpu=fused.token_bias.gpu,
-            idx_mapping=None,
-        )
+        state_idx_gpu = fused.state_idx.copy_to_gpu(num_reqs)
+        src_col_gpu = fused.src_col.copy_to_gpu(num_reqs)
+        token_bias_gpu = fused.token_bias.copy_to_gpu(num_reqs)
+        # The V1 context uses the positional form. Keep the keyword form for
+        # compatible duck-typed contexts used by older integrations.
+        if isinstance(fused.ctx, MambaSpecDecodeGPUContext):
+            fused.ctx.run_fused_precopy(
+                num_reqs, state_idx_gpu, src_col_gpu, token_bias_gpu
+            )
+        else:
+            fused.ctx.run_fused_precopy(
+                num_reqs=num_reqs,
+                state_idx_gpu=state_idx_gpu,
+                src_col_gpu=src_col_gpu,
+                token_bias_gpu=token_bias_gpu,
+                idx_mapping=None,
+            )
     else:
         do_mamba_copy_block(copy_bufs)
 

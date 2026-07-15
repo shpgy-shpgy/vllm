@@ -142,6 +142,7 @@ def enable_norm_fusion(cfg: "VllmConfig") -> bool:
         cfg.compilation_config.is_custom_op_enabled("rms_norm")
         or cfg.compilation_config.is_custom_op_enabled("quant_fp8")
         or cfg.kernel_config.ir_op_priority.rms_norm[0] != "native"
+        or (cfg.model_config is not None and cfg.model_config.is_mxfp6_w6a8_quantized())
     )
 
 
@@ -154,7 +155,13 @@ def enable_act_fusion(cfg: "VllmConfig") -> bool:
     return (
         cfg.compilation_config.is_custom_op_enabled("silu_and_mul")
         or cfg.compilation_config.is_custom_op_enabled("quant_fp8")
-        or (cfg.model_config is not None and cfg.model_config.is_nvfp4_quantized())
+        or (
+            cfg.model_config is not None
+            and (
+                cfg.model_config.is_nvfp4_quantized()
+                or cfg.model_config.is_mxfp6_w6a8_quantized()
+            )
+        )
     )
 
 

@@ -11,6 +11,7 @@ import importlib
 import importlib.util
 import os
 import shutil
+import threading
 from collections.abc import Callable
 from typing import Any, NoReturn
 
@@ -243,6 +244,57 @@ autotune = _lazy_import_wrapper(
     "autotune",
     fallback_fn=lambda *args, **kwargs: contextlib.nullcontext(),
 )
+
+_AUTOTUNE_DELAY_LOCK = threading.RLock()
+
+
+@contextlib.contextmanager
+def autotune_with_torch_cuda_delay(*args, **kwargs):
+    """Run FlashInfer autotuning without its optional TRT-LLM delay JIT.
+
+    Some CUDA toolkit installations provide the runtime libraries but omit
+    compatible cuBLAS development headers. FlashInfer's profiling-only delay
+    kernel then fails to build and every otherwise-valid tactic is discarded.
+    ``torch.cuda._sleep`` provides the same stream delay without a JIT build.
+    """
+    if not has_flashinfer():
+        yield
+        return
+
+    autotuner = _get_submodule("flashinfer.autotuner")
+    if autotuner is None or not hasattr(autotuner, "autotune"):
+        yield
+        return
+
+    autotune_fn = autotuner.autotune
+    implementation_name = getattr(autotune_fn, "__module__", "")
+    implementation = (
+        _get_submodule(implementation_name) if implementation_name else None
+    )
+    delay_owners = []
+    for module in (autotuner, implementation):
+        if (
+            module is not None
+            and hasattr(module, "delay_kernel")
+            and all(module is not owner for owner in delay_owners)
+        ):
+            delay_owners.append(module)
+
+    def torch_delay(microseconds: int) -> None:
+        torch.cuda._sleep(max(1, int(microseconds) * 1000))
+
+    with _AUTOTUNE_DELAY_LOCK:
+        original_delays = [owner.delay_kernel for owner in delay_owners]
+        for owner in delay_owners:
+            owner.delay_kernel = torch_delay
+        try:
+            with autotune_fn(*args, **kwargs):
+                yield
+        finally:
+            for owner, original_delay in zip(
+                delay_owners, original_delays, strict=True
+            ):
+                owner.delay_kernel = original_delay
 
 
 @functools.cache
@@ -489,6 +541,19 @@ def supports_trtllm_attention(is_prefill: bool = False) -> bool:
     return current_platform.is_device_capability_family(100)
 
 
+@functools.cache
+def supports_xqa_attention() -> bool:
+    """Return `True` if FlashInfer XQA decode is supported on this platform."""
+    if envs.VLLM_BATCH_INVARIANT:
+        return False
+    if not current_platform.is_cuda_alike():
+        return False
+    if not has_flashinfer():
+        return False
+    capability = current_platform.get_device_capability()
+    return capability is not None and capability.major in (9, 10, 12)
+
+
 def force_use_trtllm_attention() -> bool | None:
     """
     This function should only be called during initialization stage when vllm config
@@ -512,6 +577,24 @@ def can_use_trtllm_attention(
     return supports_trtllm_attention(is_prefill=is_prefill) and (
         num_qo_heads % num_kv_heads == 0
     )
+
+
+def can_use_xqa_attention(
+    num_qo_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+) -> bool:
+    """Check if FlashInfer XQA decode supports this attention shape."""
+    if force_use_trtllm_attention() is False:
+        return False
+    if not supports_xqa_attention():
+        return False
+    if num_kv_heads <= 0 or num_qo_heads % num_kv_heads != 0:
+        return False
+    # FlashInfer XQA JIT accepts more head sizes, but verifier tests show D=80
+    # can illegal-address. The pinned FlashInfer version includes the XQA
+    # V-page prefetch fix required for D=256.
+    return head_dim in (64, 128, 256)
 
 
 def use_trtllm_attention(
@@ -799,6 +882,36 @@ if has_flashinfer():
         )
 
     @torch.library.custom_op(
+        "vllm::flashinfer_nvfp4_quantize_128x4",
+        mutates_args=[],
+        device_types="cuda",
+    )
+    def flashinfer_nvfp4_quantize_128x4_op(
+        a: torch.Tensor, a_global_sf: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        from flashinfer import SfLayout
+        from flashinfer import nvfp4_quantize as nvfp4_quantize_
+
+        return nvfp4_quantize_(
+            a,
+            a_global_sf,
+            sfLayout=SfLayout.layout_128x4,
+            do_shuffle=False,
+        )
+
+    @torch.library.register_fake("vllm::flashinfer_nvfp4_quantize_128x4")
+    def flashinfer_nvfp4_quantize_128x4_fake(
+        a: torch.Tensor, a_global_sf: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        m, n = a.shape
+        rounded_m = cdiv(m, 128) * 128
+        scale_n = cdiv(n // 16, 4) * 4
+        return (
+            torch.empty(m, n // 2, dtype=torch.uint8, device=a.device),
+            torch.empty(rounded_m, scale_n, dtype=torch.uint8, device=a.device),
+        )
+
+    @torch.library.custom_op(
         "vllm::flashinfer_mxfp8_quantize_8x4",
         mutates_args=[],
         device_types="cuda",
@@ -1057,6 +1170,17 @@ def flashinfer_quant_nvfp4_8x4_sf_layout(
     return flashinfer_nvfp4_quantize(a, a_global_sf)
 
 
+def flashinfer_nvfp4_quantize_128x4(
+    a: torch.Tensor, a_global_sf: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize NVFP4 with the 128x4 scale layout required by b12x."""
+    if not has_flashinfer():
+        raise RuntimeError("FlashInfer is required for NVFP4 quantization")
+    return torch.ops.vllm.flashinfer_nvfp4_quantize_128x4.default(
+        a, a_global_sf
+    )
+
+
 flashinfer_fp8_blockscale_gemm = _lazy_import_wrapper(
     "flashinfer.gemm", "fp8_blockscale_gemm_sm90"
 )
@@ -1170,6 +1294,7 @@ __all__ = [
     "flashinfer_trtllm_batch_decode_sparse_mla_dsv4",
     "flashinfer_xqa_batch_decode_with_kv_cache",
     "autotune",
+    "autotune_with_torch_cuda_delay",
     "has_flashinfer_moe",
     "has_flashinfer_comm",
     "has_flashinfer_nvlink_two_sided",
@@ -1182,7 +1307,9 @@ __all__ = [
     "has_flashinfer_fp8_blockscale_gemm",
     "has_nvidia_artifactory",
     "supports_trtllm_attention",
+    "supports_xqa_attention",
     "can_use_trtllm_attention",
+    "can_use_xqa_attention",
     "use_trtllm_attention",
     "flashinfer_mxfp4_quantize",
     "flashinfer_scaled_fp4_mm",
@@ -1190,6 +1317,7 @@ __all__ = [
     "flashinfer_scaled_fp8_mm",
     "flashinfer_scaled_fp8_mm_out",
     "flashinfer_quant_nvfp4_8x4_sf_layout",
+    "flashinfer_nvfp4_quantize_128x4",
     "flashinfer_fp8_blockscale_gemm",
     "should_use_flashinfer_for_blockscale_fp8_gemm",
     "is_flashinfer_fp8_blockscale_gemm_supported",

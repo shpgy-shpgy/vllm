@@ -382,6 +382,7 @@ class OpenAIServingChat(GenerateBaseServing):
                     }
                     if parser is not None and parser.reasoning_parser is not None
                     else None,
+                    headers=raw_request.headers if raw_request else None,
                 )
 
             generators.append(generator)

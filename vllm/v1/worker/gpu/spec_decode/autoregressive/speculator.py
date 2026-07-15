@@ -13,7 +13,10 @@ from vllm.triton_utils import tl, triton
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.block_table import BlockTables
-from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
+from vllm.v1.worker.gpu.cudagraph_utils import (
+    BatchExecutionDescriptor,
+    CudaGraphManager,
+)
 from vllm.v1.worker.gpu.dp_utils import DPSyncState, dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
@@ -162,12 +165,25 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         # Draft prefill reuses the target model's attention metadata at
         # runtime, so capture builds its dummy metadata through the target
         # model runner's builders and buffers.
-        assert self.prefill_cudagraph_manager is not None
-        if self.prefill_cudagraph_manager.use_breakable_cg:
-            self.prefill_cudagraph_manager.init_breakable_cg_runner(self.model)
+        prefill_manager = self.prefill_cudagraph_manager
+        assert prefill_manager is not None
+        if prefill_manager.use_breakable_cg:
+            prefill_manager.init_breakable_cg_runner(self.model)
+
+        # Warm Stream-K's current capture stream before recording the graph.
+        def warmup_capture_stream(manager: CudaGraphManager) -> None:
+            from vllm.model_executor.layers.quantization.utils import (
+                mxfp6_sm120_utils,
+            )
+
+            mxfp6_sm120_utils.warmup_mxfp6_sm120_stream(
+                self.model,
+                manager.get_capture_sizes(),
+                self.dtype,
+            )
 
         self.on_prefill_begin(self.max_num_reqs)
-        self.prefill_cudagraph_manager.capture(
+        prefill_manager.capture(
             self._prefill,
             self.model_state,
             self.target_input_buffers,
@@ -175,6 +191,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             self.target_attn_groups,
             self.kv_cache_config,
             progress_bar_desc="Capturing prefill CUDA graphs",
+            capture_stream_warmup=lambda: warmup_capture_stream(prefill_manager),
         )
         self.on_prefill_end(self.max_num_reqs)
 
@@ -183,13 +200,14 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
 
         self.on_multi_step_decode_begin(self.max_num_reqs)
         # Capture either the fused decode loop or one decode step per graph.
-        assert self.decode_cudagraph_manager is not None
+        decode_manager = self.decode_cudagraph_manager
+        assert decode_manager is not None
         decode_fn = (
             self._generate_fused_drafts
             if self.use_fused_multi_step_decode
             else self._generate_draft
         )
-        self.decode_cudagraph_manager.capture(
+        decode_manager.capture(
             decode_fn,
             self.model_state,
             self.input_buffers,
@@ -197,6 +215,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             self.attn_groups,
             self.kv_cache_config,
             progress_bar_desc="Capturing decode CUDA graphs",
+            capture_stream_warmup=lambda: warmup_capture_stream(decode_manager),
         )
         self.on_multi_step_decode_end(self.max_num_reqs)
 

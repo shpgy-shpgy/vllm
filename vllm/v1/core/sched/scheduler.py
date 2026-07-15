@@ -7,6 +7,7 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+import vllm.envs as envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
@@ -199,6 +200,10 @@ class Scheduler(SchedulerInterface):
         # requests skipped in waiting flow due async deps or constraints.
         self.skipped_waiting = create_request_queue(self.policy)
         self.running: list[Request] = []
+
+        # Opt-in per-request QUEUED/SCHEDULED timing debug logs (SCHED_TT).
+        self._sched_tt_debug = envs.VLLM_SCHED_TT_DEBUG
+        self._sched_tt_queued_ts: dict[str, float] = {}
 
         # The request IDs that are finished in between the previous and the
         # current steps. This is used to notify the workers about the finished
@@ -1163,6 +1168,25 @@ class Scheduler(SchedulerInterface):
                 if self.log_stats:
                     request.record_event(
                         EngineCoreEventType.SCHEDULED, scheduled_timestamp
+                    )
+                if self._sched_tt_debug:
+                    queued_ts = self._sched_tt_queued_ts.pop(
+                        request.request_id, -1.0
+                    )
+                    wait = (
+                        scheduled_timestamp - queued_ts if queued_ts >= 0 else -1.0
+                    )
+                    logger.info(
+                        "SCHED_TT SCHEDULED req=%s t=%.6f step=%d wait=%.4f "
+                        "new_tokens=%d waiting=%d running=%d status=%s",
+                        request.request_id,
+                        scheduled_timestamp,
+                        self.current_step,
+                        wait,
+                        num_new_tokens,
+                        len(self.waiting),
+                        len(self.running),
+                        request.status,
                     )
                 if request.status == RequestStatus.WAITING:
                     scheduled_new_reqs.append(request)
@@ -2413,6 +2437,16 @@ class Scheduler(SchedulerInterface):
                 self.connector.on_new_request(request)
             if self.log_stats:
                 request.record_event(EngineCoreEventType.QUEUED)
+            if self._sched_tt_debug:
+                queued_ts = time.monotonic()
+                self._sched_tt_queued_ts[request.request_id] = queued_ts
+                logger.info(
+                    "SCHED_TT QUEUED req=%s t=%.6f waiting=%d running=%d",
+                    request.request_id,
+                    queued_ts,
+                    len(self.waiting),
+                    len(self.running),
+                )
 
     def finish_requests(
         self, request_ids: str | Iterable[str] | None, finished_status: RequestStatus

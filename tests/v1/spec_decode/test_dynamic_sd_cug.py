@@ -359,6 +359,50 @@ def test_basic_sd_does_not_capture_shorter_full_decode_shapes(monkeypatch):
             assert desc.num_active_loras == 0
 
 
+def test_capture_sizes_include_rounded_full_decode_shapes(monkeypatch):
+    monkeypatch.setattr(
+        gpu_cudagraph_utils,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+
+    vllm_config = _create_vllm_config_for_dsd(
+        max_num_seqs=64,
+        max_spec_tokens=2,
+        use_dynamic_sd=False,
+    )
+    compilation_config = CompilationConfig(
+        cudagraph_mode="FULL_AND_PIECEWISE",
+        cudagraph_capture_sizes=[8, 10, 12, 14, 16, 128, 160, 192],
+    )
+    compilation_config.max_cudagraph_capture_size = 192
+    compilation_config.post_init_cudagraph_sizes()
+    vllm_config.compilation_config = compilation_config
+
+    manager = gpu_cudagraph_utils.CudaGraphManager(
+        vllm_config=vllm_config,
+        device=torch.device("cpu"),
+        cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+        decode_query_len=3,
+    )
+
+    assert manager.get_capture_sizes() == [
+        192,
+        162,
+        160,
+        129,
+        128,
+        18,
+        16,
+        15,
+        14,
+        12,
+        10,
+        9,
+        8,
+    ]
+
+
 def test_dynamic_sd_only_captures_scheduled_query_lengths(monkeypatch):
     """DSD should only capture FULL graphs for query lengths in the schedule.
 

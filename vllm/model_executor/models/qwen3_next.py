@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen3Next model."""
 
+import os
 from collections.abc import Iterable
 from itertools import islice
 
@@ -212,6 +213,45 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                 prefix=f"{prefix}.shared_expert",
             )
 
+        runner_cls = None
+        native_p1_tp2 = os.environ.get("QWEN35_NATIVE_P1_TP2") == "1"
+        cooperative_tp2 = os.environ.get("QWEN35_COOPERATIVE_TP2") == "1"
+        flashinfer_p2b_tp2 = (
+            os.environ.get("QWEN35_FLASHINFER_P2B_TP2") == "1"
+        )
+        if sum((native_p1_tp2, cooperative_tp2, flashinfer_p2b_tp2)) > 1:
+            raise RuntimeError(
+                "Native P1, Cooperative TP2, and FlashInfer P2b TP2 adapters "
+                "are mutually exclusive"
+            )
+        if native_p1_tp2:
+            from native_p1_tp2_vllm import (
+                NATIVE_P1_TP2_ADAPTER_VERSION,
+                native_p1_tp2_runner_cls,
+            )
+
+            if NATIVE_P1_TP2_ADAPTER_VERSION != 1:
+                raise RuntimeError("expected Native P1 TP2 adapter v1")
+            runner_cls = native_p1_tp2_runner_cls()
+        elif cooperative_tp2:
+            from cooperative_tp2_vllm import (
+                COOPERATIVE_TP2_ADAPTER_VERSION,
+                cooperative_tp2_runner_cls,
+            )
+
+            if COOPERATIVE_TP2_ADAPTER_VERSION != 30:
+                raise RuntimeError("expected Cooperative TP2 adapter v30")
+            runner_cls = cooperative_tp2_runner_cls()
+        elif flashinfer_p2b_tp2:
+            from flashinfer_p2b_tp2_vllm import (
+                FLASHINFER_P2B_TP2_ADAPTER_VERSION,
+                flashinfer_p2b_tp2_runner_cls,
+            )
+
+            if FLASHINFER_P2B_TP2_ADAPTER_VERSION != 2:
+                raise RuntimeError("expected FlashInfer P2b TP2 adapter v2")
+            runner_cls = flashinfer_p2b_tp2_runner_cls()
+
         self.experts = FusedMoEFactory(
             shared_experts=(
                 None if self.replicate_shared_expert else self.shared_expert
@@ -232,6 +272,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             shared_expert_gate=self.shared_expert_gate
             if self.shared_expert is None
             else None,
+            runner_cls=runner_cls,
         )
 
     def forward(

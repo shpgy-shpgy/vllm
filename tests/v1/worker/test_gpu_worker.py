@@ -9,7 +9,10 @@ import pytest
 
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.v1.worker import gpu_worker, startup_plan
-from vllm.v1.worker.gpu_worker import maybe_rocm_profiling_fallback
+from vllm.v1.worker.gpu_worker import (
+    _get_cudagraph_memory_reservation,
+    maybe_rocm_profiling_fallback,
+)
 from vllm.v1.worker.startup_plan import (
     maybe_apply_startup_plan,
     maybe_save_startup_plan,
@@ -221,3 +224,22 @@ def test_execute_model_waits_previous_pp_send_before_forward(
 
     assert log == ["wait:prev-tensor", "forward", "isend"]
     assert worker._pp_send_work == [tensor_handle]
+
+
+@pytest.mark.parametrize(
+    ("estimate", "init_free", "requested", "from_requested", "from_unrequested"),
+    [
+        (0, 10, 9, 0, 0),
+        (1, 10, 9, 0, 1),
+        (2, 10, 9, 1, 1),
+        (2, 9, 9, 2, 0),
+        (2, 8, 9, 2, 0),
+        (-1, 10, 9, 0, 0),
+    ],
+)
+def test_cudagraph_memory_reservation_uses_unrequested_headroom(
+    estimate, init_free, requested, from_requested, from_unrequested
+):
+    assert _get_cudagraph_memory_reservation(
+        estimate, init_free, requested
+    ) == (from_requested, from_unrequested)

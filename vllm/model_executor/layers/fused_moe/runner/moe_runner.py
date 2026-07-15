@@ -675,6 +675,18 @@ class MoERunner(MoERunnerInterface):
             result = result + zero_expert_output
         return result
 
+    def _combine_shared_and_fused_output(
+        self,
+        shared_output: torch.Tensor,
+        fused_output: torch.Tensor,
+    ) -> torch.Tensor:
+        """Combine shared and routed outputs.
+
+        Kept as a method so narrowly scoped runner experiments can change the
+        destination buffer without changing the default MoE implementation.
+        """
+        return shared_output + fused_output
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -777,7 +789,9 @@ class MoERunner(MoERunnerInterface):
         fused_output = self.apply_routed_output_transform(fused_output)
 
         if shared_output is not None:
-            result = shared_output + fused_output
+            result = self._combine_shared_and_fused_output(
+                shared_output, fused_output
+            )
         else:
             result = fused_output
 

@@ -64,6 +64,42 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
             from vllm.model_executor.layers.utils import dispatch_cpu_unquantized_gemm
 
             dispatch_cpu_unquantized_gemm(layer, remove_weight=False)
+        elif envs.VLLM_HYBRID_NVFP4_LM_HEAD and (
+            isinstance(layer, ParallelLMHead)
+            or getattr(layer, "_is_tied_lm_head", False)
+        ):
+            from vllm.model_executor.layers.hybrid_nvfp4_lm_head import (
+                prepare_hybrid_nvfp4_lm_head,
+            )
+
+            prepare_hybrid_nvfp4_lm_head(
+                layer,
+                candidates=envs.VLLM_HYBRID_NVFP4_LM_HEAD_CANDIDATES,
+            )
+        elif envs.VLLM_HYBRID_MXFP4_LM_HEAD and (
+            isinstance(layer, ParallelLMHead)
+            or getattr(layer, "_is_tied_lm_head", False)
+        ):
+            from vllm.model_executor.layers.hybrid_mxfp4_lm_head import (
+                prepare_hybrid_mxfp4_lm_head,
+            )
+
+            prepare_hybrid_mxfp4_lm_head(
+                layer,
+                candidates=envs.VLLM_HYBRID_MXFP4_LM_HEAD_CANDIDATES,
+            )
+        elif envs.VLLM_HYBRID_MXFP8_LM_HEAD and (
+            isinstance(layer, ParallelLMHead)
+            or getattr(layer, "_is_tied_lm_head", False)
+        ):
+            from vllm.model_executor.layers.hybrid_mxfp8_lm_head import (
+                prepare_hybrid_mxfp8_lm_head,
+            )
+
+            prepare_hybrid_mxfp8_lm_head(
+                layer,
+                candidates=envs.VLLM_HYBRID_MXFP8_LM_HEAD_CANDIDATES,
+            )
 
     def apply(
         self,
@@ -283,6 +319,7 @@ class VocabParallelEmbedding(PluggableLayer):
             self.tp_size,
         )
         self.embedding_dim = embedding_dim
+        self._is_tied_lm_head = False
 
         # Avoid overriding a preselected model-specific method with generic
         # config-based dispatch.

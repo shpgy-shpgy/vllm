@@ -12,6 +12,10 @@ from torch._ops import OpOverload
 import vllm.ir.ops
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+    fused_add_rms_norm_mxfp8_quant,
+    mxfp8_e4m3_quantize,
+)
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
     QuantKey,
@@ -610,6 +614,43 @@ class FusedAddRMSNormDynamicQuantPattern(RMSNormQuantPattern):
         )
 
 
+class FusedAddRMSNormMXFP8QuantPattern:
+    """Fuse residual-add RMSNorm with swizzled MXFP8 quantization."""
+
+    def __init__(self, epsilon: float) -> None:
+        self.epsilon = epsilon
+
+    def register(self, pm_pass: PatternMatcherPass) -> None:
+        def pattern(
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            residual: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            output, residual_output = vllm.ir.ops.fused_add_rms_norm(
+                input, residual, weight, self.epsilon
+            )
+            quantized, scale = mxfp8_e4m3_quantize(output, is_sf_swizzled_layout=True)
+            return quantized, residual_output, scale
+
+        def replacement(
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            residual: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            quantized, scale, residual_output = fused_add_rms_norm_mxfp8_quant(
+                input, residual, weight, self.epsilon
+            )
+            return quantized, residual_output, scale
+
+        pm.register_replacement(
+            pattern,
+            replacement,
+            [empty_bf16(5, 128), empty_bf16(128), empty_bf16(5, 128)],
+            pm.fwd_only,
+            pm_pass,
+        )
+
+
 class RMSNormQuantFusionPass(VllmPatternMatcherPass):
     """
     This pass fuses rms_norm & quant custom ops into a fused rms_norm_quant op.
@@ -627,6 +668,9 @@ class RMSNormQuantFusionPass(VllmPatternMatcherPass):
         # Make sure fused add patterns are before simple rms norm,
         # as the latter is a subset of the former in torch ops
         for epsilon in [1e-5, 1e-6]:
+            if current_platform.is_device_capability(120):
+                FusedAddRMSNormMXFP8QuantPattern(epsilon).register(self.patterns)
+
             # Fuse fused_add_rms_norm + static fp8 quant
             FusedAddRMSNormStaticQuantPattern(epsilon, FP8_DTYPE).register(
                 self.patterns
@@ -685,4 +729,5 @@ class RMSNormQuantFusionPass(VllmPatternMatcherPass):
             FusedAddRMSNormStaticQuantPattern,
             FusedAddRMSNormDynamicQuantPattern,
             FusedAddRMSNormGroupQuantPattern,
+            FusedAddRMSNormMXFP8QuantPattern,
         )

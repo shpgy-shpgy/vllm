@@ -86,6 +86,28 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
         eagle_model, "has_own_lm_head", draft_lm_head, target_lm_head
     ):
         if draft_lm_head is not None:
+            # Model loading may already have prepared an auxiliary FP4/FP8 copy
+            # on the draft head. Drop it before replacing the draft head so
+            # references held by loader wrappers cannot retain a vocabulary-sized
+            # allocation. Keep imports off the normal path when unused.
+            if (
+                draft_lm_head is not target_lm_head
+                and hasattr(draft_lm_head, "_hybrid_mxfp4_lm_head_state")
+            ):
+                from vllm.model_executor.layers.hybrid_mxfp4_lm_head import (
+                    release_hybrid_mxfp4_lm_head,
+                )
+
+                release_hybrid_mxfp4_lm_head(draft_lm_head)
+            if (
+                draft_lm_head is not target_lm_head
+                and hasattr(draft_lm_head, "_hybrid_mxfp8_lm_head_state")
+            ):
+                from vllm.model_executor.layers.hybrid_mxfp8_lm_head import (
+                    release_hybrid_mxfp8_lm_head,
+                )
+
+                release_hybrid_mxfp8_lm_head(draft_lm_head)
             del eagle_model.lm_head
         eagle_model.lm_head = target_lm_head
 
@@ -97,6 +119,25 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
             for layer in items:
                 sh = getattr(layer, "shared_head", None)
                 if sh is not None and hasattr(sh, "head"):
+                    old_head = sh.head
+                    if (
+                        old_head is not target_lm_head
+                        and hasattr(old_head, "_hybrid_mxfp4_lm_head_state")
+                    ):
+                        from vllm.model_executor.layers.hybrid_mxfp4_lm_head import (
+                            release_hybrid_mxfp4_lm_head,
+                        )
+
+                        release_hybrid_mxfp4_lm_head(old_head)
+                    if (
+                        old_head is not target_lm_head
+                        and hasattr(old_head, "_hybrid_mxfp8_lm_head_state")
+                    ):
+                        from vllm.model_executor.layers.hybrid_mxfp8_lm_head import (
+                            release_hybrid_mxfp8_lm_head,
+                        )
+
+                        release_hybrid_mxfp8_lm_head(old_head)
                     del sh.head
                     sh.head = target_lm_head
 

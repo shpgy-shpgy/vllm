@@ -30,6 +30,8 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+logger = init_logger(__name__)
+
 
 class EncoderRunner:
     def __init__(

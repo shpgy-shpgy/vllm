@@ -3,7 +3,80 @@
 import torch
 
 from vllm.model_executor.layers.quantization.utils.ocp_mx_utils import OCP_MX_BLOCK_SIZE
+from vllm.logger import init_logger
 from vllm.utils.torch_utils import direct_register_custom_op
+
+logger = init_logger(__name__)
+
+
+def _unpack_mxfp6(x: torch.Tensor) -> torch.Tensor:
+    """Unpack four contiguous 6-bit values from every three bytes."""
+    if x.ndim == 0 or x.shape[-1] == 0 or (x.shape[-1] * 4) % 3 != 0:
+        raise ValueError(
+            "Packed MXFP6 weights must have a non-empty last dimension whose "
+            "size is divisible by 3."
+        )
+
+    packed = x.contiguous().reshape(-1, x.shape[-1]).to(torch.int32)
+    byte0 = packed[:, 0::3]
+    byte1 = packed[:, 1::3]
+    byte2 = packed[:, 2::3]
+    codes = torch.stack(
+        (
+            byte0 & 0x3F,
+            (byte0 >> 6) | ((byte1 & 0x0F) << 2),
+            (byte1 >> 4) | ((byte2 & 0x03) << 4),
+            byte2 >> 2,
+        ),
+        dim=-1,
+    )
+    return codes.reshape(*x.shape[:-1], -1).to(torch.uint8)
+
+
+def _decode_mxfp6(codes: torch.Tensor, quant_dtype: str) -> torch.Tensor:
+    """Decode OCP MXFP6 E3M2/E2M3 codes to float32."""
+    if quant_dtype == "fp6_e3m2":
+        exponent_bits, mantissa_bits, exponent_bias = 3, 2, 3
+    elif quant_dtype == "fp6_e2m3":
+        exponent_bits, mantissa_bits, exponent_bias = 2, 3, 1
+    else:
+        raise ValueError(f"Unsupported MXFP6 dtype: {quant_dtype}")
+
+    code = codes.to(torch.int32)
+    sign = torch.where((code & 0x20) != 0, -1.0, 1.0)
+    exponent = (code >> mantissa_bits) & ((1 << exponent_bits) - 1)
+    mantissa = code & ((1 << mantissa_bits) - 1)
+
+    normal = (1.0 + mantissa.to(torch.float32) / (1 << mantissa_bits)) * (
+        2.0 ** (exponent.to(torch.float32) - exponent_bias)
+    )
+    subnormal = mantissa.to(torch.float32) * (
+        2.0 ** (1 - exponent_bias - mantissa_bits)
+    )
+    return sign * torch.where(exponent == 0, subnormal, normal)
+
+
+def _dequant_mxfp6_torch(
+    x: torch.Tensor, scale: torch.Tensor, float_dtype: torch.dtype, quant_dtype: str
+) -> torch.Tensor:
+    """Quark-compatible MXFP6 dequantization without an external package."""
+    unpacked_x = _unpack_mxfp6(x)
+    if unpacked_x.shape[-1] % OCP_MX_BLOCK_SIZE != 0:
+        raise ValueError(
+            "Unpacked MXFP6 weights must have a last dimension divisible by "
+            f"{OCP_MX_BLOCK_SIZE}."
+        )
+
+    values = _decode_mxfp6(unpacked_x, quant_dtype)
+    num_groups = values.shape[-1] // OCP_MX_BLOCK_SIZE
+    values = values.reshape(*values.shape[:-1], num_groups, OCP_MX_BLOCK_SIZE)
+
+    # UE8M0 stores the power-of-two exponent with a bias of 127.  Scales are
+    # normally [rows, K/32], but keeping the leading dimensions broadcastable
+    # also covers expert weight tensors.
+    scales = torch.exp2(scale.to(torch.int16).to(torch.float32) - 127.0)
+    values = values * scales.unsqueeze(-1)
+    return values.reshape(*unpacked_x.shape[:-1], -1).to(float_dtype)
 
 
 def _quant_dequant_mxfp6(
@@ -66,11 +139,11 @@ def _dequant_mxfp6(
         )
         from quark.torch.utils.pack import create_pack_method
     except ImportError as e:
-        raise ImportError(
-            "The package `amd-quark` is required to use "
-            "MX-FP6 models. Please install it with `pip install "
-            "amd-quark`."
-        ) from e
+        logger.warning_once(
+            "The package `amd-quark` is unavailable; using the slower pure "
+            "PyTorch MXFP6 dequantization fallback."
+        )
+        return _dequant_mxfp6_torch(x, scale, float_dtype, quant_dtype)
 
     pack_method = create_pack_method(None, dtype=quant_dtype)
     unpacked_x = pack_method.unpack(x, reorder=False)

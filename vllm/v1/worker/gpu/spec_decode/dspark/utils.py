@@ -113,6 +113,24 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
         and _should_share(draft_model, "has_own_lm_head", draft_lm_head, target_lm_head)
     ):
         if draft_lm_head is not None:
+            if (
+                draft_lm_head is not target_lm_head
+                and hasattr(draft_lm_head, "_hybrid_mxfp4_lm_head_state")
+            ):
+                from vllm.model_executor.layers.hybrid_mxfp4_lm_head import (
+                    release_hybrid_mxfp4_lm_head,
+                )
+
+                release_hybrid_mxfp4_lm_head(draft_lm_head)
+            if (
+                draft_lm_head is not target_lm_head
+                and hasattr(draft_lm_head, "_hybrid_mxfp8_lm_head_state")
+            ):
+                from vllm.model_executor.layers.hybrid_mxfp8_lm_head import (
+                    release_hybrid_mxfp8_lm_head,
+                )
+
+                release_hybrid_mxfp8_lm_head(draft_lm_head)
             del draft_model.lm_head
         draft_model.lm_head = target_lm_head
 

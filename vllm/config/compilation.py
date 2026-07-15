@@ -5,6 +5,7 @@ import enum
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import field, fields
+from math import lcm
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
@@ -1478,23 +1479,6 @@ class CompilationConfig:
                 "and make sure compilation mode is VLLM_COMPILE"
             )
 
-        # MRV1 adjusts cudagraph sizes to be a multiple of uniform_decode_query_len
-        # to avoid: https://github.com/vllm-project/vllm/issues/28207 and temp-fix:
-        # https://github.com/vllm-project/vllm/issues/28207#issuecomment-3504004536
-        # Will be removed in the near future when we have separate cudagraph capture
-        # sizes for decode and mixed prefill-decode.
-        # MRV2 handles cudagraph capture sizing in cudagraph_utils.py
-        # and doesn't need below: https://github.com/vllm-project/vllm/pull/45953
-        if (
-            not use_v2_model_runner
-            and cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
-            and uniform_decode_query_len > 1
-        ):
-            self.adjust_cudagraph_sizes_for_spec_decode(
-                uniform_decode_query_len,
-                tensor_parallel_size,
-            )
-
         # For Mamba models with FULL decode cudagraphs, each decode
         # sequence needs one Mamba cache block. The decode cudagraph
         # dispatcher already caps batch sizes at max_num_seqs, so we just
@@ -1522,50 +1506,65 @@ class CompilationConfig:
         self.cudagraph_mode = cudagraph_mode
         return cudagraph_mode
 
-    def adjust_cudagraph_sizes_for_spec_decode(
-        self, uniform_decode_query_len: int, tensor_parallel_size: int
-    ):
+    def get_cudagraph_capture_sizes_for_decode(
+        self,
+        uniform_decode_query_len: int,
+        tensor_parallel_size: int = 1,
+    ) -> list[int]:
+        """Return capture sizes for FULL decode graphs without mutating config.
+
+        Speculative decode FULL graphs require token counts to be a multiple of
+        the per-request query length. Mixed/prefill PIECEWISE graphs do not have
+        this constraint, so callers should use this helper only for decode graph
+        keys and keep ``cudagraph_capture_sizes`` unchanged.
+        """
+        if not self.cudagraph_capture_sizes:
+            return []
+
         multiple_of = uniform_decode_query_len
         if tensor_parallel_size > 1 and self.pass_config.enable_sp:
-            multiple_of = max(uniform_decode_query_len, tensor_parallel_size)
-            if (
-                multiple_of % uniform_decode_query_len != 0
-                or multiple_of % tensor_parallel_size != 0
-            ):
-                raise ValueError(
-                    f"Can't determine cudagraph shapes that are both a "
-                    f"multiple of {uniform_decode_query_len} "
-                    f"(num_speculative_tokens + 1) required by spec-decode "
-                    f"and {tensor_parallel_size} (tensor_parallel_size) "
-                    f"required by sequence parallelism please adjust "
-                    f"num_speculative_tokens or disable sequence parallelism"
-                )
+            multiple_of = lcm(uniform_decode_query_len, tensor_parallel_size)
 
-        if not self.cudagraph_capture_sizes or multiple_of <= 1:
-            return
+        if multiple_of <= 1:
+            return list(self.cudagraph_capture_sizes)
 
         assert self.max_cudagraph_capture_size is not None
         rounded_sizes = sorted(
-            set(
-                round_up(size, multiple_of)
+            {
+                rounded_size
                 for size in self.cudagraph_capture_sizes
-                if round_up(size, multiple_of) <= self.max_cudagraph_capture_size
-            )
+                if (rounded_size := round_up(size, multiple_of))
+                <= self.max_cudagraph_capture_size
+            }
         )
 
         if len(rounded_sizes) == 0 and multiple_of <= self.max_cudagraph_capture_size:
-            # if one valid but would be round_down use that
+            # If all configured sizes round past the max, still capture the
+            # smallest valid decode graph.
             rounded_sizes = [multiple_of]
 
         if len(rounded_sizes) == 0:
             raise ValueError(
-                f"No valid cudagraph sizes after rounding to multiple of {multiple_of} "
-                f"(num_speculative_tokens + 1 or tp if sequence parallelism is enabled)"
-                f" please adjust num_speculative_tokens ({uniform_decode_query_len - 1}"
-                f") or max_cudagraph_capture_size ({self.max_cudagraph_capture_size})"
-                f" or cudagraph_capture_sizes ({self.cudagraph_capture_sizes})"
+                f"No valid decode cudagraph sizes after rounding to multiple of "
+                f"{multiple_of} (num_speculative_tokens + 1 or lcm with tp if "
+                f"sequence parallelism is enabled). Please adjust "
+                f"num_speculative_tokens ({uniform_decode_query_len - 1}), "
+                f"max_cudagraph_capture_size ({self.max_cudagraph_capture_size}), "
+                f"or cudagraph_capture_sizes ({self.cudagraph_capture_sizes})."
             )
 
+        return rounded_sizes
+
+    def adjust_cudagraph_sizes_for_spec_decode(
+        self, uniform_decode_query_len: int, tensor_parallel_size: int
+    ):
+        if not self.cudagraph_capture_sizes or uniform_decode_query_len <= 1:
+            return
+
+        rounded_sizes = self.get_cudagraph_capture_sizes_for_decode(
+            uniform_decode_query_len,
+            tensor_parallel_size,
+        )
         self.max_cudagraph_capture_size = rounded_sizes[-1]
         self.cudagraph_capture_sizes = rounded_sizes
 

@@ -229,7 +229,7 @@ if flashinfer_comm is not None:
         get_workspace_fn = (
             get_fi_ar_quant_workspace if is_quant_pattern else get_fi_ar_workspace
         )
-        workspace = get_workspace_fn(
+        workspace_kwargs = dict(
             world_size=world_size,
             rank=get_tensor_model_parallel_rank(),
             max_token_num=max_token_num,
@@ -237,6 +237,13 @@ if flashinfer_comm is not None:
             dtype=allreduce_in.dtype,
             group=get_tp_group().cpu_group,
         )
+        if is_quant_pattern:
+            workspace = get_workspace_fn(**workspace_kwargs)
+        else:
+            workspace = get_workspace_fn(
+                **workspace_kwargs,
+                device=allreduce_in.device,
+            )
         assert workspace is not None, (
             "Flashinfer allreduce workspace must be initialized when using flashinfer"
         )
@@ -1066,7 +1073,10 @@ class AllReduceFusionPass(VllmPatternMatcherPass):
             dtype=self.model_dtype,
             group=self.group,
         )
-        if get_fi_ar_workspace(**workspace_kwargs) is None:
+        device = (
+            current_platform.current_device() if current_platform.is_cuda() else None
+        )
+        if get_fi_ar_workspace(**workspace_kwargs, device=device) is None:
             logger.warning_once(
                 "Failed to initialize Flashinfer allreduce workspace. "
                 "Flashinfer allreduce-norm fusion will be disabled."
