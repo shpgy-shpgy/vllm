@@ -19,6 +19,20 @@ def engine_client(request: Request) -> EngineClient:
     return request.app.state.engine_client
 
 
+@router.get("/ready", response_class=Response)
+async def ready(raw_request: Request) -> Response:
+    """Health check."""
+    client = engine_client(raw_request)
+    if client is None:
+        # Render-only servers have no engine; they are always healthy.
+        return Response(status_code=200)
+    try:
+        await client.check_health()
+        return Response(status_code=200)
+    except EngineDeadError:
+        return Response(content="Service Unavailable", status_code=503)
+
+
 @router.get("/health", response_class=Response)
 async def health(raw_request: Request) -> Response:
     """Health check."""

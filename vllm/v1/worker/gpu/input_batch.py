@@ -547,6 +547,10 @@ def _post_update_kernel(
     last_sampled_tokens_ptr,
     output_bin_counts_ptr,
     output_bin_counts_stride,
+    output_unique_token_ids_ptr,
+    output_unique_token_ids_stride,
+    num_output_unique_tokens_ptr,
+    presence_penalty_ptr,
     sampled_tokens_ptr,
     sampled_tokens_stride,
     num_sampled_ptr,
@@ -586,6 +590,24 @@ def _post_update_kernel(
             )
             count = tl.load(token_ptr)
             tl.store(token_ptr, count + 1)
+            if output_unique_token_ids_ptr is not None:
+                track_unique_tokens = (
+                    tl.load(presence_penalty_ptr + req_state_idx) != 0.0
+                )
+                if count == 0 and track_unique_tokens:
+                    unique_position = tl.load(
+                        num_output_unique_tokens_ptr + req_state_idx
+                    )
+                    tl.store(
+                        output_unique_token_ids_ptr
+                        + req_state_idx * output_unique_token_ids_stride
+                        + unique_position,
+                        token_id,
+                    )
+                    tl.store(
+                        num_output_unique_tokens_ptr + req_state_idx,
+                        unique_position + 1,
+                    )
 
     if query_start_loc_ptr is None:
         query_len = 0
@@ -610,6 +632,12 @@ def post_update(
     last_sampled_tokens: torch.Tensor,
     # [max_num_reqs, vocab_size]
     output_bin_counts: torch.Tensor | None,
+    # [max_num_reqs, max_model_len]
+    output_unique_token_ids: torch.Tensor | None,
+    # [max_num_reqs]
+    num_output_unique_tokens: torch.Tensor | None,
+    # [max_num_reqs]
+    presence_penalty: torch.Tensor | None,
     # [num_reqs, num_speculative_steps + 1]
     sampled_tokens: torch.Tensor,
     # [num_reqs]
@@ -630,6 +658,10 @@ def post_update(
         last_sampled_tokens,
         output_bin_counts,
         output_bin_counts.stride(0) if output_bin_counts is not None else 0,
+        output_unique_token_ids,
+        output_unique_token_ids.stride(0) if output_unique_token_ids is not None else 0,
+        num_output_unique_tokens,
+        presence_penalty,
         sampled_tokens,
         sampled_tokens.stride(0),
         num_sampled,

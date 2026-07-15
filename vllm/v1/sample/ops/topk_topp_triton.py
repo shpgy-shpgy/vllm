@@ -18,6 +18,10 @@ from vllm.utils.platform_utils import num_compute_units
 
 _TRITON_TABLE_CACHE: dict[tuple[torch.device], tuple[torch.Tensor, torch.Tensor]] = {}
 _TRITON_BUFFER_CACHE: dict[tuple[torch.device, torch.dtype, int], torch.Tensor] = {}
+_TRITON_SMALL_TOPK_SAMPLE_CACHE: dict[
+    tuple[torch.device, torch.dtype, int, int],
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+] = {}
 
 # fmt: off
 _NORMAL_CDF_TO_SIGMA_TABLE = [
@@ -100,6 +104,8 @@ def _topk_topp_kernel(
     NORMAL_CDF_TO_SIGMA_TABLE,
     K,
     P,
+    PIVOTS,
+    COUNTS,
     BATCH_SIZE,
     VOCAB_SIZE: tl.constexpr,
     MASK_VALUE: tl.constexpr,
@@ -107,6 +113,9 @@ def _topk_topp_kernel(
     BLOCK_SIZE_TRUNC: tl.constexpr,
     TOPK_ENABLED: tl.constexpr,
     TOPP_ENABLED: tl.constexpr,
+    APPLY_FINAL_MASK: tl.constexpr,
+    OUTPUT_PIVOT: tl.constexpr,
+    RESET_COUNTS: tl.constexpr,
 ):
     NUM_TILES: tl.constexpr = (VOCAB_SIZE + BLOCK_SIZE - 1) // BLOCK_SIZE
     pid = tl.program_id(0)
@@ -830,7 +839,13 @@ def _topk_topp_kernel(
         # Using `not <` instead of `>=` so that NaN is also caught.
         if not (final_pivot < max_logit):
             final_pivot = -float("inf")
-        elif final_pivot != -float("inf"):
+
+        if OUTPUT_PIVOT:
+            tl.store(PIVOTS + row_id, final_pivot)
+        if RESET_COUNTS:
+            tl.store(COUNTS + row_id, 0)
+
+        if APPLY_FINAL_MASK and final_pivot != -float("inf"):
             for i in range(0, NUM_TILES):
                 offs_n = i * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
                 mask_n = offs_n < VOCAB_SIZE
@@ -954,6 +969,8 @@ def apply_top_k_top_p_triton(
         normal_cdf_to_sigma_table,
         k_ptr,
         p_ptr,
+        logits,
+        logits,
         BATCH_SIZE=batch_size,
         MASK_VALUE=mask_value,
         VOCAB_SIZE=vocab_size,
@@ -961,13 +978,876 @@ def apply_top_k_top_p_triton(
         BLOCK_SIZE_TRUNC=block_size_trunc,
         TOPK_ENABLED=topk_enabled,
         TOPP_ENABLED=topp_enabled,
+        APPLY_FINAL_MASK=True,
+        OUTPUT_PIVOT=False,
+        RESET_COUNTS=False,
         **launch_kwargs,
     )
 
     return logits
 
 
+@triton.jit
+def _rand64(seed, offset, includes_zero: tl.constexpr):
+    lo, hi, _, _ = tl.randint4x(seed, offset)
+    lo = lo.to(tl.uint32, bitcast=True).to(tl.uint64)
+    hi = hi.to(tl.uint32, bitcast=True).to(tl.uint64)
+    r = (hi << 32) | lo
+
+    # 1 / 2**64
+    scale = 5.421010862427522170037e-20
+    u = r.to(tl.float64) * scale
+    u = tl.minimum(u, 0.9999999999999999)
+    if not includes_zero:
+        u = tl.maximum(u, 2.2250738585072014e-308)  # float64 tiny
+    return u
+
+
+@triton.jit
+def _compact_masked_topk_kernel(
+    LOGITS,
+    LOGITS_STRIDE,
+    CANDIDATE_IDS,
+    CANDIDATE_LOGITS,
+    COUNTS,
+    VOCAB_SIZE: tl.constexpr,
+    MAX_CANDIDATES: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row_id = tl.program_id(0)
+    block_id = tl.program_id(1)
+    offs = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < VOCAB_SIZE
+
+    logits = tl.load(
+        LOGITS + row_id * LOGITS_STRIDE + offs,
+        mask=mask,
+        other=-float("inf"),
+    ).to(tl.float32)
+    keep = (logits > -float("inf")) & mask
+    keep_i32 = keep.to(tl.int32)
+    num_keep = tl.sum(keep_i32, axis=0)
+    local_pos = tl.cumsum(keep_i32, axis=0) - 1
+    base = tl.atomic_add(COUNTS + row_id, num_keep, sem="relaxed")
+    write_pos = base + local_pos
+    write_mask = keep & (write_pos < MAX_CANDIDATES)
+
+    tl.store(
+        CANDIDATE_LOGITS + row_id * MAX_CANDIDATES + write_pos,
+        logits,
+        mask=write_mask,
+    )
+    tl.store(
+        CANDIDATE_IDS + row_id * MAX_CANDIDATES + write_pos,
+        offs,
+        mask=write_mask,
+    )
+
+
+def apply_top_k_top_p_and_sample_small_topk_parallel_triton(
+    logits: torch.Tensor,
+    k: torch.Tensor,
+    p: torch.Tensor | None,
+    seeds: torch.Tensor,
+    max_top_k: int,
+    mask_value: float = float("-inf"),
+) -> torch.Tensor:
+    """Compute top-k/top-p pivots, then parallel mask+compact and sample."""
+    assert logits.ndim == 2
+    assert logits.dtype == torch.float32
+    assert k.ndim == 1 and k.shape[0] == logits.shape[0]
+    assert seeds.ndim == 1 and seeds.shape[0] == logits.shape[0]
+    if p is not None:
+        assert p.ndim == 1 and p.shape[0] == logits.shape[0]
+
+    batch_size, vocab_size = logits.shape
+    if batch_size == 0:
+        return torch.empty((0,), dtype=torch.int64, device=logits.device)
+    if logits.stride(1) != 1:
+        logits = logits.contiguous()
+
+    max_candidates = min(64, next_power_of_2(max(1, max_top_k)))
+    candidate_ids, candidate_logits, counts, sampled = _get_small_topk_sample_buffers(
+        logits, batch_size, max_candidates
+    )
+    k_ptr = k.to(torch.int32)
+    if p is not None:
+        p_ptr = p.to(torch.float32)
+        topp_enabled = True
+    else:
+        p_ptr = logits
+        topp_enabled = False
+
+    num_sm = num_compute_units(logits.device.index)
+    NUM_PROGRAMS = min(num_sm, batch_size)
+
+    buf_key = (logits.device, logits.dtype, vocab_size)
+    buffer = _TRITON_BUFFER_CACHE.get(buf_key)
+    if buffer is None or buffer.shape[0] < NUM_PROGRAMS:
+        size = min(next_power_of_2(NUM_PROGRAMS), num_sm)
+        buffer = logits.new_empty((size, vocab_size))
+        _TRITON_BUFFER_CACHE[buf_key] = buffer
+    if buffer.shape[0] > NUM_PROGRAMS:
+        buffer = buffer[:NUM_PROGRAMS]
+
+    tables = _TRITON_TABLE_CACHE.get(logits.device)
+    if tables is None:
+        normal_cdf_to_sigma_table = logits.new_tensor(_NORMAL_CDF_TO_SIGMA_TABLE)
+        percentile_to_std_table = logits.new_tensor(_PERCENTILE_TO_STD_TABLE)
+        _TRITON_TABLE_CACHE[logits.device] = (
+            normal_cdf_to_sigma_table,
+            percentile_to_std_table,
+        )
+    else:
+        normal_cdf_to_sigma_table, percentile_to_std_table = tables
+
+    _topk_topp_kernel[(NUM_PROGRAMS,)](
+        logits,
+        logits.stride(0),
+        buffer,
+        percentile_to_std_table,
+        normal_cdf_to_sigma_table,
+        k_ptr,
+        p_ptr,
+        logits,
+        counts,
+        BATCH_SIZE=batch_size,
+        MASK_VALUE=mask_value,
+        VOCAB_SIZE=vocab_size,
+        BLOCK_SIZE=8192,
+        BLOCK_SIZE_TRUNC=4096,
+        TOPK_ENABLED=True,
+        TOPP_ENABLED=topp_enabled,
+        APPLY_FINAL_MASK=True,
+        OUTPUT_PIVOT=False,
+        RESET_COUNTS=False,
+    )
+
+    counts.zero_()
+    block_size = 1024
+    num_blocks = triton.cdiv(vocab_size, block_size)
+    _compact_masked_topk_kernel[(batch_size, num_blocks)](
+        logits,
+        logits.stride(0),
+        candidate_ids,
+        candidate_logits,
+        counts,
+        VOCAB_SIZE=vocab_size,
+        MAX_CANDIDATES=max_candidates,
+        BLOCK_SIZE=block_size,
+    )
+
+    _sample_compacted_topk_kernel[(batch_size,)](
+        candidate_ids,
+        candidate_logits,
+        counts,
+        seeds,
+        sampled,
+        MAX_CANDIDATES=max_candidates,
+        BLOCK_SIZE=max_candidates,
+    )
+    return sampled
+
+
+@triton.jit
+def _sample_compacted_topk_kernel(
+    CANDIDATE_IDS,
+    CANDIDATE_LOGITS,
+    COUNTS,
+    SEEDS,
+    SAMPLED,
+    MAX_CANDIDATES: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row_id = tl.program_id(0)
+    offs = tl.arange(0, BLOCK_SIZE)
+    count = tl.minimum(tl.load(COUNTS + row_id), MAX_CANDIDATES)
+    mask = offs < count
+
+    logits = tl.load(
+        CANDIDATE_LOGITS + row_id * MAX_CANDIDATES + offs,
+        mask=mask,
+        other=-float("inf"),
+    ).to(tl.float64)
+
+    candidate_ids = tl.load(
+        CANDIDATE_IDS + row_id * MAX_CANDIDATES + offs,
+        mask=mask,
+        other=0,
+    )
+    seed = tl.load(SEEDS + row_id)
+    # Key random values by token id rather than compact slot. Compaction uses
+    # atomics across vocab tiles, whose completion order is not deterministic.
+    u = _rand64(seed, candidate_ids, includes_zero=False)
+    gumbel_noise = -tl.log(-tl.log(u))
+    scores = tl.where(mask, logits + gumbel_noise, -float("inf"))
+    _, idx = tl.max(scores, axis=0, return_indices=True)
+
+    token_id = tl.sum(tl.where((offs == idx) & mask, candidate_ids, 0), axis=0)
+    tl.store(SAMPLED + row_id, token_id)
+
+
+@triton.jit
+def _full_vocab_sample_block_kernel(
+    LOGITS,
+    SEEDS,
+    EXCLUDE_TOKEN_IDS,
+    SHARD_TOKEN_IDS,
+    BLOCK_VALUES,
+    BLOCK_INDICES,
+    VOCAB_START: tl.constexpr,
+    VOCAB_SIZE: tl.constexpr,
+    ACTIVE_VOCAB_SIZE: tl.constexpr,
+    NUM_BLOCKS: tl.constexpr,
+    SCALE_OVER_TEMPERATURE: tl.constexpr,
+    HAS_EXCLUDE: tl.constexpr,
+    HAS_SHARD_TOKEN_IDS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    block_id = tl.program_id(1)
+    lane = tl.arange(0, BLOCK_SIZE)
+    vocab_offsets = block_id * BLOCK_SIZE + lane
+    mask = vocab_offsets < ACTIVE_VOCAB_SIZE
+    if HAS_SHARD_TOKEN_IDS:
+        global_offsets = tl.load(
+            SHARD_TOKEN_IDS + vocab_offsets,
+            mask=vocab_offsets < VOCAB_SIZE,
+            other=-1,
+        )
+        mask = mask & (global_offsets >= 0)
+    else:
+        global_offsets = VOCAB_START + vocab_offsets
+    if HAS_EXCLUDE:
+        exclude_token_id = tl.load(EXCLUDE_TOKEN_IDS + row)
+        mask = mask & (global_offsets != exclude_token_id)
+
+    logits = tl.load(
+        LOGITS + row * VOCAB_SIZE + vocab_offsets,
+        mask=mask,
+        other=-float("inf"),
+    ).to(tl.float32)
+    logits = logits * SCALE_OVER_TEMPERATURE
+
+    seed = tl.load(SEEDS + row)
+    random_offsets = tl.where(mask, global_offsets, 0)
+    u = _rand64(seed, random_offsets, includes_zero=False)
+    gumbel_noise = -tl.log(-tl.log(u))
+    scores = logits.to(tl.float64) + gumbel_noise
+    scores = tl.where(mask, scores, -float("inf"))
+
+    value, lane_idx = tl.max(scores, axis=0, return_indices=True)
+    token_id = tl.max(tl.where((lane == lane_idx) & mask, global_offsets, 0), axis=0)
+    out_offset = row * NUM_BLOCKS + block_id
+    tl.store(BLOCK_VALUES + out_offset, value)
+    tl.store(BLOCK_INDICES + out_offset, token_id)
+
+
+@triton.jit
+def _merge_full_vocab_sample_blocks_kernel(
+    BLOCK_VALUES,
+    BLOCK_INDICES,
+    OUT_VALUES,
+    OUT_INDICES,
+    NUM_BLOCKS: tl.constexpr,
+    BLOCK_NUM_BLOCKS: tl.constexpr,
+):
+    row = tl.program_id(0)
+    lane = tl.arange(0, BLOCK_NUM_BLOCKS)
+    mask = lane < NUM_BLOCKS
+    in_offset = row * NUM_BLOCKS + lane
+
+    values = tl.load(BLOCK_VALUES + in_offset, mask=mask, other=-float("inf"))
+    indices = tl.load(BLOCK_INDICES + in_offset, mask=mask, other=0)
+    _, lane_idx = tl.max(values, axis=0, return_indices=True)
+    token_id = tl.max(tl.where(lane == lane_idx, indices, 0), axis=0)
+
+    tl.store(OUT_VALUES + row, tl.max(values, axis=0))
+    tl.store(OUT_INDICES + row, token_id)
+
+
+def sample_full_vocab_from_shard_triton(
+    logits: torch.Tensor,
+    *,
+    vocab_start: int,
+    active_vocab_size: int,
+    seeds: torch.Tensor,
+    shard_token_ids: torch.Tensor | None = None,
+    exclude_token_ids: torch.Tensor | None = None,
+    scale: float = 1.0,
+    temperature: float = 1.0,
+    block_size: int = 1024,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sample local vocab-shard winners with Gumbel-max.
+
+    Returns per-row ``(score, global_token_id)`` winners. Reducing those winners
+    across TP ranks is equivalent to sampling from the full global softmax,
+    while communicating only one pair per row per rank.
+    """
+    assert logits.ndim == 2
+    assert logits.is_cuda
+    assert seeds.ndim == 1 and seeds.shape[0] == logits.shape[0]
+    assert seeds.dtype == torch.int64
+    if exclude_token_ids is not None:
+        assert exclude_token_ids.ndim == 1
+        assert exclude_token_ids.shape[0] == logits.shape[0]
+        assert exclude_token_ids.dtype in (torch.int32, torch.int64)
+    assert 0 < active_vocab_size <= logits.shape[1]
+    assert temperature > 0.0
+    if shard_token_ids is not None:
+        assert shard_token_ids.ndim == 1
+        assert shard_token_ids.shape[0] == logits.shape[1]
+        assert shard_token_ids.dtype == torch.int64
+
+    batch_size, vocab_size = logits.shape
+    out_values = torch.empty((batch_size,), device=logits.device, dtype=torch.float64)
+    out_indices = torch.empty((batch_size,), device=logits.device, dtype=torch.int32)
+    if batch_size == 0:
+        return out_values, out_indices
+
+    if not logits.is_contiguous():
+        logits = logits.contiguous()
+    if exclude_token_ids is None:
+        exclude_token_ids = seeds
+        has_exclude = False
+    else:
+        if not exclude_token_ids.is_contiguous():
+            exclude_token_ids = exclude_token_ids.contiguous()
+        has_exclude = True
+    if shard_token_ids is None:
+        shard_token_ids = seeds
+        has_shard_token_ids = False
+    else:
+        if not shard_token_ids.is_contiguous():
+            shard_token_ids = shard_token_ids.contiguous()
+        has_shard_token_ids = True
+
+    num_blocks = triton.cdiv(active_vocab_size, block_size)
+    block_values = torch.empty(
+        (batch_size, num_blocks), device=logits.device, dtype=torch.float64
+    )
+    block_indices = torch.empty(
+        (batch_size, num_blocks), device=logits.device, dtype=torch.int32
+    )
+    _full_vocab_sample_block_kernel[(batch_size, num_blocks)](
+        logits,
+        seeds,
+        exclude_token_ids,
+        shard_token_ids,
+        block_values,
+        block_indices,
+        VOCAB_START=int(vocab_start),
+        VOCAB_SIZE=vocab_size,
+        ACTIVE_VOCAB_SIZE=active_vocab_size,
+        NUM_BLOCKS=num_blocks,
+        SCALE_OVER_TEMPERATURE=float(scale) / float(temperature),
+        HAS_EXCLUDE=has_exclude,
+        HAS_SHARD_TOKEN_IDS=has_shard_token_ids,
+        BLOCK_SIZE=block_size,
+    )
+    _merge_full_vocab_sample_blocks_kernel[(batch_size,)](
+        block_values,
+        block_indices,
+        out_values,
+        out_indices,
+        NUM_BLOCKS=num_blocks,
+        BLOCK_NUM_BLOCKS=next_power_of_2(num_blocks),
+    )
+    return out_values, out_indices
+
+
+@triton.jit
+def _pack_topk_pairs_kernel(
+    LOCAL_VALS,
+    LOCAL_INDICES,
+    LOCAL_PAIRS,
+    VOCAB_START: tl.constexpr,
+    TOP_K: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row_id = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK)
+    mask = offsets < TOP_K
+
+    input_base = row_id * TOP_K
+    vals = tl.load(LOCAL_VALS + input_base + offsets, mask=mask, other=0.0).to(
+        tl.float32
+    )
+    indices = tl.load(LOCAL_INDICES + input_base + offsets, mask=mask, other=0).to(
+        tl.int64
+    )
+    global_indices = indices + VOCAB_START
+
+    output_base = row_id * TOP_K * 2
+    tl.store(LOCAL_PAIRS + output_base + offsets * 2, vals, mask=mask)
+    tl.store(
+        LOCAL_PAIRS + output_base + offsets * 2 + 1,
+        global_indices.to(tl.float32),
+        mask=mask,
+    )
+
+
+def pack_topk_pairs_triton(
+    local_vals: torch.Tensor,
+    local_indices: torch.Tensor,
+    vocab_start: int,
+) -> torch.Tensor:
+    """Pack local top-k values and local ids into compact gather pairs.
+
+    The output shape is ``[batch, top_k * 2]`` with interleaved
+    ``(logit, global_token_id_as_float)`` entries, matching the distributed
+    gather send buffer consumed by compact top-k sampling.
+    """
+    assert local_vals.ndim == 2
+    assert local_indices.shape == local_vals.shape
+    assert local_vals.dtype == torch.float32
+    assert local_indices.dtype == torch.int64
+
+    batch_size, top_k = local_vals.shape
+    local_pairs = torch.empty(
+        (batch_size, top_k * 2), dtype=torch.float32, device=local_vals.device
+    )
+    if batch_size == 0 or top_k == 0:
+        return local_pairs
+
+    if not local_vals.is_contiguous():
+        local_vals = local_vals.contiguous()
+    if not local_indices.is_contiguous():
+        local_indices = local_indices.contiguous()
+
+    block = next_power_of_2(top_k)
+    _pack_topk_pairs_kernel[(batch_size,)](
+        local_vals,
+        local_indices,
+        local_pairs,
+        VOCAB_START=int(vocab_start),
+        TOP_K=top_k,
+        BLOCK=block,
+    )
+    return local_pairs
+
+
+@triton.jit
+def _select_from_compact_topk_pairs_kernel(
+    GATHERED_PAIRS,
+    TOP_VALS_OUT,
+    TOP_IDS_OUT,
+    NUM_CANDIDATES: tl.constexpr,
+    TOP_K: tl.constexpr,
+    TOP_P: tl.constexpr,
+    CANDIDATE_BLOCK: tl.constexpr,
+    TOPK_BLOCK: tl.constexpr,
+):
+    row_id = tl.program_id(0)
+
+    cand_offsets = tl.arange(0, CANDIDATE_BLOCK)
+    cand_mask = cand_offsets < NUM_CANDIDATES
+    pair_base = row_id * NUM_CANDIDATES * 2
+    vals = tl.load(
+        GATHERED_PAIRS + pair_base + cand_offsets * 2,
+        mask=cand_mask,
+        other=-float("inf"),
+    ).to(tl.float32)
+    ids = tl.load(
+        GATHERED_PAIRS + pair_base + cand_offsets * 2 + 1,
+        mask=cand_mask,
+        other=0.0,
+    ).to(tl.float32)
+
+    top_offsets = tl.arange(0, TOPK_BLOCK)
+    top_vals = tl.full((TOPK_BLOCK,), -float("inf"), tl.float32)
+    top_ids = tl.full((TOPK_BLOCK,), 0.0, tl.float32)
+    work_vals = vals
+
+    for i in tl.static_range(0, TOP_K):
+        max_val, max_idx = tl.max(work_vals, axis=0, return_indices=True)
+        is_max = cand_offsets == max_idx
+        token_id = tl.sum(tl.where(is_max, ids, 0.0), axis=0)
+        top_vals = tl.where(top_offsets == i, max_val, top_vals)
+        top_ids = tl.where(top_offsets == i, token_id, top_ids)
+        work_vals = tl.where(is_max, -float("inf"), work_vals)
+
+    valid_top = top_offsets < TOP_K
+    if TOP_P < 1.0:
+        max_top_val = tl.max(tl.where(valid_top, top_vals, -float("inf")), axis=0)
+        weights = tl.exp(top_vals - max_top_val)
+        weights = tl.where(valid_top, weights, 0.0)
+        denom = tl.sum(weights, axis=0)
+        probs = tl.where(denom > 0.0, weights / denom, 0.0)
+        prev_cum_probs = tl.cumsum(probs, axis=0) - probs
+        valid_top = valid_top & (prev_cum_probs <= TOP_P)
+
+    out_base = row_id * TOP_K + top_offsets
+    out_mask = top_offsets < TOP_K
+    top_vals = tl.where(valid_top, top_vals, -float("inf"))
+    tl.store(TOP_VALS_OUT + out_base, top_vals, mask=out_mask)
+    tl.store(TOP_IDS_OUT + out_base, top_ids.to(tl.int64), mask=out_mask)
+
+
+def select_compact_topk_pairs_triton(
+    gathered_pairs: torch.Tensor,
+    top_k: int,
+    top_p: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fuse global compact top-k merge and top-p filtering.
+
+    ``gathered_pairs`` is the TP-gathered compact candidate tensor with shape
+    ``[batch, num_candidates, 2]`` where the last dimension stores
+    ``(logit, token_id_as_float)``. The outputs have shape ``[batch, top_k]``.
+    """
+    assert gathered_pairs.ndim == 3
+    assert gathered_pairs.shape[-1] == 2
+    assert gathered_pairs.dtype == torch.float32
+    assert 0 < top_k <= 64
+
+    batch_size, num_candidates, _ = gathered_pairs.shape
+    top_vals = torch.empty(
+        (batch_size, top_k), dtype=torch.float32, device=gathered_pairs.device
+    )
+    top_ids = torch.empty(
+        (batch_size, top_k), dtype=torch.int64, device=gathered_pairs.device
+    )
+    if batch_size == 0:
+        return top_vals, top_ids
+    if num_candidates < top_k:
+        raise ValueError(
+            f"num_candidates ({num_candidates}) must be >= top_k ({top_k})"
+        )
+    if num_candidates > 2048:
+        raise ValueError(
+            "compact top-k fused select only supports up to 2048 "
+            f"candidates, got {num_candidates}"
+        )
+
+    if not gathered_pairs.is_contiguous():
+        gathered_pairs = gathered_pairs.contiguous()
+
+    candidate_block = next_power_of_2(num_candidates)
+    topk_block = next_power_of_2(top_k)
+    _select_from_compact_topk_pairs_kernel[(batch_size,)](
+        gathered_pairs,
+        top_vals,
+        top_ids,
+        NUM_CANDIDATES=num_candidates,
+        TOP_K=top_k,
+        TOP_P=float(top_p),
+        CANDIDATE_BLOCK=candidate_block,
+        TOPK_BLOCK=topk_block,
+    )
+    return top_vals, top_ids
+
+
+@triton.jit
+def _sample_from_compact_topk_pairs_kernel(
+    GATHERED_PAIRS,
+    SEEDS,
+    SAMPLED,
+    NUM_CANDIDATES: tl.constexpr,
+    TOP_K: tl.constexpr,
+    TOP_P: tl.constexpr,
+    CANDIDATE_BLOCK: tl.constexpr,
+    TOPK_BLOCK: tl.constexpr,
+):
+    row_id = tl.program_id(0)
+
+    cand_offsets = tl.arange(0, CANDIDATE_BLOCK)
+    cand_mask = cand_offsets < NUM_CANDIDATES
+    pair_base = row_id * NUM_CANDIDATES * 2
+    vals = tl.load(
+        GATHERED_PAIRS + pair_base + cand_offsets * 2,
+        mask=cand_mask,
+        other=-float("inf"),
+    ).to(tl.float32)
+    ids = tl.load(
+        GATHERED_PAIRS + pair_base + cand_offsets * 2 + 1,
+        mask=cand_mask,
+        other=0.0,
+    ).to(tl.float32)
+
+    top_offsets = tl.arange(0, TOPK_BLOCK)
+    top_vals = tl.full((TOPK_BLOCK,), -float("inf"), tl.float32)
+    top_ids = tl.full((TOPK_BLOCK,), 0.0, tl.float32)
+    work_vals = vals
+
+    for i in tl.static_range(0, TOP_K):
+        max_val, max_idx = tl.max(work_vals, axis=0, return_indices=True)
+        is_max = cand_offsets == max_idx
+        token_id = tl.sum(tl.where(is_max, ids, 0.0), axis=0)
+        top_vals = tl.where(top_offsets == i, max_val, top_vals)
+        top_ids = tl.where(top_offsets == i, token_id, top_ids)
+        work_vals = tl.where(is_max, -float("inf"), work_vals)
+
+    valid_top = top_offsets < TOP_K
+    if TOP_P >= 1.0:
+        keep = valid_top
+    else:
+        max_top_val = tl.max(tl.where(valid_top, top_vals, -float("inf")), axis=0)
+        weights = tl.exp(top_vals - max_top_val)
+        weights = tl.where(valid_top, weights, 0.0)
+        denom = tl.sum(weights, axis=0)
+        probs = tl.where(denom > 0.0, weights / denom, 0.0)
+        prev_cum_probs = tl.cumsum(probs, axis=0) - probs
+        keep = valid_top & (prev_cum_probs <= TOP_P)
+
+    seed = tl.load(SEEDS + row_id)
+    u = _rand64(seed, top_offsets, includes_zero=False)
+    gumbel_noise = -tl.log(-tl.log(u))
+    scores = tl.where(keep, top_vals.to(tl.float64) + gumbel_noise, -float("inf"))
+    _, sampled_idx = tl.max(scores, axis=0, return_indices=True)
+    sampled_id = tl.sum(tl.where(top_offsets == sampled_idx, top_ids, 0.0), axis=0)
+    tl.store(SAMPLED + row_id, sampled_id.to(tl.int64))
+
+
+def sample_from_compact_topk_pairs_triton(
+    gathered_pairs: torch.Tensor,
+    top_k: int,
+    top_p: float,
+    seeds: torch.Tensor,
+) -> torch.Tensor:
+    """Fuse global compact top-k merge, top-p filtering, and sampling.
+
+    ``gathered_pairs`` is the TP-gathered compact candidate tensor with shape
+    ``[batch, num_candidates, 2]`` where the last dimension stores
+    ``(logit, token_id_as_float)``. The output is one sampled global token id
+    per row.
+    """
+    assert gathered_pairs.ndim == 3
+    assert gathered_pairs.shape[-1] == 2
+    assert gathered_pairs.dtype == torch.float32
+    assert seeds.ndim == 1 and seeds.shape[0] == gathered_pairs.shape[0]
+    assert seeds.dtype == torch.int64
+    assert 0 < top_k <= 64
+
+    batch_size, num_candidates, _ = gathered_pairs.shape
+    if batch_size == 0:
+        return torch.empty((0,), dtype=torch.int64, device=gathered_pairs.device)
+    if num_candidates < top_k:
+        raise ValueError(
+            f"num_candidates ({num_candidates}) must be >= top_k ({top_k})"
+        )
+    if num_candidates > 2048:
+        raise ValueError(
+            "compact top-k fused sampling only supports up to 2048 "
+            f"candidates, got {num_candidates}"
+        )
+
+    if not gathered_pairs.is_contiguous():
+        gathered_pairs = gathered_pairs.contiguous()
+
+    sampled = torch.empty(
+        (batch_size,), dtype=torch.int64, device=gathered_pairs.device
+    )
+    candidate_block = next_power_of_2(num_candidates)
+    topk_block = next_power_of_2(top_k)
+    _sample_from_compact_topk_pairs_kernel[(batch_size,)](
+        gathered_pairs,
+        seeds,
+        sampled,
+        NUM_CANDIDATES=num_candidates,
+        TOP_K=top_k,
+        TOP_P=float(top_p),
+        CANDIDATE_BLOCK=candidate_block,
+        TOPK_BLOCK=topk_block,
+    )
+    return sampled
+
+
+@triton.jit
+def _sample_recovered_compacted_topk_kernel(
+    CANDIDATE_IDS,
+    CANDIDATE_LOGITS,
+    COUNTS,
+    DRAFT_TOKEN_IDS,
+    SEEDS,
+    RECOVERED_TOKEN_IDS,
+    TARGET_DRAFT_PROBS,
+    MAX_CANDIDATES: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row_id = tl.program_id(0)
+    offs = tl.arange(0, BLOCK_SIZE)
+    count = tl.minimum(tl.load(COUNTS + row_id), MAX_CANDIDATES)
+    mask = offs < count
+
+    candidate_ids = tl.load(
+        CANDIDATE_IDS + row_id * MAX_CANDIDATES + offs,
+        mask=mask,
+        other=-1,
+    )
+    logits = tl.load(
+        CANDIDATE_LOGITS + row_id * MAX_CANDIDATES + offs,
+        mask=mask,
+        other=-float("inf"),
+    ).to(tl.float64)
+
+    draft_token_id = tl.load(DRAFT_TOKEN_IDS + row_id)
+    is_draft = mask & (candidate_ids == draft_token_id)
+    recovered_mask = mask & (candidate_ids != draft_token_id)
+
+    max_logit = tl.max(tl.where(mask, logits, -float("inf")), axis=0)
+    weights = tl.exp(logits - max_logit)
+    denom = tl.sum(tl.where(mask, weights, 0.0), axis=0)
+    draft_weight = tl.sum(tl.where(is_draft, weights, 0.0), axis=0)
+    target_draft_prob = tl.where(denom > 0.0, draft_weight / denom, 0.0)
+
+    seed = tl.load(SEEDS + row_id)
+    random_offsets = tl.where(mask, candidate_ids, 0)
+    u = _rand64(seed, random_offsets, includes_zero=False)
+    gumbel_noise = -tl.log(-tl.log(u))
+    scores = tl.where(recovered_mask, logits + gumbel_noise, -float("inf"))
+    _, idx = tl.max(scores, axis=0, return_indices=True)
+
+    has_recovered = tl.sum(recovered_mask.to(tl.int32), axis=0) > 0
+    recovered_token_id = tl.load(
+        CANDIDATE_IDS + row_id * MAX_CANDIDATES + idx,
+        mask=has_recovered,
+        other=0,
+    )
+    tl.store(RECOVERED_TOKEN_IDS + row_id, recovered_token_id)
+    tl.store(TARGET_DRAFT_PROBS + row_id, target_draft_prob)
+
+
+def _get_small_topk_sample_buffers(
+    logits: torch.Tensor,
+    batch_size: int,
+    max_candidates: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    batch_bucket = next_power_of_2(batch_size)
+    key = (logits.device, logits.dtype, batch_bucket, max_candidates)
+    buffers = _TRITON_SMALL_TOPK_SAMPLE_CACHE.get(key)
+    if buffers is None:
+        candidate_ids = torch.empty(
+            (batch_bucket, max_candidates), dtype=torch.int64, device=logits.device
+        )
+        candidate_logits = torch.empty(
+            (batch_bucket, max_candidates), dtype=logits.dtype, device=logits.device
+        )
+        counts = torch.empty((batch_bucket,), dtype=torch.int32, device=logits.device)
+        sampled = torch.empty((batch_bucket,), dtype=torch.int64, device=logits.device)
+        buffers = (candidate_ids, candidate_logits, counts, sampled)
+        _TRITON_SMALL_TOPK_SAMPLE_CACHE[key] = buffers
+
+    candidate_ids, candidate_logits, counts, sampled = buffers
+    return (
+        candidate_ids[:batch_size],
+        candidate_logits[:batch_size],
+        counts[:batch_size],
+        sampled[:batch_size],
+    )
+
+
+def sample_masked_small_topk_triton(
+    logits: torch.Tensor,
+    seeds: torch.Tensor,
+    max_top_k: int,
+) -> torch.Tensor:
+    """
+    Sample from logits after top-k/top-p masking when top_k is small.
+
+    `apply_top_k_top_p_triton` has already set masked logits to -inf. For
+    small top_k, only a handful of finite entries remain per row, so compact
+    those entries and run Gumbel sampling over the compact candidate set instead
+    of materializing full-vocab probabilities and exponential noise.
+    """
+    assert logits.ndim == 2
+    assert logits.dtype == torch.float32
+    assert seeds.ndim == 1 and seeds.shape[0] == logits.shape[0]
+
+    batch_size, vocab_size = logits.shape
+    if batch_size == 0:
+        return torch.empty((0,), dtype=torch.int64, device=logits.device)
+    if logits.stride(1) != 1:
+        logits = logits.contiguous()
+
+    max_candidates = min(64, next_power_of_2(max(1, max_top_k)))
+    candidate_ids, candidate_logits, counts, sampled = _get_small_topk_sample_buffers(
+        logits, batch_size, max_candidates
+    )
+    counts.zero_()
+
+    block_size = 1024
+    num_blocks = triton.cdiv(vocab_size, block_size)
+    _compact_masked_topk_kernel[(batch_size, num_blocks)](
+        logits,
+        logits.stride(0),
+        candidate_ids,
+        candidate_logits,
+        counts,
+        VOCAB_SIZE=vocab_size,
+        MAX_CANDIDATES=max_candidates,
+        BLOCK_SIZE=block_size,
+    )
+
+    _sample_compacted_topk_kernel[(batch_size,)](
+        candidate_ids,
+        candidate_logits,
+        counts,
+        seeds,
+        sampled,
+        MAX_CANDIDATES=max_candidates,
+        BLOCK_SIZE=max_candidates,
+    )
+    return sampled
+
+
+def sample_recovered_no_draft_probs_triton(
+    logits: torch.Tensor,
+    draft_token_ids: torch.Tensor,
+    seeds: torch.Tensor,
+    max_top_k: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # Compact masked top-k logits, sample recovered tokens excluding each draft
+    # token, and return the target probability of each draft token.
+    assert logits.ndim == 2
+    assert logits.dtype == torch.float32
+    assert draft_token_ids.ndim == 1 and draft_token_ids.shape[0] == logits.shape[0]
+    assert seeds.ndim == 1 and seeds.shape[0] == logits.shape[0]
+
+    batch_size, vocab_size = logits.shape
+    recovered = torch.empty_like(draft_token_ids)
+    target_draft_probs = torch.empty(
+        (batch_size,), dtype=torch.float32, device=logits.device
+    )
+    if batch_size == 0:
+        return recovered, target_draft_probs
+    if logits.stride(1) != 1:
+        logits = logits.contiguous()
+
+    max_candidates = min(64, next_power_of_2(max(1, max_top_k)))
+    candidate_ids, candidate_logits, counts, _ = _get_small_topk_sample_buffers(
+        logits, batch_size, max_candidates
+    )
+    counts.zero_()
+
+    block_size = 1024
+    num_blocks = triton.cdiv(vocab_size, block_size)
+    _compact_masked_topk_kernel[(batch_size, num_blocks)](
+        logits,
+        logits.stride(0),
+        candidate_ids,
+        candidate_logits,
+        counts,
+        VOCAB_SIZE=vocab_size,
+        MAX_CANDIDATES=max_candidates,
+        BLOCK_SIZE=block_size,
+    )
+
+    _sample_recovered_compacted_topk_kernel[(batch_size,)](
+        candidate_ids,
+        candidate_logits,
+        counts,
+        draft_token_ids,
+        seeds,
+        recovered,
+        target_draft_probs,
+        MAX_CANDIDATES=max_candidates,
+        BLOCK_SIZE=max_candidates,
+    )
+    return recovered, target_draft_probs
+
+
 def reset_buffer_cache():
     _TRITON_BUFFER_CACHE.clear()
     _TRITON_TABLE_CACHE.clear()
+    _TRITON_SMALL_TOPK_SAMPLE_CACHE.clear()
     torch.accelerator.empty_cache()

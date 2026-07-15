@@ -31,6 +31,9 @@ from vllm.model_executor.layers.fused_moe.utils import (
     resolve_moe_use_td,
     warn_if_moe_use_td_ineffective,
 )
+from vllm.model_executor.layers.quantization.utils.fp8_utils_moe_fused import (
+    silu_mul_per_token_group_quant_fp8_rowmajor,
+)
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.triton_utils.allocation import set_triton_allocator
@@ -39,6 +42,68 @@ from vllm.utils.platform_utils import get_device_name_as_file_name
 from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
+
+
+@triton.jit
+def _moe_sum_kernel(
+    input_ptr,
+    output_ptr,
+    M,
+    TOPK: tl.constexpr,
+    K,
+    stride_im,
+    stride_ik,
+    stride_ia,
+    stride_om,
+    stride_ok,
+    BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    m_offset = pid_m
+    if m_offset >= M:
+        return
+    k_offset = pid_k * BLOCK_K
+    offs_k = k_offset + tl.arange(0, BLOCK_K)
+    accum = tl.zeros((BLOCK_K,), dtype=tl.float32)
+    for k in range(TOPK):
+        ptrs = input_ptr + m_offset * stride_im + k * stride_ik + offs_k * stride_ia
+        row = tl.load(ptrs, mask=offs_k < K, other=0.0)
+        accum += row.to(tl.float32)
+    out_ptrs = output_ptr + m_offset * stride_om + offs_k * stride_ok
+    tl.store(out_ptrs, accum, mask=offs_k < K)
+
+
+def _triton_moe_sum(input: torch.Tensor, output: torch.Tensor) -> None:
+    """Triton-based moe_sum with compile-time unrolled topk."""
+    M, topk, K = input.shape
+    if M == 0:
+        return
+    # Qwen3.5 TP2 B1 has only one 2048-wide output row. A single 2048-wide
+    # program leaves the device almost entirely idle; sixteen 128-wide programs
+    # preserve the per-element expert addition order while reducing the
+    # CUDA-Graph node from ~1.27 us to ~0.87 us on both RTX 5090 ranks.
+    is_qwen35_tp2_b1 = M == 1 and topk == 8 and K == 2048
+    BLOCK_K = 128 if is_qwen35_tp2_b1 else triton.next_power_of_2(min(K, 2048))
+    num_k_blocks = triton.cdiv(K, BLOCK_K)
+
+    if topk <= 8:
+        _moe_sum_kernel[(M, num_k_blocks)](
+            input,
+            output,
+            M,
+            topk,
+            K,
+            input.stride(0),
+            input.stride(1),
+            input.stride(2),
+            output.stride(0),
+            output.stride(1),
+            BLOCK_K=BLOCK_K,
+            num_warps=2 if is_qwen35_tp2_b1 else max(4, BLOCK_K // 256),
+        )
+    else:
+        ops.moe_sum(input, output)
 
 
 @triton.jit
@@ -335,12 +400,16 @@ def fused_moe_kernel(
     group_n: tl.constexpr,
     group_k: tl.constexpr,
     naive_block_assignment: tl.constexpr,
+    HAS_INVALID_EXPERTS: tl.constexpr,
     # Meta-parameters
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
     SPLIT_K: tl.constexpr,
+    EVEN_N: tl.constexpr,
+    EVEN_K: tl.constexpr,
+    SCALAR_B_SCALE_N: tl.constexpr,
     MUL_ROUTED_WEIGHT: tl.constexpr,
     top_k: tl.constexpr,
     compute_type: tl.constexpr,
@@ -421,7 +490,7 @@ def fused_moe_kernel(
     token_mask = offs_token < num_valid_tokens
 
     off_experts = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
-    if off_experts == -1:
+    if HAS_INVALID_EXPERTS and off_experts == -1:
         # -----------------------------------------------------------
         # Write back zeros to the output when the expert is not
         # in the current expert parallel rank.
@@ -439,7 +508,10 @@ def fused_moe_kernel(
         )
         return
 
-    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
+    if EVEN_N:
+        offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
+    else:
+        offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     # TD gather and the SWAP_AB accumulator layout are mutually exclusive.
     tl.static_assert(not (USE_TD and SWAP_AB))
@@ -487,10 +559,14 @@ def fused_moe_kernel(
         # block-wise
         if group_k > 0 and group_n > 0:
             a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
-            offs_bsn = offs_bn // group_n
-            b_scale_ptrs = (
-                b_scale_ptr + off_experts * stride_bse + offs_bsn * stride_bsn
-            )
+            if SCALAR_B_SCALE_N:
+                bsn = (pid_n * BLOCK_SIZE_N) // group_n
+                b_scale_ptrs = b_scale_ptr + off_experts * stride_bse + bsn * stride_bsn
+            else:
+                offs_bsn = offs_bn // group_n
+                b_scale_ptrs = (
+                    b_scale_ptr + off_experts * stride_bse + offs_bsn * stride_bsn
+                )
         # channel-wise
         elif per_channel_quant:
             b_scale_ptrs = (
@@ -547,7 +623,14 @@ def fused_moe_kernel(
                 )
                 b_scale = tl.load(b_scale_ptrs + offs_ks * stride_bsk)
                 if SWAP_AB:
-                    accumulator += tl.dot(b, a) * b_scale[:, None] * a_scale[None, :]
+                    if SCALAR_B_SCALE_N:
+                        accumulator += tl.dot(b, a) * b_scale * a_scale[None, :]
+                    else:
+                        accumulator += (
+                            tl.dot(b, a) * b_scale[:, None] * a_scale[None, :]
+                        )
+                elif SCALAR_B_SCALE_N:
+                    accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale
                 else:
                     accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
             else:
@@ -606,7 +689,10 @@ def fused_moe_kernel(
     # Write back the block of the output
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
-    c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
+    if EVEN_N:
+        c_mask = token_mask[:, None]
+    else:
+        c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
     tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
@@ -781,6 +867,7 @@ def invoke_fused_moe_triton_kernel(
     per_channel_quant: bool,
     block_shape: list[int] | None = None,
     B_bias: torch.Tensor | None = None,
+    has_invalid_experts: bool = True,
 ):
     assert topk_weights is not None or not mul_routed_weight
     assert topk_weights is None or topk_weights.stride(1) == 1
@@ -902,9 +989,19 @@ def invoke_fused_moe_triton_kernel(
         use_int8_w8a16=use_int8_w8a16,
         per_channel_quant=per_channel_quant,
         naive_block_assignment=(sorted_token_ids is None),
+        # Keep the invalid-expert guard enabled while debugging graph capture;
+        # the extra predicate is cheap and prevents a stale EP route from
+        # turning into an out-of-bounds weight access.
+        HAS_INVALID_EXPERTS=True,
         HAS_BIAS=HAS_BIAS,
         BLOCK_SIZE_K=BLOCK_SIZE_K,
         SWAP_AB=SWAP_AB,
+        # The optimized unmasked/scalar-scale variants are not safe across
+        # all SM120 CUDA-graph shapes.  Use the masked baseline until the
+        # multi-size capture path is stable.
+        EVEN_N=False,
+        EVEN_K=(B.size(2) % BLOCK_SIZE_K) == 0,
+        SCALAR_B_SCALE_N=False,
         USE_TD=use_td,
         **config,
     )
@@ -932,6 +1029,7 @@ def dispatch_fused_moe_kernel(
     per_channel_quant: bool,
     block_shape: list[int] | None = None,
     B_bias: torch.Tensor | None = None,
+    has_invalid_experts: bool = True,
 ) -> None:
     assert topk_weights is not None or not mul_routed_weight
     assert topk_weights is None or topk_weights.stride(1) == 1
@@ -1010,6 +1108,7 @@ def dispatch_fused_moe_kernel(
             per_channel_quant,
             block_shape,
             B_bias,
+            has_invalid_experts,
         )
 
 
@@ -1561,7 +1660,7 @@ def _prepare_expert_assignment(
     # path of the fused_moe_kernel kernel
     naive_block_assignment = (
         expert_map is None
-        and num_tokens * top_k_num * 4 <= global_num_experts
+        and (num_tokens <= 16 or num_tokens * top_k_num * 4 <= global_num_experts)
         and not (
             (use_int8_w8a16 or use_int4_w4a16)
             and block_shape is not None
@@ -1735,7 +1834,6 @@ def fused_experts_impl(
     )
 
     config = get_config_func(M)
-
     # We can reuse the memory between these because by the time we need
     # cache3, we're done with cache1
     cache13 = torch.empty(
@@ -1810,19 +1908,39 @@ def fused_experts_impl(
         per_channel_quant=per_channel_quant,
         block_shape=block_shape,
         B_bias=w1_bias,
+        has_invalid_experts=False,
     )
 
-    apply_moe_activation(
-        activation_enum, intermediate_cache2, intermediate_cache1.view(-1, N)
+    # Fused SiLU+Mul + FP8 quantization for per-token-group quant
+    use_fused_act_quant = (
+        use_fp8_w8a8
+        and current_platform.is_cuda()
+        and block_shape is not None
+        and block_shape[1] > 0
+        and block_shape[1] & (block_shape[1] - 1) == 0
+        and activation_enum == MoEActivation.SILU
+        and a2_scale is None
+        and not per_channel_quant
     )
+    if use_fused_act_quant:
+        assert block_shape is not None
+        group_k = block_shape[1]
+        qintermediate_cache2, a2q_scale = silu_mul_per_token_group_quant_fp8_rowmajor(
+            intermediate_cache1.view(-1, N),
+            group_size=group_k,
+        )
+    else:
+        apply_moe_activation(
+            activation_enum, intermediate_cache2, intermediate_cache1.view(-1, N)
+        )
 
-    qintermediate_cache2, a2q_scale = moe_kernel_quantize_input(
-        A=intermediate_cache2,
-        A_scale=a2_scale,
-        quant_dtype=quant_dtype,
-        per_act_token_quant=per_channel_quant,
-        block_shape=block_shape,
-    )
+        qintermediate_cache2, a2q_scale = moe_kernel_quantize_input(
+            A=intermediate_cache2,
+            A_scale=a2_scale,
+            quant_dtype=quant_dtype,
+            per_act_token_quant=per_channel_quant,
+            block_shape=block_shape,
+        )
 
     if expert_map is not None:
         intermediate_cache3.zero_()
@@ -1849,9 +1967,10 @@ def fused_experts_impl(
         per_channel_quant=per_channel_quant,
         block_shape=block_shape,
         B_bias=w2_bias,
+        has_invalid_experts=False,
     )
 
-    ops.moe_sum(
+    _triton_moe_sum(
         intermediate_cache3.view(*intermediate_cache3.size()),
         out_hidden_states,
     )

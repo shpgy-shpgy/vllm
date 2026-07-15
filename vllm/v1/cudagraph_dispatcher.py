@@ -69,6 +69,22 @@ class CudagraphDispatcher:
         # Default cudagraph_mode to NONE until initialize_cudagraph_keys is called
         self.cudagraph_mode = CUDAGraphMode.NONE
 
+    @staticmethod
+    def _compute_padding_map(capture_sizes: list[int]) -> list[int]:
+        """Pre-compute the mapping from batch size to padded graph size."""
+        max_size = capture_sizes[-1]
+        bs_to_padded_graph_size: list[int] = [0] * (max_size + 1)
+        for end, start in zip(
+            capture_sizes + [max_size + 1],
+            [0] + capture_sizes,
+        ):
+            for bs in range(start, end):
+                if bs == start:
+                    bs_to_padded_graph_size[bs] = start
+                else:
+                    bs_to_padded_graph_size[bs] = end
+        return bs_to_padded_graph_size
+
     def _compute_bs_to_padded_graph_size(self) -> None:
         """Pre-compute the mapping from batch size to padded graph size."""
         max_size = self.compilation_config.max_cudagraph_capture_size
@@ -79,16 +95,23 @@ class CudagraphDispatcher:
         assert capture_sizes is not None, (
             "Cudagraph capture sizes must be set when cudagraphs are enabled."
         )
-        self._bs_to_padded_graph_size: list[int] = [0] * (max_size + 1)
-        for end, start in zip(
-            capture_sizes + [max_size + 1],
-            [0] + capture_sizes,
+        self._bs_to_padded_graph_size = self._compute_padding_map(capture_sizes)
+        tensor_parallel_size = self.vllm_config.parallel_config.tensor_parallel_size
+        if (
+            self.cudagraph_mode.separate_routine()
+            and self.cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
         ):
-            for bs in range(start, end):
-                if bs == start:
-                    self._bs_to_padded_graph_size[bs] = start
-                else:
-                    self._bs_to_padded_graph_size[bs] = end
+            self._decode_cudagraph_capture_sizes = (
+                self.compilation_config.get_cudagraph_capture_sizes_for_decode(
+                    self.uniform_decode_query_len,
+                    tensor_parallel_size,
+                )
+            )
+        else:
+            self._decode_cudagraph_capture_sizes = capture_sizes
+        self._decode_bs_to_padded_graph_size = self._compute_padding_map(
+            self._decode_cudagraph_capture_sizes
+        )
 
         # Validate that compile_sizes won't be changed by padding.
         # Only validate when cudagraphs are actually being used.
@@ -129,18 +152,30 @@ class CudagraphDispatcher:
             # No specialization: only capture graphs with LoRA active
             return [lora_config.max_loras + 1]
 
-    def _create_padded_batch_descriptor(
+    def _maybe_create_padded_batch_descriptor(
         self,
         num_tokens: int,
         uniform_decode: bool,
         has_lora: bool,
         num_active_loras: int = 0,
-    ) -> BatchDescriptor:
+    ) -> BatchDescriptor | None:
         max_num_seqs = self.vllm_config.scheduler_config.max_num_seqs
         uniform_decode_query_len = self.uniform_decode_query_len
-        num_tokens_padded = self._bs_to_padded_graph_size[num_tokens]
+        use_decode_padding = (
+            uniform_decode
+            and self.cudagraph_mode.separate_routine()
+            and self.cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
+        )
+        padding_map = (
+            self._decode_bs_to_padded_graph_size
+            if use_decode_padding
+            else self._bs_to_padded_graph_size
+        )
+        if num_tokens >= len(padding_map):
+            return None
+        num_tokens_padded = padding_map[num_tokens]
 
-        if uniform_decode and self.cudagraph_mode.has_mode(CUDAGraphMode.FULL):
+        if use_decode_padding:
             num_reqs = min(num_tokens_padded // uniform_decode_query_len, max_num_seqs)
             assert num_tokens_padded % uniform_decode_query_len == 0
         else:
@@ -155,6 +190,22 @@ class CudagraphDispatcher:
             num_active_loras=num_active_loras,
         )
 
+    def _create_padded_batch_descriptor(
+        self,
+        num_tokens: int,
+        uniform_decode: bool,
+        has_lora: bool,
+        num_active_loras: int = 0,
+    ) -> BatchDescriptor:
+        batch_desc = self._maybe_create_padded_batch_descriptor(
+            num_tokens, uniform_decode, has_lora, num_active_loras
+        )
+        assert batch_desc is not None, (
+            f"No cudagraph padding available for {num_tokens} tokens "
+            f"(uniform_decode={uniform_decode})"
+        )
+        return batch_desc
+
     def add_cudagraph_key(
         self, runtime_mode: CUDAGraphMode, batch_descriptor: BatchDescriptor
     ):
@@ -164,11 +215,16 @@ class CudagraphDispatcher:
         self.cudagraph_keys[runtime_mode].add(batch_descriptor)
 
     def initialize_cudagraph_keys(
-        self, cudagraph_mode: CUDAGraphMode, uniform_decode_query_len: int = 1
+        self,
+        cudagraph_mode: CUDAGraphMode,
+        uniform_decode_query_len: int | None = None,
     ):
         # This should be called only after attention backend is initialized. So we can
         # get the correct cudagraph mode after backend support is resolved.
         self.cudagraph_mode = cudagraph_mode
+        if uniform_decode_query_len is not None:
+            self.uniform_decode_query_len = uniform_decode_query_len
+        decode_query_len = self.uniform_decode_query_len
 
         # Early exit if cudagraphs are disabled
         if cudagraph_mode == CUDAGraphMode.NONE:
@@ -209,16 +265,12 @@ class CudagraphDispatcher:
             and cudagraph_mode.separate_routine()
         ):
             max_num_tokens = (
-                uniform_decode_query_len
-                * self.vllm_config.scheduler_config.max_num_seqs
-            )
-            assert self.compilation_config.cudagraph_capture_sizes is not None, (
-                "Cudagraph capture sizes must be set when full mode is enabled."
+                decode_query_len * self.vllm_config.scheduler_config.max_num_seqs
             )
             cudagraph_capture_sizes_for_decode = [
                 x
-                for x in self.compilation_config.cudagraph_capture_sizes
-                if x <= max_num_tokens and x >= uniform_decode_query_len
+                for x in self._decode_cudagraph_capture_sizes
+                if x <= max_num_tokens and x >= decode_query_len
             ]
             for bs, num_active_loras in product(
                 cudagraph_capture_sizes_for_decode, lora_cases
@@ -300,20 +352,32 @@ class CudagraphDispatcher:
                 effective_num_active_loras = self.vllm_config.lora_config.max_loras + 1
 
         normalized_uniform = uniform_decode and self.cudagraph_mode.separate_routine()
-        batch_desc = self._create_padded_batch_descriptor(
-            num_tokens, normalized_uniform, has_lora, effective_num_active_loras
+        mixed_batch_desc = self._create_padded_batch_descriptor(
+            num_tokens, False, has_lora, effective_num_active_loras
+        )
+        full_batch_desc = (
+            self._maybe_create_padded_batch_descriptor(
+                num_tokens, normalized_uniform, has_lora, effective_num_active_loras
+            )
+            if CUDAGraphMode.FULL in allowed_modes
+            else None
         )
 
         if CUDAGraphMode.FULL in allowed_modes:
             # check if key exists for full cudagraph
-            batch_desc_to_check = batch_desc
-            if batch_desc_to_check in self.cudagraph_keys[CUDAGraphMode.FULL]:
+            batch_desc_to_check = full_batch_desc
+            if (
+                batch_desc_to_check is not None
+                and batch_desc_to_check in self.cudagraph_keys[CUDAGraphMode.FULL]
+            ):
                 return CUDAGraphMode.FULL, batch_desc_to_check
 
         if CUDAGraphMode.PIECEWISE in allowed_modes:
             # also check if the relaxed key exists for more "general"
             # piecewise cudagraph
-            batch_desc_to_check = replace(batch_desc, num_reqs=None, uniform=False)
+            batch_desc_to_check = replace(
+                mixed_batch_desc, num_reqs=None, uniform=False
+            )
             if batch_desc_to_check in self.cudagraph_keys[CUDAGraphMode.PIECEWISE]:
                 return CUDAGraphMode.PIECEWISE, batch_desc_to_check
 

@@ -211,6 +211,7 @@ class OpenAIServingCompletion(GenerateBaseServing):
                     priority=self._get_priority(request, raw_request),
                     data_parallel_rank=data_parallel_rank,
                     session_id=session_id,
+                    headers=raw_request.headers if raw_request else None,
                 )
 
             generators.append(generator)

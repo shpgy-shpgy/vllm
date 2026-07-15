@@ -166,6 +166,77 @@ def test_resumed_req_ids_cleared_from_mamba_state_idx():
     assert mamba_state_idx == {"keep": 99}
 
 
+def test_gpu_precopy_stages_partial_prefix_hit_without_layer_walk():
+    spec = MagicMock(block_size=16, num_speculative_blocks=2)
+    cache_config = MagicMock(enable_prefix_caching=True)
+    copy_bufs = MagicMock(mamba_group_ids=[0], mamba_spec=spec)
+    scheduler_output = _make_postprocess_scheduler_output(
+        ["partial", "same", "fresh"],
+        {"partial": 3, "same": 1, "fresh": 1},
+    )
+
+    input_batch = MagicMock()
+    input_batch.req_ids = ["partial", "same", "fresh"]
+    input_batch.num_accepted_tokens_cpu = np.array([3, 4, 1], dtype=np.int32)
+    requests = {
+        "partial": MagicMock(num_computed_tokens=30),
+        "same": MagicMock(num_computed_tokens=33),
+        "fresh": MagicMock(num_computed_tokens=0),
+    }
+    mamba_state_idx = {"same": 2}
+
+    def make_staging_buffer():
+        buf = MagicMock()
+        buf.np = np.zeros(3, dtype=np.int32)
+        buf.copy_to_gpu.return_value = object()
+        return buf
+
+    gpu_ctx = MagicMock(spec=MambaSpecDecodeGPUContext)
+    gpu_ctx.is_initialized = True
+    gpu_ctx.mamba_state_idx_buf = make_staging_buffer()
+    gpu_ctx.precopy_src_col_buf = make_staging_buffer()
+    gpu_ctx.precopy_token_bias_buf = make_staging_buffer()
+
+    with (
+        patch("vllm.v1.worker.mamba_utils.collect_mamba_copy_meta") as collect,
+        patch("vllm.v1.worker.mamba_utils.do_mamba_copy_block") as pointer_copy,
+    ):
+        preprocess_mamba(
+            scheduler_output,
+            MagicMock(),
+            cache_config,
+            mamba_state_idx,
+            input_batch,
+            requests,
+            {},
+            (),
+            copy_bufs,
+            gpu_ctx=gpu_ctx,
+        )
+
+    assert mamba_state_idx == {"partial": 2, "same": 2, "fresh": 0}
+    np.testing.assert_array_equal(
+        gpu_ctx.mamba_state_idx_buf.np, np.array([2, 2, 0], dtype=np.int32)
+    )
+    np.testing.assert_array_equal(
+        gpu_ctx.precopy_src_col_buf.np, np.array([1, -1, -1], dtype=np.int32)
+    )
+    np.testing.assert_array_equal(
+        gpu_ctx.precopy_token_bias_buf.np, np.array([2, 0, 0], dtype=np.int32)
+    )
+    np.testing.assert_array_equal(
+        input_batch.num_accepted_tokens_cpu, np.array([1, 4, 1], dtype=np.int32)
+    )
+    collect.assert_not_called()
+    pointer_copy.assert_not_called()
+    gpu_ctx.run_fused_precopy.assert_called_once_with(
+        3,
+        gpu_ctx.mamba_state_idx_buf.copy_to_gpu.return_value,
+        gpu_ctx.precopy_src_col_buf.copy_to_gpu.return_value,
+        gpu_ctx.precopy_token_bias_buf.copy_to_gpu.return_value,
+    )
+
+
 # -----------------------------------------------------------------------------
 # Golden tests for postprocess_mamba_fused_kernel
 # -----------------------------------------------------------------------------

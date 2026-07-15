@@ -10,6 +10,10 @@ from torch._ops import OpOverload
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+    mxfp8_e4m3_quantize,
+    silu_and_mul_mxfp8_quant,
+)
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
     kFp8Dynamic64Sym,
@@ -280,6 +284,31 @@ class SiluMulBlockQuantPattern(ActivationQuantPattern):
         return _replacement
 
 
+class SiluMulMXFP8QuantPattern(VllmPatternReplacement):
+    """Fuse SiLU-and-mul with swizzled MXFP8 activation quantization."""
+
+    def __init__(self) -> None:
+        self.silu_and_mul_matcher = MatcherSiluAndMul()
+
+    def get_inputs(self) -> list[torch.Tensor]:
+        return self.silu_and_mul_matcher.inputs()
+
+    @property
+    def pattern(self):
+        def _pattern(input: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            output = self.silu_and_mul_matcher(input)
+            return mxfp8_e4m3_quantize(output, is_sf_swizzled_layout=True)
+
+        return _pattern
+
+    @property
+    def replacement(self):
+        def _replacement(input: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            return silu_and_mul_mxfp8_quant(input)
+
+        return _replacement
+
+
 class ActivationQuantFusionPass(VllmFusionPatternMatcherPass):
     """
     This pass fuses a pre-defined set of custom ops into fused ops.
@@ -298,7 +327,8 @@ class ActivationQuantFusionPass(VllmFusionPatternMatcherPass):
         if silu_and_mul_nvfp4_quant_supported:
             self.register(SiluMulNvfp4QuantPattern())
 
-        if current_platform.is_cuda():
+        if current_platform.is_device_capability(120):
+            self.register(SiluMulMXFP8QuantPattern())
             for (
                 quant_key,
                 is_scale_transposed,

@@ -2163,6 +2163,33 @@ class ModelConfig:
             and "nvfp4" in quant_config.get("format", "").lower()
         )
 
+    def is_mxfp6_w6a8_quantized(self) -> bool:
+        """Return whether this is a Quark MXFP6 W6A8 checkpoint."""
+        if self.quantization != "quark":
+            return False
+
+        quant_config = self.model_arch_config.quantization_config
+        if quant_config is None:
+            return False
+
+        global_config = quant_config.get("global_quant_config", {})
+        weight_config = global_config.get("weight") or {}
+        input_config = global_config.get("input_tensors") or {}
+        return (
+            weight_config.get("dtype") == "fp6_e3m2"
+            and weight_config.get("qscheme") == "per_group"
+            and weight_config.get("group_size") == 32
+            and weight_config.get("scale_format") == "e8m0"
+            and weight_config.get("symmetric") is True
+            and not weight_config.get("is_dynamic")
+            and input_config.get("dtype") == "fp8_e4m3"
+            and input_config.get("qscheme") == "per_group"
+            and input_config.get("group_size") == 32
+            and input_config.get("scale_format") == "e8m0"
+            and input_config.get("symmetric") is True
+            and input_config.get("is_dynamic") is True
+        )
+
 
 def get_served_model_name(model: str, served_model_name: str | list[str] | None):
     """

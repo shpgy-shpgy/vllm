@@ -5,7 +5,7 @@ import os
 import socket
 import time
 import warnings
-from collections.abc import AsyncGenerator, Iterable, Mapping
+from collections.abc import AsyncGenerator, Iterable, Mapping, Sized
 from copy import copy
 from typing import Any
 
@@ -640,6 +640,7 @@ class AsyncLLM(EngineClient):
         session_id: str | None = None,
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
+        headers: Mapping[str, str] | None = None,
     ) -> AsyncGenerator[RequestOutput, None]:
         """
         Main function called by the API server to kick off a request
@@ -657,6 +658,45 @@ class AsyncLLM(EngineClient):
         """
 
         q: RequestOutputCollector | None = None
+        ISL = -1
+        OSL = -1
+        TTFT = E2E = QUEUE_TIME = -1.0
+        headers_text = ""
+        if isinstance(prompt, EngineCoreRequest):
+            if prompt.prompt_token_ids is not None:
+                ISL = len(prompt.prompt_token_ids)
+        elif isinstance(prompt, Mapping):
+            prompt_token_ids = prompt.get("prompt_token_ids")
+            if isinstance(prompt_token_ids, Sized):
+                ISL = len(prompt_token_ids)
+        if headers is not None:
+            sensitive_or_noisy_keys = {
+                "accept",
+                "accept-encoding",
+                "authorization",
+                "connection",
+                "content-type",
+                "cookie",
+                "proxy-authorization",
+                "set-cookie",
+                "x-api-key",
+                "x-auth-token",
+            }
+            headers_text = "".join(
+                f"[{key}:{value}]"
+                for key, value in headers.items()
+                if key.lower() not in sensitive_or_noisy_keys
+            )
+
+        def update_logged_metrics(output: RequestOutput | None) -> None:
+            nonlocal OSL, TTFT, E2E, QUEUE_TIME
+            if output is None or output.metrics is None:
+                return
+            OSL = output.metrics.num_generation_tokens
+            TTFT = output.metrics.first_token_latency
+            E2E = output.metrics.last_token_ts - output.metrics.scheduled_ts
+            QUEUE_TIME = output.metrics.scheduled_ts - output.metrics.queued_ts
+
         try:
             q = await self.add_request(
                 request_id,
@@ -687,6 +727,9 @@ class AsyncLLM(EngineClient):
                 finished = out.finished
                 if out is not STREAM_FINISHED:
                     yield out
+
+            if isinstance(out, RequestOutput):
+                update_logged_metrics(out)
 
         # If the request is disconnected by the client, generate()
         # is cancelled or the generator is garbage collected. So,
@@ -735,7 +778,21 @@ class AsyncLLM(EngineClient):
             raise EngineGenerateError() from e
         finally:
             if q is not None:
+                queued_output = q.output
+                if isinstance(queued_output, RequestOutput):
+                    update_logged_metrics(queued_output)
                 q.close()
+            metrics_text = "".join(
+                [
+                    f"[ISL:{ISL}]",
+                    f"[OSL:{OSL}]",
+                    f"[TTFT:{TTFT * 1000:.2f}]",
+                    f"[E2E:{E2E * 1000:.2f}]",
+                    f"[QUEUE_TIME:{QUEUE_TIME * 1000:.2f}]",
+                    f"[req_id:{request_id}]",
+                ]
+            )
+            logger.warning("metrics %s%s", headers_text, metrics_text)
 
     def _run_output_handler(self):
         """Background loop: pulls from EngineCore and pushes to AsyncStreams."""

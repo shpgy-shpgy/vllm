@@ -424,5 +424,101 @@ def warmup_kernels(
     cleanup_output = SchedulerOutput.make_empty()
     cleanup_output.finished_req_ids = set(req_ids)
     worker_execute_model(cleanup_output)
+
+    if not model_runner.is_pooling_model:
+        vocab_size = model_runner.model_config.get_vocab_size()
+
+        def _run_vocab_parallel_sampling_warmup(
+            params: SamplingParams,
+            suffix: str,
+            *,
+            warm_spec_decode: bool = False,
+        ) -> None:
+            """Exercise V2 model-level sampling paths before JIT monitoring."""
+            nonlocal next_block_id
+            next_block_id = 1
+            req_id = f"_v2_vocab_parallel_warmup_{suffix}_"
+            request = NewRequestData.from_request(
+                Request(
+                    req_id,
+                    prompt_token_ids,
+                    params,
+                    None,
+                    mm_features=warmup_mm_features,
+                ),
+                block_ids=tuple(_alloc_blocks(n) for n in prefill_block_counts),
+                prefill_token_ids=prompt_token_ids,
+            )
+            output = SchedulerOutput.make_empty()
+            output.scheduled_new_reqs = [request]
+            output.num_scheduled_tokens = {req_id: prompt_len}
+            output.total_num_scheduled_tokens = prompt_len
+            output.num_common_prefix_blocks = [0] * num_kv_cache_groups
+            worker_execute_model(output)
+            worker_sample_tokens(None)
+
+            if warm_spec_decode and num_spec_steps > 0:
+                vocab_decode_block_deltas = [
+                    block_count(prompt_len + decode_query_len, spec)
+                    - block_count(prompt_len, spec)
+                    for spec in kv_cache_specs
+                ]
+                cached = CachedRequestData.make_empty()
+                cached.req_ids = [req_id]
+                cached.num_computed_tokens = [prompt_len]
+                cached.num_output_tokens = [1]
+                cached.new_block_ids = [
+                    tuple(_alloc_blocks(n) for n in vocab_decode_block_deltas)
+                    if any(vocab_decode_block_deltas)
+                    else None
+                ]
+                decode = SchedulerOutput.make_empty()
+                decode.scheduled_cached_reqs = cached
+                decode.num_scheduled_tokens = {req_id: decode_query_len}
+                decode.scheduled_spec_decode_tokens = {req_id: [0] * num_spec_steps}
+                decode.total_num_scheduled_tokens = decode_query_len
+                decode.num_common_prefix_blocks = [0] * num_kv_cache_groups
+                worker_execute_model(decode)
+                worker_sample_tokens(None)
+
+            cleanup = SchedulerOutput.make_empty()
+            cleanup.finished_req_ids = {req_id}
+            worker_execute_model(cleanup)
+
+        if hasattr(model_runner.model, "get_top_tokens"):
+            # The compact greedy speculative sampler has its own Triton
+            # rejection kernel.  The generic sampler warmup above exercises
+            # speculative decoding with processed logits, so explicitly run
+            # the greedy+MTP path before the JIT monitor is enabled.
+            _run_vocab_parallel_sampling_warmup(
+                SamplingParams(
+                    max_tokens=max(2, decode_query_len + 1),
+                    temperature=0.0,
+                ),
+                "greedy",
+                warm_spec_decode=num_spec_steps > 0,
+            )
+        if hasattr(model_runner.model, "sample_full_tokens"):
+            _run_vocab_parallel_sampling_warmup(
+                SamplingParams(
+                    max_tokens=2,
+                    temperature=1.0,
+                    top_k=-1,
+                    top_p=1.0,
+                ),
+                "full",
+            )
+        if hasattr(model_runner.model, "sample_topk_tokens"):
+            _run_vocab_parallel_sampling_warmup(
+                SamplingParams(
+                    max_tokens=max(2, decode_query_len + 1),
+                    temperature=0.7,
+                    top_k=min(20, vocab_size),
+                    top_p=0.9,
+                ),
+                "topk",
+                warm_spec_decode=hasattr(model_runner.model, "get_topk_candidates"),
+            )
+
     model_runner.kv_connector.set_disabled(False)
     torch.accelerator.synchronize()

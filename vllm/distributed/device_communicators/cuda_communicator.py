@@ -47,28 +47,25 @@ class CudaCommunicator(DeviceCommunicatorBase):
             global_world_size,
             use_all2all=use_all2all,
         )
+        flashinfer_allreduce_mode: bool | None
         if "tp" not in unique_name:
             # custom allreduce or torch symm mem can be used only by tp
             use_custom_allreduce = False
             use_torch_symm_mem = False
-            use_flashinfer_allreduce = False
+            flashinfer_allreduce_mode = False
             use_aiter_allreduce = False
         else:
             from vllm.distributed.parallel_state import _ENABLE_CUSTOM_ALL_REDUCE
 
             use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
             use_torch_symm_mem = envs.VLLM_ALLREDUCE_USE_SYMM_MEM
-            # FlashInfer all-reduce does not provide a fixed reduction order.
-            use_flashinfer_allreduce = (
-                envs.VLLM_ALLREDUCE_USE_FLASHINFER and not envs.VLLM_BATCH_INVARIANT
-            )
+            flashinfer_allreduce_mode = envs.VLLM_ALLREDUCE_USE_FLASHINFER
             use_aiter_allreduce = use_custom_allreduce and bool(
                 rocm_aiter_ops.is_custom_all_reduce_enabled()
             )
 
         self.use_custom_allreduce = use_custom_allreduce
         self.use_torch_symm_mem = use_torch_symm_mem
-        self.use_flashinfer_allreduce = use_flashinfer_allreduce
         self.use_aiter_allreduce = use_aiter_allreduce
 
         # lazy import to avoid documentation build error
@@ -77,12 +74,19 @@ class CudaCommunicator(DeviceCommunicatorBase):
         )
         from vllm.distributed.device_communicators.flashinfer_all_reduce import (
             FlashInferAllReduce,
+            should_auto_enable_flashinfer_allreduce,
         )
         from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
         from vllm.distributed.device_communicators.quick_all_reduce import (
             QuickAllReduce,
         )
         from vllm.distributed.device_communicators.symm_mem import SymmMemCommunicator
+
+        self.use_flashinfer_allreduce = (
+            should_auto_enable_flashinfer_allreduce(self.world_size, self.device)
+            if flashinfer_allreduce_mode is None
+            else flashinfer_allreduce_mode
+        ) and not envs.VLLM_BATCH_INVARIANT
 
         self.pynccl_comm: PyNcclCommunicator | None = None
         if self.world_size > 1:

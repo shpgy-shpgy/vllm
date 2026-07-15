@@ -44,6 +44,7 @@ class Sampler:
         reasoning_config: ReasoningConfig | None = None,
         return_sampling_mask: bool = False,
     ):
+        self.device = device
         self.logprobs_mode = logprobs_mode
         self.compute_nans = envs.VLLM_COMPUTE_NANS_IN_LOGITS  # False by default.
         self.use_fp64_gumbel = use_fp64_gumbel
@@ -64,6 +65,35 @@ class Sampler:
         self.use_flashinfer = (
             not return_sampling_mask and flashinfer_sampler_supported()
         )
+
+    @torch.inference_mode()
+    def warmup_top_k_top_p_buffer(self, num_rows: int) -> None:
+        """Warm the shape-dependent top-k/top-p sampler workspace.
+
+        Speculative verification applies filters to the flattened target rows
+        (one row for each draft step plus the bonus row). The normal profile
+        sampler only uses one row per request, so a larger Triton workspace
+        could otherwise be allocated after the KV cache and CUDA graphs are
+        already committed.
+        """
+        if num_rows < 8:
+            return
+        vocab_size = self.sampling_states.vocab_size
+        if vocab_size <= 0:
+            return
+        logits = torch.zeros(
+            (num_rows, vocab_size), dtype=torch.float32, device=self.device
+        )
+        top_k = torch.full(
+            (num_rows,), min(20, vocab_size), dtype=torch.int32, device=self.device
+        )
+        top_p = torch.full(
+            (num_rows,), 0.95, dtype=torch.float32, device=self.device
+        )
+        apply_top_k_top_p(logits, top_k, top_p)
+        if self.device.type != "cpu":
+            torch.accelerator.synchronize()
+        del logits, top_k, top_p
 
     def add_request(
         self, req_idx: int, prompt_len: int, sampling_params: SamplingParams
@@ -118,6 +148,152 @@ class Sampler:
             return None
         num_logprobs = max_num_logprobs if max_num_logprobs != NO_LOGPROBS else 0
         return num_logprobs, max_token_ids
+
+    def get_vocab_parallel_sampling_params(
+        self, input_batch: InputBatch
+    ) -> tuple[str, int, float, float, bool] | None:
+        """Return params for a semantics-preserving vocab-parallel fast path.
+
+        The model-level helpers bypass the full-vocabulary logits gather and
+        therefore can only be used when every active request has the same,
+        supported sampling mode. Any feature that needs materialized logits
+        falls back to the regular sampler.
+        """
+        idx_mapping_np = input_batch.idx_mapping_np
+        if idx_mapping_np.size == 0 or self.compute_nans:
+            return None
+
+        use_penalty = self.penalties_state.use_penalty[idx_mapping_np]
+        has_penalty = bool(np.any(use_penalty))
+        presence_only = False
+        if has_penalty:
+            repetition_penalties = self.penalties_state.repetition_penalty.np[
+                idx_mapping_np
+            ]
+            frequency_penalties = self.penalties_state.frequency_penalty.np[
+                idx_mapping_np
+            ]
+            presence_only = bool(
+                np.all(repetition_penalties == 1.0)
+                and np.all(frequency_penalties == 0.0)
+            )
+            if not presence_only:
+                return None
+
+        if (
+            self.sampling_states.max_num_logprobs(idx_mapping_np) != NO_LOGPROBS
+            or self.logprob_token_ids_state.max_num_token_ids(idx_mapping_np) > 0
+            or np.any(self.logit_bias_state.use_logit_bias[idx_mapping_np])
+            or np.any(self.bad_words_state.num_bad_words.np[idx_mapping_np] != 0)
+        ):
+            return None
+
+        temperatures = self.sampling_states.temperature.np[idx_mapping_np]
+        top_ks = self.sampling_states.top_k.np[idx_mapping_np]
+        top_ps = self.sampling_states.top_p.np[idx_mapping_np]
+        min_ps = self.sampling_states.min_p.np[idx_mapping_np]
+
+        # Top-k/top-p/min-p preserve argmax, but requiring their default values
+        # keeps this guard deliberately narrow and makes warmup exercise the
+        # regular sampler kernels.
+        default_filters = (
+            np.all(top_ks == self.sampling_states.vocab_size)
+            and np.all(top_ps == 1.0)
+            and np.all(min_ps == 0.0)
+        )
+        if np.all(temperatures == 0.0):
+            if (
+                not presence_only
+                and default_filters
+                and not self.sampling_states.any_explicit_seed(idx_mapping_np)
+            ):
+                return (
+                    "greedy",
+                    self.sampling_states.vocab_size,
+                    1.0,
+                    0.0,
+                    False,
+                )
+            return None
+
+        if (
+            self.use_fp64_gumbel
+            or self.sampling_states.any_explicit_seed(idx_mapping_np)
+            or np.any(temperatures <= 0.0)
+            or not np.all(temperatures == temperatures[0])
+            or not np.all(min_ps == 0.0)
+        ):
+            return None
+
+        temperature = float(temperatures[0])
+        if default_filters:
+            if presence_only:
+                return None
+            return (
+                "full",
+                self.sampling_states.vocab_size,
+                1.0,
+                temperature,
+                False,
+            )
+
+        top_k = int(top_ks[0])
+        top_p = float(top_ps[0])
+        if (
+            top_k <= 0
+            or top_k > 64
+            or top_p <= 0.0
+            or top_p > 1.0
+            or not np.all(top_ks == top_k)
+            or not np.all(top_ps == top_p)
+        ):
+            return None
+        return ("topk", top_k, top_p, temperature, presence_only)
+
+    def get_vocab_parallel_presence_inputs(
+        self, input_batch: InputBatch
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]:
+        """Return per-row penalties and persistent output-token statistics."""
+        request_indices = input_batch.idx_mapping
+        presence_penalties = self.penalties_state.presence_penalty.gpu.index_select(
+            0, request_indices.to(torch.int64)
+        )
+        return (
+            presence_penalties,
+            self.penalties_state.output_bin_counts,
+            request_indices,
+            self.penalties_state.output_unique_token_ids,
+            self.penalties_state.num_output_unique_tokens,
+        )
+
+    def make_sampler_output(
+        self,
+        sampled: torch.Tensor,
+        input_batch: InputBatch,
+        *,
+        num_nans: torch.Tensor | None = None,
+    ) -> SamplerOutput:
+        """Build the standard one-token output for a pre-sampled batch."""
+        num_sampled, num_rejected = get_num_sampled_and_rejected(
+            input_batch.seq_lens.new_ones(input_batch.num_reqs),
+            input_batch.seq_lens,
+            input_batch.cu_num_logits,
+            input_batch.idx_mapping,
+            self.req_states.prefill_len.gpu,
+        )
+        return SamplerOutput(
+            sampled_token_ids=sampled.view(-1, 1),
+            logprobs_tensors=None,
+            num_nans=num_nans,
+            num_sampled=num_sampled,
+            num_rejected=num_rejected,
+        )
 
     def __call__(
         self,
@@ -191,7 +367,7 @@ class Sampler:
             )
 
         # These are GPU tensors.
-        sampler_output = SamplerOutput(
+        return SamplerOutput(
             # The sampled tokens are expanded to 2D tensor with shape
             # [num_requests, 1], where each row represents one generated
             # token per request.
@@ -202,7 +378,6 @@ class Sampler:
             num_rejected=num_rejected,
             sampling_mask_tensors=sampling_mask_tensors,
         )
-        return sampler_output
 
     def apply_sampling_params(
         self,
@@ -270,6 +445,24 @@ class Sampler:
         return self.sampling_states.apply_top_k_top_p(
             logits, expanded_idx_mapping, idx_mapping_np
         )
+
+    def _requires_logits_processing(self, idx_mapping_np: np.ndarray) -> bool:
+        if np.any(self.logit_bias_state.use_logit_bias[idx_mapping_np]):
+            return True
+        if np.any(self.penalties_state.use_penalty[idx_mapping_np]):
+            return True
+        if np.any(self.bad_words_state.num_bad_words.np[idx_mapping_np] > 0):
+            return True
+
+        states = self.sampling_states
+        temperatures = states.temperature.np[idx_mapping_np]
+        if np.any((temperatures != 0.0) & (temperatures != 1.0)):
+            return True
+        if np.any(states.min_p.np[idx_mapping_np] != 0.0):
+            return True
+        if np.any(states.top_k.np[idx_mapping_np] != states.vocab_size):
+            return True
+        return bool(np.any(states.top_p.np[idx_mapping_np] != 1.0))
 
     def sample(
         self,

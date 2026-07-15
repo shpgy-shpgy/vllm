@@ -284,6 +284,323 @@ direct_register_custom_op(
 )
 
 
+def _empty_swizzled_mxfp8_scales(x: torch.Tensor, output_features: int) -> torch.Tensor:
+    rows = x.numel() // x.shape[-1]
+    scale_columns = output_features // MXFP8_BLOCK_SIZE
+    padded_rows = ((rows + 127) // 128) * 128
+    padded_scale_columns = ((scale_columns + 3) // 4) * 4
+    return torch.empty(
+        padded_rows * padded_scale_columns,
+        dtype=MXFP8_SCALE_DTYPE,
+        device=x.device,
+    )
+
+
+def _build_fused_mxfp8_quant_kernels():
+    from vllm.triton_utils import tl, triton
+
+    @triton.jit
+    def _silu_and_mul_quant_kernel(
+        input_ptr,
+        output_ptr,
+        scale_ptr,
+        rows,
+        input_stride,
+        output_stride,
+        K: tl.constexpr,
+        GROUPS_PER_ROW: tl.constexpr,
+        GROUPS_PER_CTA: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+    ):
+        group_start = tl.program_id(0) * GROUPS_PER_CTA
+        row_start = tl.program_id(1).to(tl.int64) * BLOCK_M
+        row_step = tl.num_programs(1).to(tl.int64) * BLOCK_M
+
+        elements_per_cta: tl.constexpr = GROUPS_PER_CTA * 32
+        columns = group_start * 32 + tl.arange(0, elements_per_cta)
+        row_offsets = tl.arange(0, BLOCK_M)
+        group_offsets = tl.arange(0, GROUPS_PER_CTA)
+        column_mask = columns < K
+        num_k_tiles: tl.constexpr = (GROUPS_PER_ROW + 3) // 4
+
+        while row_start < rows:
+            row_ids = row_start + row_offsets
+            row_mask = row_ids < rows
+            input_offsets = row_ids[:, None] * input_stride
+
+            gate = tl.load(
+                input_ptr + input_offsets + columns[None, :],
+                mask=row_mask[:, None] & column_mask[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            up = tl.load(
+                input_ptr + input_offsets + K + columns[None, :],
+                mask=row_mask[:, None] & column_mask[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            gate = (
+                (gate / (1.0 + tl.exp(-gate)))
+                .to(input_ptr.dtype.element_ty)
+                .to(tl.float32)
+            )
+            output = gate * up
+            output = output.to(input_ptr.dtype.element_ty).to(tl.float32)
+            output_blocked = tl.reshape(output, (BLOCK_M, GROUPS_PER_CTA, 32))
+
+            amax = tl.max(tl.abs(output_blocked), axis=2)
+            raw_scale = amax * (1.0 / 448.0)
+            scale = tl.ceil(tl.log2(raw_scale)) + 127.0
+            scale = tl.minimum(tl.maximum(scale, 0.0), 254.0)
+            descale = tl.exp2(scale - 127.0)
+            descale = tl.where(amax == 0.0, 1.0, descale)
+            output_quant = output_blocked / descale[:, :, None]
+            output_quant = tl.reshape(output_quant, (BLOCK_M, elements_per_cta))
+
+            tl.store(
+                output_ptr + row_ids[:, None] * output_stride + columns[None, :],
+                output_quant.to(output_ptr.dtype.element_ty),
+                mask=row_mask[:, None] & column_mask[None, :],
+            )
+
+            group_ids = group_start + group_offsets
+            scale_offsets = (
+                (
+                    (row_ids[:, None] // 128 * num_k_tiles + group_ids // 4) * 32
+                    + row_ids[:, None] % 32
+                )
+                * 4
+                + (row_ids[:, None] % 128) // 32
+            ) * 4 + group_ids % 4
+            tl.store(
+                scale_ptr + scale_offsets,
+                scale.to(tl.uint8),
+                mask=row_mask[:, None] & (group_ids[None, :] < GROUPS_PER_ROW),
+            )
+            row_start += row_step
+
+    @triton.jit
+    def _fused_add_rms_norm_quant_kernel(
+        input_ptr,
+        residual_ptr,
+        weight_ptr,
+        output_ptr,
+        scale_ptr,
+        residual_output_ptr,
+        K,
+        epsilon,
+        GROUPS_PER_ROW: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
+        row_id = tl.program_id(0).to(tl.int64)
+        columns = tl.arange(0, BLOCK_K)
+        column_mask = columns < K
+        offsets = row_id * K + columns
+
+        values = tl.load(input_ptr + offsets, mask=column_mask, other=0.0).to(
+            tl.float32
+        )
+        residual = tl.load(residual_ptr + offsets, mask=column_mask, other=0.0).to(
+            tl.float32
+        )
+        values += residual
+        values = values.to(input_ptr.dtype.element_ty).to(tl.float32)
+        tl.store(
+            residual_output_ptr + offsets,
+            values.to(residual_output_ptr.dtype.element_ty),
+            mask=column_mask,
+        )
+
+        variance = tl.sum(values * values, axis=0) / K
+        inverse_rms = tl.rsqrt(variance + epsilon)
+        weight = tl.load(weight_ptr + columns, mask=column_mask, other=0.0).to(
+            tl.float32
+        )
+        output = values * inverse_rms * weight
+        output = output.to(input_ptr.dtype.element_ty).to(tl.float32)
+
+        block_groups: tl.constexpr = BLOCK_K // 32
+        output_blocked = tl.reshape(output, (block_groups, 32))
+        amax = tl.max(tl.abs(output_blocked), axis=1)
+        raw_scale = amax * (1.0 / 448.0)
+        scale = tl.ceil(tl.log2(raw_scale)) + 127.0
+        scale = tl.minimum(tl.maximum(scale, 0.0), 254.0)
+        descale = tl.exp2(scale - 127.0)
+        descale = tl.where(amax == 0.0, 1.0, descale)
+        output_quant = output_blocked / descale[:, None]
+        output_quant = tl.reshape(output_quant, (BLOCK_K,))
+        tl.store(
+            output_ptr + offsets,
+            output_quant.to(output_ptr.dtype.element_ty),
+            mask=column_mask,
+        )
+
+        group_ids = tl.arange(0, block_groups)
+        num_k_tiles: tl.constexpr = (GROUPS_PER_ROW + 3) // 4
+        scale_offsets = (
+            ((row_id // 128 * num_k_tiles + group_ids // 4) * 32 + row_id % 32) * 4
+            + (row_id % 128) // 32
+        ) * 4 + group_ids % 4
+        tl.store(
+            scale_ptr + scale_offsets,
+            scale.to(tl.uint8),
+            mask=group_ids < GROUPS_PER_ROW,
+        )
+
+    return _silu_and_mul_quant_kernel, _fused_add_rms_norm_quant_kernel
+
+
+_SILU_AND_MUL_MXFP8_QUANT_KERNEL = None
+_FUSED_ADD_RMS_NORM_MXFP8_QUANT_KERNEL = None
+
+
+def _get_fused_mxfp8_quant_kernels():
+    global _SILU_AND_MUL_MXFP8_QUANT_KERNEL
+    global _FUSED_ADD_RMS_NORM_MXFP8_QUANT_KERNEL
+    if _SILU_AND_MUL_MXFP8_QUANT_KERNEL is None:
+        (
+            _SILU_AND_MUL_MXFP8_QUANT_KERNEL,
+            _FUSED_ADD_RMS_NORM_MXFP8_QUANT_KERNEL,
+        ) = _build_fused_mxfp8_quant_kernels()
+    return (
+        _SILU_AND_MUL_MXFP8_QUANT_KERNEL,
+        _FUSED_ADD_RMS_NORM_MXFP8_QUANT_KERNEL,
+    )
+
+
+def _silu_and_mul_mxfp8_quant_impl(
+    input: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from vllm.triton_utils import triton
+
+    assert input.shape[-1] % (2 * MXFP8_BLOCK_SIZE) == 0
+    input = input.contiguous()
+    hidden_size = input.shape[-1] // 2
+    rows = input.numel() // input.shape[-1]
+    output_shape = (*input.shape[:-1], hidden_size)
+    output = torch.empty(output_shape, dtype=MXFP8_VALUE_DTYPE, device=input.device)
+    scales = _empty_swizzled_mxfp8_scales(input, hidden_size)
+
+    silu_kernel, _ = _get_fused_mxfp8_quant_kernels()
+    groups_per_row = hidden_size // MXFP8_BLOCK_SIZE
+    groups_per_cta = 32
+    block_m = 1 if rows < 512 else 4
+    grid = (
+        triton.cdiv(groups_per_row, groups_per_cta),
+        min(triton.cdiv(rows, block_m), 4096),
+    )
+    silu_kernel[grid](
+        input,
+        output,
+        scales,
+        rows,
+        input.shape[-1],
+        hidden_size,
+        K=hidden_size,
+        GROUPS_PER_ROW=groups_per_row,
+        GROUPS_PER_CTA=groups_per_cta,
+        BLOCK_M=block_m,
+        num_warps=4,
+        num_stages=2,
+    )
+    return output, scales
+
+
+def _silu_and_mul_mxfp8_quant_fake(
+    input: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    hidden_size = input.shape[-1] // 2
+    output = torch.empty(
+        (*input.shape[:-1], hidden_size),
+        dtype=MXFP8_VALUE_DTYPE,
+        device=input.device,
+    )
+    return output, _empty_swizzled_mxfp8_scales(input, hidden_size)
+
+
+def silu_and_mul_mxfp8_quant(
+    input: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fuse SiLU-and-mul with MXFP8 quantization and scale swizzling."""
+    return torch.ops.vllm.silu_and_mul_mxfp8_quant(input)
+
+
+direct_register_custom_op(
+    op_name="silu_and_mul_mxfp8_quant",
+    op_func=_silu_and_mul_mxfp8_quant_impl,
+    fake_impl=_silu_and_mul_mxfp8_quant_fake,
+)
+
+
+def _fused_add_rms_norm_mxfp8_quant_impl(
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    epsilon: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    input = input.contiguous()
+    residual = residual.contiguous()
+    weight = weight.contiguous()
+    hidden_size = input.shape[-1]
+    assert hidden_size % MXFP8_BLOCK_SIZE == 0
+    rows = input.numel() // hidden_size
+    output = torch.empty_like(input, dtype=MXFP8_VALUE_DTYPE)
+    scales = _empty_swizzled_mxfp8_scales(input, hidden_size)
+    residual_output = torch.empty_like(input)
+    _, rms_kernel = _get_fused_mxfp8_quant_kernels()
+
+    from vllm.triton_utils import triton
+
+    block_k = triton.next_power_of_2(hidden_size)
+    num_warps = 8 if block_k >= 8192 else 4
+    rms_kernel[(rows,)](
+        input,
+        residual,
+        weight,
+        output,
+        scales,
+        residual_output,
+        hidden_size,
+        epsilon,
+        GROUPS_PER_ROW=hidden_size // MXFP8_BLOCK_SIZE,
+        BLOCK_K=block_k,
+        num_warps=num_warps,
+    )
+    return output, scales, residual_output
+
+
+def _fused_add_rms_norm_mxfp8_quant_fake(
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    epsilon: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    del residual, weight, epsilon
+    return (
+        torch.empty_like(input, dtype=MXFP8_VALUE_DTYPE),
+        _empty_swizzled_mxfp8_scales(input, input.shape[-1]),
+        torch.empty_like(input),
+    )
+
+
+def fused_add_rms_norm_mxfp8_quant(
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    epsilon: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fuse residual-add RMSNorm with MXFP8 quantization and scale swizzling."""
+    return torch.ops.vllm.fused_add_rms_norm_mxfp8_quant(
+        input, residual, weight, epsilon
+    )
+
+
+direct_register_custom_op(
+    op_name="fused_add_rms_norm_mxfp8_quant",
+    op_func=_fused_add_rms_norm_mxfp8_quant_impl,
+    fake_impl=_fused_add_rms_norm_mxfp8_quant_fake,
+)
+
+
 def xpu_mxfp8_quantize(
     x: torch.Tensor, dtype: torch.dtype | None = None
 ) -> tuple[torch.Tensor, torch.Tensor]:

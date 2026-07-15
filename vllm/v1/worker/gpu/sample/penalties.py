@@ -3,6 +3,7 @@
 import numpy as np
 import torch
 
+import vllm.envs as envs
 from vllm.sampling_params import SamplingParams
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv
@@ -40,6 +41,23 @@ class PenaltiesState:
         self.output_bin_counts = torch.zeros(
             max_num_reqs, self.vocab_size, dtype=torch.int32, device=self.device
         )
+        if (
+            envs.VLLM_HYBRID_NVFP4_LM_HEAD
+            or envs.VLLM_HYBRID_MXFP4_LM_HEAD
+            or envs.VLLM_HYBRID_MXFP8_LM_HEAD
+        ):
+            self.output_unique_token_ids = torch.empty(
+                max_num_reqs,
+                min(req_states.max_model_len, self.vocab_size),
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self.num_output_unique_tokens = torch.zeros(
+                max_num_reqs, dtype=torch.int32, device=self.device
+            )
+        else:
+            self.output_unique_token_ids = None
+            self.num_output_unique_tokens = None
 
         self._new_penalties_reqs: list[int] = []
 
@@ -70,6 +88,8 @@ class PenaltiesState:
                 self.req_states.prefill_len.gpu,
                 self.prompt_bin_mask,
                 self.output_bin_counts,
+                self.output_unique_token_ids,
+                self.num_output_unique_tokens,
                 max_prefill_len,
             )
             self._new_penalties_reqs.clear()
@@ -226,6 +246,9 @@ def _bincount_kernel(
     prompt_bin_mask_stride,
     output_bin_counts_ptr,
     output_bin_counts_stride,
+    output_unique_token_ids_ptr,
+    output_unique_token_ids_stride,
+    num_output_unique_tokens_ptr,
     BLOCK_SIZE: tl.constexpr,
 ):
     token_idx = tl.program_id(0)
@@ -258,13 +281,32 @@ def _bincount_kernel(
         output_tokens = tl.load(
             all_token_ids_ptr + req_state_idx * all_token_ids_stride + block, mask=mask
         )
-        tl.atomic_add(
+        old_count = tl.atomic_add(
             output_bin_counts_ptr
             + req_state_idx * output_bin_counts_stride
             + output_tokens,
             1,
             mask=mask,
         )
+        if output_unique_token_ids_ptr is not None:
+            is_new = mask & (old_count == 0)
+            unique_count_ptrs = (
+                num_output_unique_tokens_ptr
+                + req_state_idx
+                + tl.zeros((BLOCK_SIZE,), tl.int32)
+            )
+            unique_positions = tl.atomic_add(
+                unique_count_ptrs,
+                1,
+                mask=is_new,
+            )
+            tl.store(
+                output_unique_token_ids_ptr
+                + req_state_idx * output_unique_token_ids_stride
+                + unique_positions,
+                output_tokens,
+                mask=is_new,
+            )
 
 
 def bincount(
@@ -274,12 +316,16 @@ def bincount(
     prefill_len: torch.Tensor,
     prompt_bin_mask: torch.Tensor,
     output_bin_counts: torch.Tensor,
+    output_unique_token_ids: torch.Tensor | None,
+    num_output_unique_tokens: torch.Tensor | None,
     max_prefill_len: int,
 ) -> None:
     # Use index_fill_ instead of `tensor[idx] = 0` to avoid sync.
     idx_long = expanded_idx_mapping.long()
     prompt_bin_mask.index_fill_(0, idx_long, 0)
     output_bin_counts.index_fill_(0, idx_long, 0)
+    if num_output_unique_tokens is not None:
+        num_output_unique_tokens.index_fill_(0, idx_long, 0)
     num_tokens = expanded_idx_mapping.shape[0]
     BLOCK_SIZE = 1024
     num_blocks = triton.cdiv(max_prefill_len, BLOCK_SIZE)
@@ -293,6 +339,9 @@ def bincount(
         prompt_bin_mask.stride(0),
         output_bin_counts,
         output_bin_counts.stride(0),
+        output_unique_token_ids,
+        output_unique_token_ids.stride(0) if output_unique_token_ids is not None else 0,
+        num_output_unique_tokens,
         BLOCK_SIZE=BLOCK_SIZE,
     )
 

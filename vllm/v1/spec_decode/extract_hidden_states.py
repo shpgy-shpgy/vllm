@@ -242,7 +242,7 @@ class ExtractHiddenStatesProposer:
         """Initialize cudagraph dispatcher keys.
 
         Only supports PIECEWISE cudagraphs (via mixed_mode).
-        Should be called after adjust_cudagraph_sizes_for_spec_decode.
+        Should be called after the target cudagraph mode is resolved.
         """
         assert self.vllm_config.speculative_config is not None
         if (

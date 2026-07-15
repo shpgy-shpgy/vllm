@@ -8,6 +8,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+import vllm.envs as envs
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.eplb.eplb_state import EplbState
@@ -16,6 +17,7 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.models import supports_multimodal_embeddings
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.gpu.attn_utils import (
     build_attn_metadata,
     init_attn_backend,
@@ -183,6 +185,21 @@ class DraftModelSpeculator(BaseSpeculator):
         )
 
         self.model = self.load_draft_model(target_model, target_attn_layer_names)
+        if (
+            not self.use_local_argmax_reduction
+            and (
+                envs.VLLM_HYBRID_NVFP4_LM_HEAD
+                or envs.VLLM_HYBRID_MXFP4_LM_HEAD
+                or envs.VLLM_HYBRID_MXFP8_LM_HEAD
+            )
+            and self.speculative_config.draft_sample_method == "greedy"
+            and hasattr(self.model, "get_top_tokens")
+        ):
+            self.use_local_argmax_reduction = True
+            logger.info(
+                "Hybrid MXFP4/MXFP8 lm-head automatically enabled local argmax "
+                "reduction for greedy draft token generation."
+            )
         self._validate_local_argmax_reduction()
 
         all_attn_layers = set[str](
@@ -357,8 +374,14 @@ class DraftModelSpeculator(BaseSpeculator):
 
     def _greedy_sample_draft(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.use_local_argmax_reduction:
-            return self.model.get_top_tokens(hidden_states)
-        logits = self.model.compute_logits(hidden_states)
+            with record_function_or_nullcontext(
+                f"lm_head.draft.compact[M={hidden_states.shape[0]}]"
+            ):
+                return self.model.get_top_tokens(hidden_states)
+        with record_function_or_nullcontext(
+            f"lm_head.draft.full_logits[M={hidden_states.shape[0]}]"
+        ):
+            logits = self.model.compute_logits(hidden_states)
         return logits.argmax(dim=-1)
 
     def sample_draft(

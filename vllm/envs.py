@@ -190,6 +190,24 @@ if TYPE_CHECKING:
     VLLM_HUMMING_MOE_GEMM_TYPE: Literal["indexed", "grouped", "auto"] | None = None
     VLLM_B12X_MOE_FP4_FORCE_A16: bool = False
     VLLM_DEEPEPLL_NVFP4_DISPATCH: bool = False
+    # Experimental hybrid lm-head paths.  These settings are intentionally
+    # exposed through envs.py so model loading and tests use the same values.
+    VLLM_HYBRID_NVFP4_LM_HEAD: bool = False
+    VLLM_HYBRID_NVFP4_LM_HEAD_BACKEND: Literal["b12x", "auto"] = "b12x"
+    VLLM_HYBRID_NVFP4_LM_HEAD_CANDIDATES: int = 128
+    VLLM_HYBRID_NVFP4_LM_HEAD_MAX_ROWS: int = 0
+    VLLM_HYBRID_NVFP4_LM_HEAD_USE_FLASHINFER_TOPK: bool = True
+    VLLM_HYBRID_MXFP4_LM_HEAD: bool = False
+    VLLM_HYBRID_MXFP4_LM_HEAD_CANDIDATES: int = 128
+    VLLM_HYBRID_MXFP4_LM_HEAD_MAX_ROWS: int = 0
+    VLLM_HYBRID_MXFP4_LM_HEAD_USE_FLASHINFER_TOPK: bool = True
+    VLLM_HYBRID_MXFP4_LM_HEAD_ROW_BUCKET_PAD: bool = True
+    VLLM_HYBRID_MXFP4_LM_HEAD_MIXED_BATCH_MODE: str = "all"
+    VLLM_HYBRID_MXFP8_LM_HEAD: bool = False
+    VLLM_HYBRID_MXFP8_LM_HEAD_CANDIDATES: int = 128
+    VLLM_HYBRID_MXFP8_LM_HEAD_MAX_ROWS: int = 0
+    VLLM_HYBRID_MXFP8_LM_HEAD_USE_FLASHINFER_TOPK: bool = True
+    VLLM_SCHED_TT_DEBUG: bool = False
     VLLM_V1_USE_OUTLINES_CACHE: bool = False
     VLLM_TPU_USING_PATHWAYS: bool = False
     VLLM_USE_DEEP_GEMM: bool = True
@@ -263,7 +281,7 @@ if TYPE_CHECKING:
     VLLM_HAS_FLASHINFER_CUBIN: bool = False
     VLLM_ROCM_FP8_MFMA_PAGE_ATTN: bool = False
     VLLM_ALLREDUCE_USE_SYMM_MEM: bool = True
-    VLLM_ALLREDUCE_USE_FLASHINFER: bool = True
+    VLLM_ALLREDUCE_USE_FLASHINFER: bool | None = None
     VLLM_TUNED_CONFIG_FOLDER: str | None = None
     VLLM_ENABLE_STARTUP_PLAN: bool = False
     VLLM_GPT_OSS_SYSTEM_TOOL_MCP_LABELS: set[str] = set()
@@ -429,6 +447,21 @@ def env_with_choices(
         return value
 
     return _get_validated_env
+
+
+def env_flag_or_none(
+    env_name: str,
+    fallback_env_name: str | None = None,
+) -> Callable[[], bool | None]:
+    """Return a tri-state flag: unset for auto, false, or true."""
+
+    def _get_optional_flag() -> bool | None:
+        value = os.getenv(env_name)
+        if value is None and fallback_env_name is not None:
+            value = os.getenv(fallback_env_name)
+        return None if value is None else bool(int(value))
+
+    return _get_optional_flag
 
 
 def env_list_with_choices(
@@ -850,13 +883,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # If set to 1, vllm will trace function calls
     # Useful for debugging
     "VLLM_TRACE_FUNCTION": lambda: int(os.getenv("VLLM_TRACE_FUNCTION", "0")),
-    # Whether to use the FlashInfer top-k / top-p sampler on CUDA. Enabled
-    # by default when the hardware supports it — set to 0 to opt out
-    # explicitly, which forces the PyTorch-native (Triton for bs>=8) path.
+    # Whether to use the FlashInfer top-k / top-p sampler on CUDA. Disabled by
+    # default so the compact Triton sampler can be selected; set to 1 to opt in.
     "VLLM_USE_FLASHINFER_SAMPLER": lambda: (
         bool(int(os.environ["VLLM_USE_FLASHINFER_SAMPLER"]))
         if "VLLM_USE_FLASHINFER_SAMPLER" in os.environ
-        else True
+        else False
     ),
     # Pipeline stage partition strategy
     "VLLM_PP_LAYER_PARTITION": lambda: os.getenv("VLLM_PP_LAYER_PARTITION", None),
@@ -1527,6 +1559,56 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DEEPEPLL_NVFP4_DISPATCH": lambda: bool(
         int(os.getenv("VLLM_DEEPEPLL_NVFP4_DISPATCH", "0"))
     ),
+    # Experimental MXFP4/NVFP4/MXFP8-coarse, BF16-refined lm-head paths.
+    "VLLM_HYBRID_NVFP4_LM_HEAD": lambda: bool(
+        int(os.getenv("VLLM_HYBRID_NVFP4_LM_HEAD", "0"))
+    ),
+    "VLLM_HYBRID_NVFP4_LM_HEAD_BACKEND": lambda: os.getenv(
+        "VLLM_HYBRID_NVFP4_LM_HEAD_BACKEND", "b12x"
+    ).strip().lower(),
+    "VLLM_HYBRID_NVFP4_LM_HEAD_CANDIDATES": lambda: int(
+        os.getenv("VLLM_HYBRID_NVFP4_LM_HEAD_CANDIDATES", "128")
+    ),
+    "VLLM_HYBRID_NVFP4_LM_HEAD_MAX_ROWS": lambda: int(
+        os.getenv("VLLM_HYBRID_NVFP4_LM_HEAD_MAX_ROWS", "0")
+    ),
+    "VLLM_HYBRID_NVFP4_LM_HEAD_USE_FLASHINFER_TOPK": lambda: bool(
+        int(os.getenv("VLLM_HYBRID_NVFP4_LM_HEAD_USE_FLASHINFER_TOPK", "1"))
+    ),
+    "VLLM_HYBRID_MXFP4_LM_HEAD": lambda: bool(
+        int(os.getenv("VLLM_HYBRID_MXFP4_LM_HEAD", "0"))
+    ),
+    "VLLM_HYBRID_MXFP4_LM_HEAD_CANDIDATES": lambda: int(
+        os.getenv("VLLM_HYBRID_MXFP4_LM_HEAD_CANDIDATES", "128")
+    ),
+    "VLLM_HYBRID_MXFP4_LM_HEAD_MAX_ROWS": lambda: int(
+        os.getenv("VLLM_HYBRID_MXFP4_LM_HEAD_MAX_ROWS", "0")
+    ),
+    "VLLM_HYBRID_MXFP4_LM_HEAD_USE_FLASHINFER_TOPK": lambda: bool(
+        int(os.getenv("VLLM_HYBRID_MXFP4_LM_HEAD_USE_FLASHINFER_TOPK", "1"))
+    ),
+    "VLLM_HYBRID_MXFP4_LM_HEAD_ROW_BUCKET_PAD": lambda: bool(
+        int(os.getenv("VLLM_HYBRID_MXFP4_LM_HEAD_ROW_BUCKET_PAD", "1"))
+    ),
+    "VLLM_HYBRID_MXFP4_LM_HEAD_MIXED_BATCH_MODE": lambda: os.getenv(
+        "VLLM_HYBRID_MXFP4_LM_HEAD_MIXED_BATCH_MODE", "all"
+    ).strip().lower(),
+    "VLLM_HYBRID_MXFP8_LM_HEAD": lambda: bool(
+        int(os.getenv("VLLM_HYBRID_MXFP8_LM_HEAD", "0"))
+    ),
+    "VLLM_HYBRID_MXFP8_LM_HEAD_CANDIDATES": lambda: int(
+        os.getenv("VLLM_HYBRID_MXFP8_LM_HEAD_CANDIDATES", "128")
+    ),
+    "VLLM_HYBRID_MXFP8_LM_HEAD_MAX_ROWS": lambda: int(
+        os.getenv("VLLM_HYBRID_MXFP8_LM_HEAD_MAX_ROWS", "0")
+    ),
+    "VLLM_HYBRID_MXFP8_LM_HEAD_USE_FLASHINFER_TOPK": lambda: bool(
+        int(os.getenv("VLLM_HYBRID_MXFP8_LM_HEAD_USE_FLASHINFER_TOPK", "1"))
+    ),
+    # Opt-in per-request QUEUED/SCHEDULED timing debug logs (SCHED_TT).
+    "VLLM_SCHED_TT_DEBUG": lambda: bool(
+        int(os.getenv("VLLM_SCHED_TT_DEBUG", "0"))
+    ),
     # Whether to turn on the outlines cache for V1
     # This cache is unbounded and on disk, so it's not safe to use in
     # an environment with potentially malicious users.
@@ -1860,9 +1942,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ALLREDUCE_USE_SYMM_MEM": lambda: bool(
         int(os.getenv("VLLM_ALLREDUCE_USE_SYMM_MEM", "1"))
     ),
-    # Whether to use FlashInfer allreduce
-    "VLLM_ALLREDUCE_USE_FLASHINFER": lambda: bool(
-        int(os.getenv("VLLM_ALLREDUCE_USE_FLASHINFER", "1"))
+    # Whether to use FlashInfer allreduce. Unset auto-selects the validated
+    # SM120 TP2 FlashInfer path; 0 disables it and 1 forces the existing path.
+    "VLLM_ALLREDUCE_USE_FLASHINFER": env_flag_or_none(
+        "VLLM_ALLREDUCE_USE_FLASHINFER"
     ),
     # Experimental: use this to enable MCP tool calling for non harmony models
     "VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT": lambda: bool(

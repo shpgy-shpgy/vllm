@@ -341,6 +341,22 @@ class Worker(WorkerBase):
             restore = original_value if original_value else str(_SIZE_MAX_MB)
             torch._C._accelerator_setAllocatorSettings(f"max_split_size_mb:{restore}")
 
+    def _warmup_v2_tp_gather(self) -> None:
+        if (
+            not self.use_v2_model_runner
+            or self.model_config.runner_type != "generate"
+            or self.parallel_config.tensor_parallel_size == 1
+            or not get_pp_group().is_last_rank
+        ):
+            return
+
+        # V2 vocab-parallel sampling uses NCCL gather. ProcessGroupNCCL
+        # initializes its P2P channels lazily on the first gather, so warm them
+        # before the memory snapshot accounts for persistent non-Torch memory.
+        local_pair = torch.empty((1, 2), dtype=torch.float64, device=self.device)
+        get_tp_group().gather(local_pair, dst=0, dim=-1)
+        torch.accelerator.synchronize()
+
     @instrument(span_name="Init device")
     def init_device(self):
         if self.device_config.device_type == "cuda":
@@ -424,6 +440,7 @@ class Worker(WorkerBase):
 
             if self.use_v2_model_runner:
                 logger.info_once("Using V2 Model Runner")
+                self._warmup_v2_tp_gather()
 
             # Set random seed.
             set_random_seed(self.model_config.seed)
@@ -858,6 +875,23 @@ class Worker(WorkerBase):
 
             maybe_save_startup_plan(self, kv_cache_memory_bytes_to_requested_limit)
 
+        # Qwen3.5's long-prefill kernels have shapes that are not covered by
+        # decode graph capture. Warm them for both model-runner generations.
+        if (
+            get_pp_group().is_last_rank
+            and "Qwen3_5MoeForConditionalGeneration" in self.model_config.architectures
+        ):
+            long_prefill_tokens = min(
+                3000,
+                self.scheduler_config.max_num_batched_tokens,
+                self.model_config.max_model_len - 1,
+            )
+            self.model_runner._dummy_run(
+                num_tokens=long_prefill_tokens,
+                skip_eplb=True,
+                cudagraph_runtime_mode=CUDAGraphMode.NONE,
+            )
+
         if self.use_v2_model_runner:
             # V2: Run full execute_model + sample_tokens to JIT compile triton kernels.
             warmup_kernels(self.model_runner, self.execute_model, self.sample_tokens)
@@ -1099,7 +1133,13 @@ class Worker(WorkerBase):
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        return self.model_runner.sample_tokens(grammar_output)
+        context = (
+            self.profiler.annotate_context_manager("sample_tokens")
+            if self.profiler
+            else nullcontext()
+        )
+        with context:
+            return self.model_runner.sample_tokens(grammar_output)
 
     @torch.inference_mode()
     @with_gpu_sync_check

@@ -32,7 +32,6 @@ from vllm.model_executor.offloader.base import get_offloader
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import round_up
-from vllm.utils.torch_utils import current_stream
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
@@ -137,7 +136,11 @@ class CudaGraphManager:
         self._lora_dispatch_map, self._max_lora_case = self._build_lora_dispatch_map()
 
         self.graphs: dict[BatchExecutionDescriptor, torch.cuda.CUDAGraph] = {}
-        self.pool = current_platform.get_global_graph_pool() if cudagraph_mode else None
+        self.pool = (
+            current_platform.get_global_graph_pool()
+            if cudagraph_mode and device.type == "cuda"
+            else None
+        )
 
         self._graphs_captured = False
 
@@ -149,6 +152,7 @@ class CudaGraphManager:
 
         self._candidates: dict[tuple[int, int], list[BatchExecutionDescriptor]] = {}
         self._capture_descs: dict[CUDAGraphMode, list[BatchExecutionDescriptor]] = {}
+        self.decode_query_lens = {decode_query_len}
 
         # Breakable CUDA graph (PW CUDA graph without torch.compile)
         self.use_breakable_cg = (
@@ -185,6 +189,25 @@ class CudaGraphManager:
         # Counts above the largest captured case clamp to it.
         return self._lora_dispatch_map.get(num_active_loras, self._max_lora_case)
 
+    def _build_candidates(
+        self,
+        descs_by_token_lora: dict[tuple[int, int], list[BatchExecutionDescriptor]],
+    ) -> dict[tuple[int, int], list[BatchExecutionDescriptor]]:
+        candidates: dict[tuple[int, int], list[BatchExecutionDescriptor]] = {}
+        for num_active_loras in self.lora_capture_cases:
+            token_counts = sorted(
+                num_tokens
+                for num_tokens, lora_count in descs_by_token_lora
+                if lora_count == num_active_loras
+            )
+            current_range_start = 0
+            for token_cg_size in token_counts:
+                descs = descs_by_token_lora[(token_cg_size, num_active_loras)]
+                for num_tokens in range(current_range_start, token_cg_size + 1):
+                    candidates[(num_tokens, num_active_loras)] = descs
+                current_range_start = token_cg_size + 1
+        return candidates
+
     def _init_candidates(self) -> None:
         """Build priority-ordered candidate lists for each token count."""
         capture_sizes = self.compilation_config.cudagraph_capture_sizes
@@ -192,11 +215,11 @@ class CudaGraphManager:
             return
 
         capture_sizes = sorted(capture_sizes)
-        max_decode_tokens = self.max_num_reqs * self.decode_query_len
         decode_mode = self.cudagraph_mode.decode_mode()
         mixed_mode = self.cudagraph_mode.mixed_mode()
         separate_decode_routine = self.cudagraph_mode.separate_routine()
         max_cg_capture_size = self.compilation_config.max_cudagraph_capture_size
+        assert max_cg_capture_size is not None
 
         descs_by_mode: defaultdict[CUDAGraphMode, list[BatchExecutionDescriptor]] = (
             defaultdict(list)
@@ -229,10 +252,12 @@ class CudaGraphManager:
             )
         else:
             decode_query_lens = [self.decode_query_len]
+        self.decode_query_lens = set(decode_query_lens)
 
         capture_varlen_decode = (
             separate_decode_routine and bool(decode_mode) and self.varlen_decode
         )
+        max_decode_tokens = self.max_num_reqs * self.decode_query_len
         for num_tokens, num_active_loras in product(
             capture_sizes, self.lora_capture_cases
         ):
@@ -251,6 +276,7 @@ class CudaGraphManager:
             #  (i.e. separate decode routine)
             elif separate_decode_routine and decode_mode and not self.varlen_decode:
                 for decode_query_len in decode_query_lens:
+                    max_decode_tokens = self.max_num_reqs * decode_query_len
                     rounded_num_tokens = round_up(num_tokens, decode_query_len)
                     rounded_num_reqs = rounded_num_tokens // decode_query_len
 
@@ -273,6 +299,9 @@ class CudaGraphManager:
                     if desc not in descs_by_mode[decode_mode]:
                         descs_by_mode[decode_mode].append(desc)
 
+        for num_tokens, num_active_loras in product(
+            capture_sizes, self.lora_capture_cases
+        ):
             if mixed_mode:
                 # for PIECEWISE graphs there is no limit on requests when replaying
                 # i.e. no request padding is needed, so we leave it as None.
@@ -313,11 +342,23 @@ class CudaGraphManager:
     def needs_capture(self) -> bool:
         return len(self._capture_descs) > 0
 
+    def get_capture_sizes(self) -> list[int]:
+        """Return the distinct token counts that will be captured."""
+        return sorted(
+            {
+                desc.num_tokens
+                for descs in self._capture_descs.values()
+                for desc in descs
+            },
+            reverse=True,
+        )
+
     @torch.inference_mode()
     def capture(
         self,
         create_forward_fn: CreateForwardFn,
         progress_bar_desc: str = "Capturing CUDA graphs",
+        capture_stream_warmup: Callable[[], None] | None = None,
     ) -> None:
         """Capture CUDA graphs.
 
@@ -327,8 +368,13 @@ class CudaGraphManager:
                 it is invoked once with warmup=True and again with warmup=False
                 because attention backends may mutate or lazily initialize
                 metadata during warmup.
+            capture_stream_warmup: Optional eager warmup that runs on the CUDA
+                graph capture stream before any graph capture begins.
         """
-        with graph_capture(device=self.device):
+        with graph_capture(device=self.device) as graph_capture_context:
+            if capture_stream_warmup is not None:
+                capture_stream_warmup()
+
             # Capture in order: PIECEWISE first, then FULL. PIECEWISE has larger
             # activations so FULL activations should fit in already allocated
             # buffers in the graph pool.
@@ -384,7 +430,9 @@ class CudaGraphManager:
                             torch.accelerator.synchronize()
                             free_before = torch.accelerator.get_memory_info()[0]
                         with torch.cuda.graph(
-                            graph, self.pool, stream=current_stream()
+                            graph,
+                            self.pool,
+                            stream=graph_capture_context.stream,
                         ):
                             forward_fn(CUDAGraphMode.NONE)
                             # Join offloader's copy stream after forward to avoid
@@ -614,7 +662,26 @@ class ModelCudaGraphManager(CudaGraphManager):
 
             return forward_fn
 
-        super().capture(create_forward_fn, progress_bar_desc)
+        capture_sizes = [
+            desc.num_tokens for descs in self._capture_descs.values() for desc in descs
+        ]
+
+        def warmup_capture_stream() -> None:
+            from vllm.model_executor.layers.quantization.utils import (
+                mxfp6_sm120_utils,
+            )
+
+            mxfp6_sm120_utils.warmup_mxfp6_sm120_stream(
+                model,
+                capture_sizes,
+                self.vllm_config.model_config.dtype,
+            )
+
+        super().capture(
+            create_forward_fn,
+            progress_bar_desc,
+            capture_stream_warmup=warmup_capture_stream,
+        )
 
     def run_fullgraph(
         self, desc: BatchExecutionDescriptor

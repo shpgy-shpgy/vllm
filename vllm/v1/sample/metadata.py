@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 
 from vllm.v1.sample.logits_processor import LogitsProcessors
@@ -53,3 +54,18 @@ class SamplingMetadata:
     # When non-None, use ``holder.has_tracked_requests()`` to see if this batch applies
     # thinking-token-budget logits (holder may exist with an empty tracking set).
     thinking_budget_state_holder: ThinkingBudgetStateHolder | None = None
+
+    # CPU-known maximum of the active top_k values. This lets GPU sampling code
+    # specialize small top-k batches without introducing a GPU->CPU sync.
+    top_k_max: int | None = None
+
+    # True when presence penalty is the only active penalty type. This avoids
+    # GPU->CPU syncs in the sampler by carrying CPU-known request state.
+    presence_penalties_only: bool = False
+
+    # CPU token buffers from InputBatch, used to build output-token tensors for
+    # the presence-only penalty path without walking Python token lists.
+    token_ids_cpu: np.ndarray | None = None
+    num_prompt_tokens_cpu: np.ndarray | None = None
+    num_tokens_no_spec_cpu: np.ndarray | None = None
+    pin_memory: bool = False

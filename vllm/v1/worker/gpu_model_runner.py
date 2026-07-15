@@ -488,12 +488,13 @@ class ExecuteModelState(NamedTuple):
     sample_tokens(), after execute_model() returns None."""
 
     scheduler_output: "SchedulerOutput"
-    logits: torch.Tensor
+    logits: torch.Tensor | None
     spec_decode_metadata: SpecDecodeMetadata | None
     spec_decode_common_attn_metadata: CommonAttentionMetadata | None
     hidden_states: torch.Tensor
     sample_hidden_states: torch.Tensor
     aux_hidden_states: list[torch.Tensor] | None
+    pre_sampled_output: SamplerOutput | None
     ec_connector_output: ECConnectorOutput | None
     cudagraph_stats: CUDAGraphStat | None
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None
@@ -950,6 +951,7 @@ class GPUModelRunner(
             self._num_valid_draft_tokens_copy_stream = torch.cuda.Stream()
 
         self._draft_token_req_ids: list[str] | None = None
+        self._draft_token_ids_cpu_valid = False
         self.transfer_event = torch.Event()
         self.sampled_token_ids_pinned_cpu = torch.empty(
             (self.max_num_reqs, 1),
@@ -988,6 +990,15 @@ class GPUModelRunner(
                     device="cpu",
                     pin_memory=PIN_MEMORY,
                 )
+        self._use_gpu_only_num_accepted_tokens = (
+            self.num_spec_tokens > 0
+            and self.model_config.is_hybrid
+            # "all" still needs postprocess_mamba_all() below. The GPU-only
+            # handoff is valid only when no per-token Mamba state is cached.
+            and self.cache_config.mamba_cache_mode == "none"
+        )
+        self._num_accepted_tokens_valid = False
+        self._num_accepted_tokens_req_id_to_index: dict[str, int] = {}
 
         # Model weight offloader
         # Make sure this is called before any get_offloader call
@@ -1595,6 +1606,14 @@ class GPUModelRunner(
         num_reqs = output_token_ids.size(0)
         self.num_accepted_tokens.gpu[:num_reqs] = (output_token_ids != -1).sum(dim=1)
 
+        if self._use_gpu_only_num_accepted_tokens:
+            self._num_accepted_tokens_valid = True
+            self._num_accepted_tokens_req_id_to_index = {
+                req_id: i
+                for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs])
+            }
+            return
+
         if self.cache_config.mamba_cache_mode == "align":
             # Fused GPU postprocess: state copies + per-request accepted-token
             # update without CPU-GPU sync. The metadata
@@ -1776,12 +1795,17 @@ class GPUModelRunner(
 
         return cu_num_tokens
 
-    def _compute_prev_positions(self, num_reqs: int) -> None:
+    def _compute_prev_positions(
+        self,
+        num_reqs: int,
+        prev_req_id_to_index: dict[str, int] | None = None,
+    ) -> None:
         """Build prev_positions mapping: current pos -> previous pos (-1 if new).
 
         Populates self.prev_positions.np[:num_reqs] with the mapping.
         """
-        prev_req_id_to_index = self.input_batch.prev_req_id_to_index
+        if prev_req_id_to_index is None:
+            prev_req_id_to_index = self.input_batch.prev_req_id_to_index
         prev_positions = self.prev_positions.np[:num_reqs]
 
         if not prev_req_id_to_index:
@@ -2103,7 +2127,8 @@ class GPUModelRunner(
             torch.from_numpy(num_scheduled_tokens),
             out=self.optimistic_seq_lens_cpu[:num_reqs],
         )
-        self.optimistic_seq_lens_cpu[num_reqs:].fill_(0)
+        if num_reqs < self.optimistic_seq_lens_cpu.shape[0]:
+            self.optimistic_seq_lens_cpu[num_reqs:].zero_()
 
         # Build prev_positions mapping: current pos -> prev pos (-1 if new).
         # Used for gathering from previous iteration's GPU tensors.
@@ -2122,13 +2147,27 @@ class GPUModelRunner(
 
         # Sync num_accepted_tokens from CPU (set by
         # _update_states_after_model_execute for hybrid models).
-        # Skipped under async scheduling (non-align): the CPU copy races with
-        # the in-flight D2H copy and with input-batch row moves.
-        needs_cpu_accepted_counts = self.num_accepted_tokens_event is not None and not (
+        if self._use_gpu_only_num_accepted_tokens:
+            if self._num_accepted_tokens_valid:
+                self._compute_prev_positions(
+                    num_reqs, self._num_accepted_tokens_req_id_to_index
+                )
+                self.prev_positions.copy_to_gpu(num_reqs)
+                prev_positions_gpu = self.prev_positions.gpu[:num_reqs]
+                prev_indices_gpu = prev_positions_gpu.clamp_min(0)
+                num_accepted_tokens = self.num_accepted_tokens.gpu[prev_indices_gpu]
+                num_accepted_tokens.masked_fill_(prev_positions_gpu < 0, 1)
+                self.num_accepted_tokens.gpu[:num_reqs].copy_(
+                    num_accepted_tokens, non_blocking=True
+                )
+            else:
+                self.num_accepted_tokens.gpu.fill_(1)
+            self.num_accepted_tokens.gpu[num_reqs:].fill_(1)
+        # Under async scheduling (non-align), a CPU copy would race with both
+        # the in-flight D2H copy and input-batch row moves.
+        elif self.num_accepted_tokens_event is not None and not (
             self.use_async_scheduling and self.cache_config.mamba_cache_mode != "align"
-        )
-        if needs_cpu_accepted_counts:
-            assert self.num_accepted_tokens_event is not None
+        ):
             self.num_accepted_tokens_event.synchronize()
             # Async mode: condense() reordered indices, use prev_positions mapping
             if self.use_async_scheduling and prev_req_id_to_index:
@@ -2208,7 +2247,8 @@ class GPUModelRunner(
         self.seq_lens[:num_reqs] = (
             self.num_computed_tokens[:num_reqs] + num_scheduled_tokens_gpu
         )
-        self.seq_lens[num_reqs:].fill_(0)
+        if num_reqs < self.seq_lens.shape[0]:
+            self.seq_lens[num_reqs:].zero_()
 
         self.input_batch.block_table.compute_slot_mapping(
             num_reqs,
@@ -2489,7 +2529,8 @@ class GPUModelRunner(
                 self.dcp_rank,
                 self.parallel_config.cp_kv_cache_interleave_size,
             )
-            self.dcp_local_seq_lens.cpu[num_reqs:].fill_(0)
+            if num_reqs < self.dcp_local_seq_lens.cpu.shape[0]:
+                self.dcp_local_seq_lens.cpu[num_reqs:].zero_()
             self.dcp_local_seq_lens.copy_to_gpu(num_reqs_padded)
 
             cm_base.dcp_local_seq_lens = self.dcp_local_seq_lens.gpu[:num_reqs_padded]
@@ -3318,11 +3359,19 @@ class GPUModelRunner(
                 if encoder_output is None:
                     # A feature starting at/after the processed boundary is only
                     # reached via the drafter's +1 look-ahead and might not be
-                    # encoded yet; fall back to the token embedding for drafting.
-                    if (
+                    # encoded yet. The MTP draft path can also observe an
+                    # eviction under memory pressure. In both cases, skipping
+                    # the draft-only embedding is safe because target-model
+                    # verification still uses the full multimodal input.
+                    if shift_computed_tokens > 0 or (
                         start_pos
                         >= req_state.num_computed_tokens + num_scheduled_tokens
                     ):
+                        logger.warning(
+                            "Encoder cache miss for %s — skipping "
+                            "multimodal embedding for this draft step.",
+                            mm_hash,
+                        )
                         continue
                     raise RuntimeError(f"Encoder cache miss for {mm_hash}.")
 
@@ -3717,27 +3766,472 @@ class GPUModelRunner(
             ec_connector_output,
         )
 
+    def _can_sample_global_argmax(
+        self,
+        scheduler_output: "SchedulerOutput",
+        spec_decode_metadata: SpecDecodeMetadata | None,
+    ) -> bool:
+        """Narrow guard for vocab-parallel greedy argmax sampling."""
+
+        def reject(reason: str) -> bool:
+            return False
+
+        if self.broadcast_pp_output or spec_decode_metadata is not None:
+            return reject("pipeline broadcast or spec decode is active")
+        if scheduler_output.has_structured_output_requests:
+            return reject("structured output is active")
+        if not hasattr(self.model, "get_top_tokens"):
+            return reject(f"model wrapper lacks method: {type(self.model).__name__}")
+        if self.sampler.logprobs_mode in ("processed_logits", "processed_logprobs"):
+            return reject(f"unsupported logprobs mode {self.sampler.logprobs_mode}")
+
+        sampling_metadata = self.input_batch.sampling_metadata
+        if not sampling_metadata.all_greedy:
+            return reject(
+                "not all requests are greedy: "
+                f"all_greedy={sampling_metadata.all_greedy}, "
+                f"all_random={sampling_metadata.all_random}"
+            )
+        if sampling_metadata.generators:
+            return reject("per-request generators are active")
+        active_non_argmax_logitsprocs = []
+        for logitproc in sampling_metadata.logitsprocs.non_argmax_invariant:
+            biases = getattr(logitproc, "biases", None)
+            if biases is not None:
+                if biases:
+                    active_non_argmax_logitsprocs.append(type(logitproc).__name__)
+                continue
+            min_toks = getattr(logitproc, "min_toks", None)
+            if min_toks is not None:
+                if min_toks:
+                    active_non_argmax_logitsprocs.append(type(logitproc).__name__)
+                continue
+            active_non_argmax_logitsprocs.append(type(logitproc).__name__)
+        if (
+            sampling_metadata.max_num_logprobs is not None
+            or sampling_metadata.logprob_token_ids
+            or sampling_metadata.allowed_token_ids_mask is not None
+            or sampling_metadata.bad_words_token_ids
+            or not sampling_metadata.no_penalties
+            or active_non_argmax_logitsprocs
+        ):
+            return reject(
+                "unsupported sampling feature: "
+                f"max_num_logprobs={sampling_metadata.max_num_logprobs}, "
+                f"logprob_token_ids={bool(sampling_metadata.logprob_token_ids)}, "
+                f"allowed={sampling_metadata.allowed_token_ids_mask is not None}, "
+                f"bad_words={bool(sampling_metadata.bad_words_token_ids)}, "
+                f"no_penalties={sampling_metadata.no_penalties}, "
+                f"argmax_inv={len(sampling_metadata.logitsprocs.argmax_invariant)}, "
+                f"active_non_argmax={active_non_argmax_logitsprocs}"
+            )
+        holder = getattr(sampling_metadata, "thinking_budget_state_holder", None)
+        if holder is not None and holder.has_tracked_requests():
+            return reject("thinking budget state is active")
+
+        num_reqs = self.input_batch.num_reqs
+        temperature_cpu = self.input_batch.temperature_cpu[:num_reqs]
+        if not np.all(temperature_cpu == 0.0):
+            return reject(
+                f"temperature_cpu is not uniformly greedy: "
+                f"{temperature_cpu[:4].tolist()}"
+            )
+        return True
+
+    def _get_global_full_sampling_temperature(
+        self,
+        scheduler_output: "SchedulerOutput",
+        spec_decode_metadata: SpecDecodeMetadata | None,
+    ) -> float | None:
+        """Return uniform temperature for full-distribution compact TP sampling."""
+
+        def reject(reason: str) -> float | None:
+            return None
+
+        if self.broadcast_pp_output or spec_decode_metadata is not None:
+            return reject("pipeline broadcast or spec decode is active")
+        if scheduler_output.has_structured_output_requests:
+            return reject("structured output is active")
+        if not hasattr(self.model, "sample_full_tokens"):
+            return reject(f"model wrapper lacks method: {type(self.model).__name__}")
+        if self.sampler.logprobs_mode in ("processed_logits", "processed_logprobs"):
+            return reject(f"unsupported logprobs mode {self.sampler.logprobs_mode}")
+
+        sampling_metadata = self.input_batch.sampling_metadata
+        if not sampling_metadata.all_random:
+            return reject(
+                "not all requests are random: "
+                f"all_greedy={sampling_metadata.all_greedy}, "
+                f"all_random={sampling_metadata.all_random}"
+            )
+        if sampling_metadata.generators:
+            return reject("per-request generators are active")
+        if self.sampler.use_fp64_gumbel:
+            return reject("fp64 gumbel sampling is active")
+        if (
+            sampling_metadata.max_num_logprobs is not None
+            or sampling_metadata.logprob_token_ids
+            or sampling_metadata.allowed_token_ids_mask is not None
+            or sampling_metadata.bad_words_token_ids
+            or not sampling_metadata.no_penalties
+            or sampling_metadata.top_k is not None
+            or sampling_metadata.top_p is not None
+        ):
+            return reject("unsupported sampling feature is active")
+        active_logitsprocs = []
+        for logitproc in sampling_metadata.logitsprocs.all:
+            biases = getattr(logitproc, "biases", None)
+            if biases is not None:
+                if biases:
+                    active_logitsprocs.append(type(logitproc).__name__)
+                continue
+            min_toks = getattr(logitproc, "min_toks", None)
+            if min_toks is not None:
+                if min_toks:
+                    active_logitsprocs.append(type(logitproc).__name__)
+                continue
+            min_p_count = getattr(logitproc, "min_p_count", None)
+            if min_p_count is not None:
+                if min_p_count:
+                    active_logitsprocs.append(type(logitproc).__name__)
+                continue
+            active_logitsprocs.append(type(logitproc).__name__)
+        if active_logitsprocs:
+            return reject(f"logits processors are active: {active_logitsprocs}")
+        holder = getattr(sampling_metadata, "thinking_budget_state_holder", None)
+        if holder is not None and holder.has_tracked_requests():
+            return reject("thinking budget state is active")
+
+        num_reqs = self.input_batch.num_reqs
+        if num_reqs == 0:
+            return reject("empty batch")
+        temperature_cpu = self.input_batch.temperature_cpu[:num_reqs]
+        temperature = float(temperature_cpu[0])
+        if temperature <= 1e-5:
+            return reject(f"temperature is not random: {temperature}")
+        if not np.all(temperature_cpu == temperature):
+            return reject("temperature is not uniform")
+        return temperature
+
+    def _get_global_topk_sampling_params(
+        self,
+        scheduler_output: "SchedulerOutput",
+        spec_decode_metadata: SpecDecodeMetadata | None,
+    ) -> tuple[int, float, float] | None:
+        """Return uniform top-k sampling params for the compact TP path."""
+
+        def reject(reason: str) -> tuple[int, float, float] | None:
+            return None
+
+        if self.broadcast_pp_output or spec_decode_metadata is not None:
+            return reject("pipeline broadcast or spec decode is active")
+        if scheduler_output.has_structured_output_requests:
+            return reject("structured output is active")
+        if not hasattr(self.model, "sample_topk_tokens"):
+            return reject(f"model wrapper lacks method: {type(self.model).__name__}")
+        if self.sampler.logprobs_mode in ("processed_logits", "processed_logprobs"):
+            return reject(f"unsupported logprobs mode {self.sampler.logprobs_mode}")
+
+        sampling_metadata = self.input_batch.sampling_metadata
+        if not sampling_metadata.all_random:
+            return reject(
+                "not all requests are random: "
+                f"all_greedy={sampling_metadata.all_greedy}, "
+                f"all_random={sampling_metadata.all_random}"
+            )
+        if sampling_metadata.generators:
+            return reject("per-request generators are active")
+        if self.sampler.use_fp64_gumbel:
+            return reject("fp64 gumbel sampling is active")
+        allow_presence_only_penalty = (
+            sampling_metadata.presence_penalties_only
+            and sampling_metadata.token_ids_cpu is not None
+            and sampling_metadata.num_prompt_tokens_cpu is not None
+            and sampling_metadata.num_tokens_no_spec_cpu is not None
+        )
+        if (
+            sampling_metadata.max_num_logprobs is not None
+            or sampling_metadata.logprob_token_ids
+            or sampling_metadata.allowed_token_ids_mask is not None
+            or sampling_metadata.bad_words_token_ids
+            or (not sampling_metadata.no_penalties and not allow_presence_only_penalty)
+        ):
+            return reject("unsupported sampling feature is active")
+        active_logitsprocs = []
+        for logitproc in sampling_metadata.logitsprocs.all:
+            biases = getattr(logitproc, "biases", None)
+            if biases is not None:
+                if biases:
+                    active_logitsprocs.append(type(logitproc).__name__)
+                continue
+            min_toks = getattr(logitproc, "min_toks", None)
+            if min_toks is not None:
+                if min_toks:
+                    active_logitsprocs.append(type(logitproc).__name__)
+                continue
+            min_p_count = getattr(logitproc, "min_p_count", None)
+            if min_p_count is not None:
+                if min_p_count:
+                    active_logitsprocs.append(type(logitproc).__name__)
+                continue
+            active_logitsprocs.append(type(logitproc).__name__)
+        if active_logitsprocs:
+            return reject(f"logits processors are active: {active_logitsprocs}")
+        holder = getattr(sampling_metadata, "thinking_budget_state_holder", None)
+        if holder is not None and holder.has_tracked_requests():
+            return reject("thinking budget state is active")
+        if (
+            sampling_metadata.top_k is None
+            or sampling_metadata.top_k_max is None
+            or sampling_metadata.top_k_max > 64
+        ):
+            return reject("top-k/top-p are missing or too large")
+
+        num_reqs = self.input_batch.num_reqs
+        if num_reqs == 0:
+            return reject("empty batch")
+
+        top_k_cpu = self.input_batch.top_k_cpu[:num_reqs]
+        top_p_cpu = self.input_batch.top_p_cpu[:num_reqs]
+        temperature_cpu = self.input_batch.temperature_cpu[:num_reqs]
+
+        top_k = int(top_k_cpu[0])
+        has_top_p = sampling_metadata.top_p is not None
+        top_p = float(top_p_cpu[0]) if has_top_p else 1.0
+        temperature = float(temperature_cpu[0])
+        if (
+            top_k <= 0
+            or top_k > 64
+            or top_p <= 0.0
+            or top_p > 1.0
+            or temperature <= 1e-5
+        ):
+            return reject(
+                "unsupported top-k/top-p/temperature values: "
+                f"top_k={top_k}, top_p={top_p}, temperature={temperature}"
+            )
+        if not np.all(top_k_cpu == top_k):
+            return reject("top_k is not uniform")
+        if has_top_p and not np.all(top_p_cpu == top_p):
+            return reject("top_p is not uniform")
+        if not np.all(temperature_cpu == temperature):
+            return reject("temperature is not uniform")
+
+        return top_k, top_p, temperature
+
+    def _get_spec_decode_topk_sampling_params(
+        self,
+        scheduler_output: "SchedulerOutput",
+        spec_decode_metadata: SpecDecodeMetadata | None,
+    ) -> tuple[int, float, float] | None:
+        """Return uniform top-k params for compact speculative sampling."""
+
+        def reject(reason: str) -> tuple[int, float, float] | None:
+            return None
+
+        if self.broadcast_pp_output or spec_decode_metadata is None:
+            return reject("not a local speculative decode path")
+        if scheduler_output.has_structured_output_requests:
+            return reject("structured output is active")
+        if not hasattr(self.model, "get_topk_candidates"):
+            return reject(f"model wrapper lacks method: {type(self.model).__name__}")
+        if self.rejection_sampler is None:
+            return reject("rejection sampler is unavailable")
+        if getattr(self.rejection_sampler, "synthetic_mode", False):
+            return reject("synthetic rejection sampling is active")
+        if self.sampler.logprobs_mode in ("processed_logits", "processed_logprobs"):
+            return reject(f"unsupported logprobs mode {self.sampler.logprobs_mode}")
+
+        sampling_metadata = self.input_batch.sampling_metadata
+        if not sampling_metadata.all_random:
+            return reject(
+                "not all requests are random: "
+                f"all_greedy={sampling_metadata.all_greedy}, "
+                f"all_random={sampling_metadata.all_random}"
+            )
+        if sampling_metadata.generators:
+            return reject("per-request generators are active")
+        if self.sampler.use_fp64_gumbel:
+            return reject("fp64 gumbel sampling is active")
+        allow_presence_only_penalty = (
+            sampling_metadata.presence_penalties_only
+            and sampling_metadata.token_ids_cpu is not None
+            and sampling_metadata.num_prompt_tokens_cpu is not None
+            and sampling_metadata.num_tokens_no_spec_cpu is not None
+            and sampling_metadata.spec_token_ids is not None
+        )
+        if (
+            sampling_metadata.max_num_logprobs is not None
+            or sampling_metadata.logprob_token_ids
+            or sampling_metadata.allowed_token_ids_mask is not None
+            or sampling_metadata.bad_words_token_ids
+            or (not sampling_metadata.no_penalties and not allow_presence_only_penalty)
+        ):
+            return reject("unsupported sampling feature is active")
+        active_logitsprocs = []
+        for logitproc in sampling_metadata.logitsprocs.all:
+            biases = getattr(logitproc, "biases", None)
+            if biases is not None:
+                if biases:
+                    active_logitsprocs.append(type(logitproc).__name__)
+                continue
+            min_toks = getattr(logitproc, "min_toks", None)
+            if min_toks is not None:
+                if min_toks:
+                    active_logitsprocs.append(type(logitproc).__name__)
+                continue
+            min_p_count = getattr(logitproc, "min_p_count", None)
+            if min_p_count is not None:
+                if min_p_count:
+                    active_logitsprocs.append(type(logitproc).__name__)
+                continue
+            active_logitsprocs.append(type(logitproc).__name__)
+        if active_logitsprocs:
+            return reject(f"logits processors are active: {active_logitsprocs}")
+        holder = getattr(sampling_metadata, "thinking_budget_state_holder", None)
+        if holder is not None and holder.has_tracked_requests():
+            return reject("thinking budget state is active")
+        if (
+            sampling_metadata.top_k is None
+            or sampling_metadata.top_k_max is None
+            or sampling_metadata.top_k_max > 64
+        ):
+            return reject("top-k/top-p are missing or too large")
+
+        num_reqs = self.input_batch.num_reqs
+        if num_reqs == 0:
+            return reject("empty batch")
+
+        top_k_cpu = self.input_batch.top_k_cpu[:num_reqs]
+        top_p_cpu = self.input_batch.top_p_cpu[:num_reqs]
+        temperature_cpu = self.input_batch.temperature_cpu[:num_reqs]
+
+        top_k = int(top_k_cpu[0])
+        has_top_p = sampling_metadata.top_p is not None
+        top_p = float(top_p_cpu[0]) if has_top_p else 1.0
+        temperature = float(temperature_cpu[0])
+        if (
+            top_k <= 0
+            or top_k > 64
+            or top_p <= 0.0
+            or top_p > 1.0
+            or temperature <= 1e-5
+        ):
+            return reject(
+                "unsupported top-k/top-p/temperature values: "
+                f"top_k={top_k}, top_p={top_p}, temperature={temperature}"
+            )
+        if not np.all(top_k_cpu == top_k):
+            return reject("top_k is not uniform")
+        if has_top_p and not np.all(top_p_cpu == top_p):
+            return reject("top_p is not uniform")
+        if not np.all(temperature_cpu == temperature):
+            return reject("temperature is not uniform")
+
+        return top_k, top_p, temperature
+
+    def _make_spec_decode_presence_topk_inputs(
+        self,
+        sampling_metadata,
+        metadata: SpecDecodeMetadata,
+        num_rows: int,
+        vocab_size: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        target_output_tokens = RejectionSampler._make_presence_output_token_ids_tensor(
+            sampling_metadata,
+            metadata,
+            vocab_size,
+            device,
+        )
+        bonus_output_tokens = self.sampler._make_presence_output_token_ids_tensor(
+            sampling_metadata,
+            self.input_batch.num_reqs,
+            vocab_size,
+            device,
+            include_spec_tokens=True,
+        )
+        if target_output_tokens is None or bonus_output_tokens is None:
+            return None
+
+        max_output_len = max(
+            target_output_tokens.shape[1], bonus_output_tokens.shape[1]
+        )
+        output_token_ids = torch.full(
+            (num_rows, max_output_len),
+            vocab_size,
+            dtype=torch.int64,
+            device=device,
+        )
+        target_indices = metadata.target_logits_indices.to(torch.int64)
+        bonus_indices = metadata.bonus_logits_indices.to(torch.int64)
+        output_token_ids[target_indices, : target_output_tokens.shape[1]] = (
+            target_output_tokens
+        )
+        output_token_ids[bonus_indices, : bonus_output_tokens.shape[1]] = (
+            bonus_output_tokens
+        )
+
+        num_requests = len(metadata.num_draft_tokens)
+        num_draft_tokens = torch.tensor(metadata.num_draft_tokens, device="cpu")
+        original_indices = torch.arange(num_requests, device="cpu")
+        repeat_indices_cpu = original_indices.repeat_interleave(num_draft_tokens)
+        repeat_indices = repeat_indices_cpu.to(device=device, non_blocking=True)
+
+        presence_penalties = torch.empty(
+            (num_rows,),
+            dtype=sampling_metadata.presence_penalties.dtype,
+            device=device,
+        )
+        presence_penalties[target_indices] = sampling_metadata.presence_penalties[
+            repeat_indices
+        ]
+        presence_penalties[bonus_indices] = sampling_metadata.presence_penalties[
+            :num_requests
+        ]
+        return presence_penalties, output_token_ids
+
+    def _update_async_spec_token_ids_for_sampling(
+        self, sampling_metadata: SamplingMetadata
+    ) -> None:
+        # Async scheduling keeps draft tokens on GPU until sampling needs
+        # output-token history for penalties or bad words. Compact pre-sampling
+        # builds that history before _sample(), so it must refresh here too.
+        if not self.use_async_scheduling:
+            return
+        holder = sampling_metadata.thinking_budget_state_holder
+        needs_thinking_tokens = holder is not None and holder.has_tracked_requests()
+        if (
+            sampling_metadata.no_penalties
+            and not sampling_metadata.bad_words_token_ids
+            and not needs_thinking_tokens
+        ):
+            return
+        if self._draft_token_req_ids is None:
+            return
+        draft_token_ids_cpu, _ = self._get_draft_token_ids_cpu()
+        self.input_batch.update_async_spec_token_ids(draft_token_ids_cpu)
+
     def _sample(
         self,
         logits: torch.Tensor | None,
         spec_decode_metadata: SpecDecodeMetadata | None,
+        pre_sampled_output: SamplerOutput | None = None,
     ) -> SamplerOutput:
         # Sample the next token and get logprobs if needed.
         sampling_metadata = self.input_batch.sampling_metadata
         # Update output token ids with tokens sampled in last step
         # if async scheduling and required by current sampling params.
         self.input_batch.update_async_output_token_ids()
+        if pre_sampled_output is not None:
+            return pre_sampled_output
         if spec_decode_metadata is None:
             return self.sampler(
                 logits=logits,
                 sampling_metadata=sampling_metadata,
             )
 
-        # Update spec_token_ids with real draft tokens from pre step only when
-        # output_token_ids is needed (penalties or bad_words are in use).
-        if self.use_async_scheduling and self._draft_token_req_ids is not None:
-            draft_token_ids_cpu, _ = self._get_draft_token_ids_cpu()
-            self.input_batch.update_async_spec_token_ids(draft_token_ids_cpu)
+        self._update_async_spec_token_ids_for_sampling(sampling_metadata)
 
         draft_probs = self._get_spec_decode_draft_probs(spec_decode_metadata)
         sampler_output = self.rejection_sampler(
@@ -4556,12 +5050,148 @@ class GPUModelRunner(
                         kv_connector_output,
                     )
 
+                pre_sampled_output = None
                 sample_hidden_states = hidden_states[logits_indices]
-                logits = self.model.compute_logits(sample_hidden_states)
+                sampling_metadata = self.input_batch.sampling_metadata
+                make_presence_output_tokens = (
+                    self.sampler._make_presence_output_token_ids_tensor
+                )
+                spec_topk_params = self._get_spec_decode_topk_sampling_params(
+                    scheduler_output, spec_decode_metadata
+                )
+                if spec_topk_params is not None:
+                    top_k, top_p, temperature = spec_topk_params
+                    assert spec_decode_metadata is not None
+                    logger.info_once(
+                        "Using vocab-parallel compact top-k speculative "
+                        "sampling fast path.",
+                        scope="global",
+                    )
+                    sampling_metadata = self.input_batch.sampling_metadata
+                    presence_penalties = None
+                    presence_output_token_ids = None
+                    if not sampling_metadata.no_penalties:
+                        self._update_async_spec_token_ids_for_sampling(
+                            sampling_metadata
+                        )
+                        presence_inputs = self._make_spec_decode_presence_topk_inputs(
+                            sampling_metadata,
+                            spec_decode_metadata,
+                            sample_hidden_states.shape[0],
+                            self.input_batch.vocab_size,
+                            sample_hidden_states.device,
+                        )
+                        assert presence_inputs is not None
+                        presence_penalties, presence_output_token_ids = presence_inputs
+                    candidate_logits, candidate_ids = self.model.get_topk_candidates(
+                        sample_hidden_states,
+                        top_k=top_k,
+                        top_p=top_p,
+                        temperature=temperature,
+                        presence_penalties=presence_penalties,
+                        output_token_ids=presence_output_token_ids,
+                    )
+                    assert self.rejection_sampler is not None
+                    pre_sampled_output = (
+                        self.rejection_sampler.sample_from_topk_candidates(
+                            spec_decode_metadata,
+                            candidate_logits,
+                            candidate_ids,
+                            self.input_batch.sampling_metadata,
+                        )
+                    )
+                    logits = None
+                elif self._can_sample_global_argmax(
+                    scheduler_output, spec_decode_metadata
+                ):
+                    sampled = self.model.get_top_tokens(sample_hidden_states)
+                    pre_sampled_output = SamplerOutput(
+                        sampled_token_ids=sampled.to(torch.int32).unsqueeze(-1),
+                        logprobs_tensors=None,
+                    )
+                    logits = None
+                else:
+                    full_temperature = self._get_global_full_sampling_temperature(
+                        scheduler_output, spec_decode_metadata
+                    )
+                    if full_temperature is not None:
+                        logger.info_once(
+                            "Using vocab-parallel full-distribution sampling "
+                            "fast path.",
+                            scope="global",
+                        )
+                        sampled = self.model.sample_full_tokens(
+                            sample_hidden_states,
+                            temperature=full_temperature,
+                        )
+                        pre_sampled_output = SamplerOutput(
+                            sampled_token_ids=sampled.to(torch.int32).unsqueeze(-1),
+                            logprobs_tensors=None,
+                        )
+                        logits = None
+                    else:
+                        topk_params = self._get_global_topk_sampling_params(
+                            scheduler_output, spec_decode_metadata
+                        )
+                        if topk_params is not None:
+                            top_k, top_p, temperature = topk_params
+                            logger.info_once(
+                                "Using vocab-parallel compact top-k sampling "
+                                "fast path.",
+                                scope="global",
+                            )
+                            presence_penalties = None
+                            presence_output_token_ids = None
+                            can_use_topk_fast_path = True
+                            sampling_metadata = self.input_batch.sampling_metadata
+                            if sampling_metadata.presence_penalties_only:
+                                can_use_topk_fast_path = (
+                                    sample_hidden_states.shape[0]
+                                    == self.input_batch.num_reqs
+                                )
+                                if can_use_topk_fast_path:
+                                    presence_output_token_ids = (
+                                        make_presence_output_tokens(
+                                            sampling_metadata,
+                                            sample_hidden_states.shape[0],
+                                            self.input_batch.vocab_size,
+                                            sample_hidden_states.device,
+                                            include_spec_tokens=False,
+                                        )
+                                    )
+                                    can_use_topk_fast_path = (
+                                        presence_output_token_ids is not None
+                                    )
+                                if can_use_topk_fast_path:
+                                    presence_penalties = (
+                                        sampling_metadata.presence_penalties
+                                    )
+
+                            if can_use_topk_fast_path:
+                                sampled = self.model.sample_topk_tokens(
+                                    sample_hidden_states,
+                                    top_k=top_k,
+                                    top_p=top_p,
+                                    temperature=temperature,
+                                    presence_penalties=presence_penalties,
+                                    output_token_ids=presence_output_token_ids,
+                                )
+                                pre_sampled_output = SamplerOutput(
+                                    sampled_token_ids=sampled.to(torch.int32).unsqueeze(
+                                        -1
+                                    ),
+                                    logprobs_tensors=None,
+                                )
+                                logits = None
+                            else:
+                                logits = self.model.compute_logits(sample_hidden_states)
+                        else:
+                            logits = self.model.compute_logits(sample_hidden_states)
             else:
                 # Rare case.
                 assert not self.is_pooling_model
 
+                pre_sampled_output = None
                 sample_hidden_states = hidden_states[logits_indices]
                 if not get_pp_group().is_last_rank:
                     all_gather_tensors = {
@@ -4596,6 +5226,7 @@ class GPUModelRunner(
             hidden_states,
             sample_hidden_states,
             aux_hidden_states,
+            pre_sampled_output,
             ec_connector_output,
             cudagraph_stats,
             slot_mappings,
@@ -4647,6 +5278,7 @@ class GPUModelRunner(
             hidden_states,
             sample_hidden_states,
             aux_hidden_states,
+            pre_sampled_output,
             ec_connector_output,
             cudagraph_stats,
             slot_mappings,
@@ -4656,12 +5288,15 @@ class GPUModelRunner(
 
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
+            assert pre_sampled_output is None
             apply_grammar_bitmask(
                 scheduler_output, grammar_output, self.input_batch, logits
             )
 
         with record_function_or_nullcontext("gpu_model_runner: sample"):
-            sampler_output = self._sample(logits, spec_decode_metadata)
+            sampler_output = self._sample(
+                logits, spec_decode_metadata, pre_sampled_output
+            )
 
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
@@ -4680,11 +5315,29 @@ class GPUModelRunner(
         self._draft_probs = None
         self._draft_prob_req_ids = None
         self._draft_token_req_ids = None
+        self._draft_token_ids_cpu_valid = False
         self.valid_sampled_token_count_gpu = None
         self.input_batch.prev_sampled_token_ids = None
+        holder = self.input_batch.sampling_metadata.thinking_budget_state_holder
+        async_needs_thinking_tokens = (
+            holder is not None and holder.has_tracked_requests()
+        )
+        async_needs_draft_token_ids_cpu = bool(
+            self.use_async_scheduling
+            and (
+                scheduler_output.has_structured_output_requests
+                or bool(self.input_batch.sampling_metadata.output_token_ids)
+                or not self.input_batch.sampling_metadata.no_penalties
+                or bool(self.input_batch.sampling_metadata.bad_words_token_ids)
+                or async_needs_thinking_tokens
+            )
+        )
 
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
+            copy_draft_token_ids_to_cpu = (
+                not self.use_async_scheduling or async_needs_draft_token_ids_cpu
+            )
             with record_function_or_nullcontext("gpu_model_runner: draft"):
                 self._draft_token_ids = self.propose_draft_token_ids(
                     scheduler_output,
@@ -4697,7 +5350,10 @@ class GPUModelRunner(
                     spec_decode_common_attn_metadata,
                     slot_mappings,
                 )
-                self._copy_draft_token_ids_to_cpu(scheduler_output)
+                self._copy_draft_token_ids_to_cpu(
+                    scheduler_output,
+                    copy_to_cpu=copy_draft_token_ids_to_cpu,
+                )
 
         spec_config = self.speculative_config
         draft_after_bookkeeping = False
@@ -4786,7 +5442,14 @@ class GPUModelRunner(
                 ).expand(len(self.input_batch.req_ids), self.num_spec_tokens)
                 self._draft_probs = None
                 self._draft_prob_req_ids = None
-                self._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=True)
+                copy_draft_token_ids_to_cpu = (
+                    not self.use_async_scheduling or async_needs_draft_token_ids_cpu
+                )
+                self._copy_draft_token_ids_to_cpu(
+                    scheduler_output,
+                    zeros_only=True,
+                    copy_to_cpu=copy_draft_token_ids_to_cpu,
+                )
 
         with record_function_or_nullcontext("gpu_model_runner: bookkeep"):
             (
@@ -4964,23 +5627,25 @@ class GPUModelRunner(
         return DraftTokenIds(req_ids, draft_token_ids)
 
     def _copy_draft_token_ids_to_cpu(
-        self, scheduler_output: "SchedulerOutput", zeros_only: bool = False
+        self,
+        scheduler_output: "SchedulerOutput",
+        zeros_only: bool = False,
+        *,
+        copy_to_cpu: bool = True,
     ) -> None:
         if torch.is_tensor(self._draft_token_ids):
             assert isinstance(self._draft_token_ids, torch.Tensor)
             self.prev_num_spec_tokens = self._draft_token_ids.shape[1]
-        # Check if we need to copy draft tokens to CPU. In async scheduling,
-        # we only copy when needed for structured output, penalties or bad_words.
-        if self.use_async_scheduling and not (
-            scheduler_output.has_structured_output_requests
-            or self.input_batch.sampling_metadata.output_token_ids
-        ):
-            return
+        # The caller has already decided whether async sampling needs a CPU
+        # copy (structured output, token-history processors, or penalties).
         # We must also set the corresponding request ids.
         self._draft_token_req_ids = self.input_batch.req_ids.copy()
+        self._draft_token_ids_cpu_valid = False
 
         draft_token_ids: torch.Tensor = self._draft_token_ids
         if not torch.is_tensor(draft_token_ids):
+            return
+        if not copy_to_cpu:
             return
         assert self.draft_token_ids_event is not None
         assert self.draft_token_ids_copy_stream is not None
@@ -4999,6 +5664,7 @@ class GPUModelRunner(
                 # No copy needed, just zero-out cpu tensor.
                 self.draft_token_ids_cpu[:num_reqs, :num_spec_tokens] = 0
             self.draft_token_ids_event.record()
+        self._draft_token_ids_cpu_valid = True
 
     def _get_draft_token_ids_cpu(self) -> tuple[list[list[int]], list[str]]:
         if isinstance(self._draft_token_ids, list):
@@ -5008,9 +5674,17 @@ class GPUModelRunner(
             return [], []
         assert self.draft_token_ids_event is not None
         assert self.draft_token_ids_cpu is not None
-        self.draft_token_ids_event.synchronize()
         assert isinstance(self._draft_token_ids, torch.Tensor)
         num_spec_tokens = self._draft_token_ids.shape[1]
+        if self._draft_token_ids_cpu_valid:
+            self.draft_token_ids_event.synchronize()
+        else:
+            # Sampling needs token history that was not active when the draft
+            # was proposed. Materialize the retained GPU draft on demand.
+            self.draft_token_ids_cpu[: len(req_ids), :num_spec_tokens].copy_(
+                self._draft_token_ids, non_blocking=False
+            )
+            self._draft_token_ids_cpu_valid = True
         return self.draft_token_ids_cpu[
             : len(req_ids), :num_spec_tokens
         ].tolist(), req_ids
@@ -5846,7 +6520,7 @@ class GPUModelRunner(
             logger.debug_once("Randomizing dummy input_ids for DP Rank")
             input_ids.copy_(rand_input_ids()[: input_ids.size(0)], non_blocking=True)
             yield
-            input_ids.fill_(0)
+            input_ids.zero_()
         else:
 
             @functools.cache
@@ -5861,7 +6535,7 @@ class GPUModelRunner(
                 rand_inputs_embeds()[: inputs_embeds.size(0)], non_blocking=True
             )
             yield
-            inputs_embeds.fill_(0)
+            inputs_embeds.zero_()
 
     def _get_mm_dummy_batch(
         self,
@@ -6101,7 +6775,8 @@ class GPUModelRunner(
                 else:
                     seq_lens = max_query_len  # type: ignore[assignment]
                 self.optimistic_seq_lens_cpu[:num_reqs] = seq_lens
-                self.optimistic_seq_lens_cpu[num_reqs:].fill_(0)
+                if num_reqs < self.optimistic_seq_lens_cpu.shape[0]:
+                    self.optimistic_seq_lens_cpu[num_reqs:].zero_()
                 self.seq_lens.copy_(self.optimistic_seq_lens_cpu, non_blocking=True)
 
                 cum_num_tokens = self._get_cumsum_and_arange(
