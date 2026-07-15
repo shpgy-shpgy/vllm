@@ -841,6 +841,9 @@ class InputBatch:
             copy_slice(self.top_p_cpu_tensor, self.top_p, num_reqs)
         if not self.no_top_k:
             copy_slice(self.top_k_cpu_tensor, self.top_k, num_reqs)
+            top_k_max = int(self.top_k_cpu[:num_reqs].max()) if num_reqs else None
+        else:
+            top_k_max = None
 
         if not self.no_penalties:
             # Since syncing these tensors is expensive only copy them
@@ -859,9 +862,8 @@ class InputBatch:
             )
 
         needs_prompt_token_ids = (
-            not self.no_penalties
-            or self.logits_processing_needs_token_ids[:num_reqs].any()
-        )
+            not self.no_penalties and not self.presence_penalties_only
+        ) or self.logits_processing_needs_token_ids[:num_reqs].any()
         # The prompt tokens are used only for applying penalties or
         # step pooling during the sampling/pooling process.
         # Hence copy these tensors only when there are requests which
@@ -932,6 +934,16 @@ class InputBatch:
             bad_words_token_ids=self.bad_words_token_ids,
             logitsprocs=self.logitsprocs,
             thinking_budget_state_holder=self.thinking_budget_state_holder,
+            top_k_max=top_k_max,
+            presence_penalties_only=self.presence_penalties_only,
+            token_ids_cpu=self.token_ids_cpu if self.presence_penalties_only else None,
+            num_prompt_tokens_cpu=(
+                self.num_prompt_tokens if self.presence_penalties_only else None
+            ),
+            num_tokens_no_spec_cpu=(
+                self.num_tokens_no_spec if self.presence_penalties_only else None
+            ),
+            pin_memory=PIN_MEMORY,
         )
 
     def get_pooling_params(self) -> list[PoolingParams]:
@@ -1063,6 +1075,14 @@ class InputBatch:
             req_output_token_ids[first_placeholder:] = new_ids
             # ^ Implicitly resizes to (first_placeholder + num_to_replace)
 
+            token_start = self.num_prompt_tokens[index] + first_placeholder
+            token_end = token_start + num_to_replace
+            if num_to_replace > 0:
+                self.token_ids_cpu[index, token_start:token_end] = new_ids
+            self.num_tokens_no_spec[index] = self.num_prompt_tokens[index] + len(
+                req_output_token_ids
+            )
+
     def update_async_spec_token_ids(self, draft_token_ids: list[list[int]]) -> None:
         """
         In async scheduling case, update spec_token_ids in sampling metadata with
@@ -1116,6 +1136,14 @@ class InputBatch:
         return (
             self.thinking_budget_state_holder is None
             or len(self.thinking_token_budget_reqs) == 0
+        )
+
+    @property
+    def presence_penalties_only(self) -> bool:
+        return (
+            len(self.presence_penalties_reqs) > 0
+            and len(self.frequency_penalties_reqs) == 0
+            and len(self.repetition_penalties_reqs) == 0
         )
 
     @property

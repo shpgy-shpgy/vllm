@@ -13,7 +13,10 @@ from vllm.platforms import CpuArchEnum, current_platform
 from vllm.triton_utils import HAS_TRITON
 
 if HAS_TRITON:
-    from vllm.v1.sample.ops.topk_topp_triton import apply_top_k_top_p_triton
+    from vllm.v1.sample.ops.topk_topp_triton import (
+        apply_top_k_top_p_and_sample_small_topk_parallel_triton,
+        apply_top_k_top_p_triton,
+    )
 
 logger = init_logger(__name__)
 
@@ -83,6 +86,7 @@ class TopKTopPSampler(nn.Module):
         super().__init__()
         self.logprobs_mode = logprobs_mode
         self.use_fp64_gumbel = use_fp64_gumbel
+        self._triton_sample_seeds: torch.Tensor | None = None
         if current_platform.is_cuda():
             # FlashInfer doesn't expose post-top-k/top-p logits/logprobs,
             # so it can't be used when the configured mode requires them.
@@ -126,18 +130,43 @@ class TopKTopPSampler(nn.Module):
         generators: dict[int, torch.Generator],
         k: torch.Tensor | None,
         p: torch.Tensor | None,
+        top_k_max: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """
         PyTorch-native implementation of top-k and top-p sampling.
 
         The logits tensor may be updated in-place.
         """
-        logits = apply_top_k_top_p(logits, k, p)
         logits_to_return = None
         if self.logprobs_mode == "processed_logits":
+            logits = apply_top_k_top_p(logits, k, p)
             logits_to_return = logits
         elif self.logprobs_mode == "processed_logprobs":
+            logits = apply_top_k_top_p(logits, k, p)
             logits_to_return = logits.log_softmax(dim=-1, dtype=torch.float32)
+
+        if (
+            logits_to_return is None
+            and HAS_TRITON
+            and current_platform.is_cuda()
+            and logits.shape[0] >= 8
+            and k is not None
+            and top_k_max is not None
+            and top_k_max <= 64
+            and not generators
+            and not self.use_fp64_gumbel
+        ):
+            logger.info_once(
+                "Using parallel fused Triton top-k/top-p compact sampling fast path.",
+                scope="global",
+            )
+            seeds = self._get_triton_sample_seeds(logits.shape[0], logits.device)
+            return apply_top_k_top_p_and_sample_small_topk_parallel_triton(
+                logits, k, p, seeds, top_k_max
+            ), None
+
+        if logits_to_return is None:
+            logits = apply_top_k_top_p(logits, k, p)
         probs = logits.softmax(dim=-1, dtype=torch.float32)
         return (
             random_sample(probs, generators, self.use_fp64_gumbel),
@@ -150,6 +179,7 @@ class TopKTopPSampler(nn.Module):
         generators: dict[int, torch.Generator],
         k: torch.Tensor | None,
         p: torch.Tensor | None,
+        top_k_max: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """More optimized implementation for top-k and top-p sampling."""
         # Fall back to the PyTorch-native path when FlashInfer has nothing
@@ -179,6 +209,7 @@ class TopKTopPSampler(nn.Module):
         generators: dict[int, torch.Generator],
         k: torch.Tensor | None,
         p: torch.Tensor | None,
+        top_k_max: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """
         PyTorch-native implementation of top-k and top-p sampling for CPU.
@@ -225,6 +256,7 @@ class TopKTopPSampler(nn.Module):
         generators: dict[int, torch.Generator],
         k: torch.Tensor | None,
         p: torch.Tensor | None,
+        top_k_max: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Optimized ROCm/aiter path (same structure as forward_cuda)."""
         if (k is None and p is None) or generators:
@@ -288,6 +320,7 @@ class TopKTopPSampler(nn.Module):
         generators: dict[int, torch.Generator],
         k: torch.Tensor | None,
         p: torch.Tensor | None,
+        top_k_max: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if generators:
             logger.warning_once(
@@ -295,7 +328,7 @@ class TopKTopPSampler(nn.Module):
                 "per-request generators. Falling back to "
                 "PyTorch-native implementation."
             )
-            return self.forward_native(logits, generators, k, p)
+            return self.forward_native(logits, generators, k, p, top_k_max)
         random_sampled = torch.empty(
             logits.shape[0], dtype=torch.int64, device=logits.device
         )
@@ -330,6 +363,17 @@ class TopKTopPSampler(nn.Module):
         state.view(torch.int64)[1] = offset
         generator.set_state(state)
         return random_sampled, logits_to_return
+
+    def _get_triton_sample_seeds(
+        self, batch_size: int, device: torch.device
+    ) -> torch.Tensor:
+        seeds = self._triton_sample_seeds
+        if seeds is None or seeds.device != device or seeds.shape[0] < batch_size:
+            seeds = torch.empty((batch_size,), dtype=torch.int64, device=device)
+            self._triton_sample_seeds = seeds
+        seeds = seeds[:batch_size]
+        seeds.random_()
+        return seeds
 
 
 # Note: this is a workaround for

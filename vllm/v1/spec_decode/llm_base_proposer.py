@@ -159,8 +159,8 @@ class SpecDecodeBaseProposer:
 
         # Cudagraph dispatcher for PIECEWISE-only dispatching in eagle.
         # Keys are initialized later via initialize_cudagraph_keys() called from
-        # gpu_model_runner._check_and_update_cudagraph_mode after
-        # adjust_cudagraph_sizes_for_spec_decode is called.
+        # gpu_model_runner._check_and_update_cudagraph_mode after the target
+        # model's cudagraph mode has been resolved.
         self.cudagraph_dispatcher = CudagraphDispatcher(self.vllm_config)
 
         # persistent buffers for cuda graph
@@ -412,7 +412,7 @@ class SpecDecodeBaseProposer:
         """Initialize cudagraph dispatcher keys for the drafter.
 
         Only supports PIECEWISE cudagraphs (via mixed_mode).
-        This should be called after adjust_cudagraph_sizes_for_spec_decode.
+        This should be called after the target cudagraph mode is resolved.
         """
         if (
             not self.speculative_config.enforce_eager

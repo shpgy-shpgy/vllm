@@ -139,9 +139,14 @@ class CudaGraphManager:
         self.pool = current_platform.get_global_graph_pool() if cudagraph_mode else None
 
         self._graphs_captured = False
-
-        self._candidates: dict[tuple[int, int], list[BatchExecutionDescriptor]] = {}
+        self._decode_candidates: dict[
+            tuple[int, int], list[BatchExecutionDescriptor]
+        ] = {}
+        self._mixed_candidates: dict[
+            tuple[int, int], list[BatchExecutionDescriptor]
+        ] = {}
         self._capture_descs: dict[CUDAGraphMode, list[BatchExecutionDescriptor]] = {}
+        self.decode_query_lens = {decode_query_len}
 
         self._init_candidates()
 
@@ -178,6 +183,25 @@ class CudaGraphManager:
         # Counts above the largest captured case clamp to it.
         return self._lora_dispatch_map.get(num_active_loras, self._max_lora_case)
 
+    def _build_candidates(
+        self,
+        descs_by_token_lora: dict[tuple[int, int], list[BatchExecutionDescriptor]],
+    ) -> dict[tuple[int, int], list[BatchExecutionDescriptor]]:
+        candidates: dict[tuple[int, int], list[BatchExecutionDescriptor]] = {}
+        for num_active_loras in self.lora_capture_cases:
+            token_counts = sorted(
+                num_tokens
+                for num_tokens, lora_count in descs_by_token_lora
+                if lora_count == num_active_loras
+            )
+            current_range_start = 0
+            for token_cg_size in token_counts:
+                descs = descs_by_token_lora[(token_cg_size, num_active_loras)]
+                for num_tokens in range(current_range_start, token_cg_size + 1):
+                    candidates[(num_tokens, num_active_loras)] = descs
+                current_range_start = token_cg_size + 1
+        return candidates
+
     def _init_candidates(self) -> None:
         """Build priority-ordered candidate lists for each token count."""
         capture_sizes = self.compilation_config.cudagraph_capture_sizes
@@ -185,15 +209,18 @@ class CudaGraphManager:
             return
 
         capture_sizes = sorted(capture_sizes)
-        max_decode_tokens = self.max_num_reqs * self.decode_query_len
         decode_mode = self.cudagraph_mode.decode_mode()
         mixed_mode = self.cudagraph_mode.mixed_mode()
         separate_decode_routine = self.cudagraph_mode.separate_routine()
         max_cg_capture_size = self.compilation_config.max_cudagraph_capture_size
+        assert max_cg_capture_size is not None
 
-        descs_by_token_lora: dict[tuple[int, int], list[BatchExecutionDescriptor]] = (
-            defaultdict(list)
-        )
+        decode_descs_by_token_lora: defaultdict[
+            tuple[int, int], list[BatchExecutionDescriptor]
+        ] = defaultdict(list)
+        mixed_descs_by_token_lora: defaultdict[
+            tuple[int, int], list[BatchExecutionDescriptor]
+        ] = defaultdict(list)
         descs_by_mode: defaultdict[CUDAGraphMode, list[BatchExecutionDescriptor]] = (
             defaultdict(list)
         )
@@ -223,14 +250,25 @@ class CudaGraphManager:
             ]
         else:
             decode_query_lens = [self.decode_query_len]
+        self.decode_query_lens = set(decode_query_lens)
 
-        for num_tokens, num_active_loras in product(
-            capture_sizes, self.lora_capture_cases
-        ):
-            # Capture uniform decode specfifc graphs if required
-            #  (i.e. separate decode routine)
-            if separate_decode_routine and decode_mode:
-                for decode_query_len in decode_query_lens:
+        # Decode graphs use sizes rounded for their uniform query length (and
+        # tensor-parallel size when sequence parallelism is enabled). Mixed or
+        # prefill graphs retain the user-configured capture sizes unchanged.
+        if separate_decode_routine and decode_mode:
+            for decode_query_len in decode_query_lens:
+                decode_capture_sizes = capture_sizes
+                if decode_mode == CUDAGraphMode.FULL:
+                    decode_capture_sizes = (
+                        self.compilation_config.get_cudagraph_capture_sizes_for_decode(
+                            decode_query_len,
+                            self.tp_size,
+                        )
+                    )
+                max_decode_tokens = self.max_num_reqs * decode_query_len
+                for num_tokens, num_active_loras in product(
+                    decode_capture_sizes, self.lora_capture_cases
+                ):
                     rounded_num_tokens = round_up(num_tokens, decode_query_len)
                     rounded_num_reqs = rounded_num_tokens // decode_query_len
 
@@ -252,10 +290,13 @@ class CudaGraphManager:
                     # avoid duplicate graphs
                     if desc not in descs_by_mode[decode_mode]:
                         descs_by_mode[decode_mode].append(desc)
-                        descs_by_token_lora[
+                        decode_descs_by_token_lora[
                             (rounded_num_tokens, num_active_loras)
                         ].append(desc)
 
+        for num_tokens, num_active_loras in product(
+            capture_sizes, self.lora_capture_cases
+        ):
             if mixed_mode:
                 # for PIECEWISE graphs there is no limit on requests when replaying
                 # i.e. no request padding is needed
@@ -272,26 +313,14 @@ class CudaGraphManager:
                     num_active_loras=num_active_loras,
                 )
                 descs_by_mode[mixed_mode].append(desc)
-                descs_by_token_lora[(num_tokens, num_active_loras)].append(desc)
-
-        if not descs_by_token_lora:
-            return
-
-        all_token_counts = sorted({k[0] for k in descs_by_token_lora})
-        current_range_start = 0
-        for token_cg_size in all_token_counts:
-            for i in range(current_range_start, token_cg_size + 1):
-                for num_active_loras in self.lora_capture_cases:
-                    staging_key = (token_cg_size, num_active_loras)
-                    if staging_key in descs_by_token_lora:
-                        self._candidates[(i, num_active_loras)] = descs_by_token_lora[
-                            staging_key
-                        ]
-            current_range_start = token_cg_size + 1
+                mixed_descs_by_token_lora[(num_tokens, num_active_loras)].append(desc)
 
         for mode, descs in descs_by_mode.items():
             descs.sort(key=lambda d: d.num_tokens, reverse=True)
             self._capture_descs[mode] = descs
+
+        self._decode_candidates = self._build_candidates(decode_descs_by_token_lora)
+        self._mixed_candidates = self._build_candidates(mixed_descs_by_token_lora)
 
     def needs_capture(self) -> bool:
         return len(self._capture_descs) > 0
@@ -379,16 +408,22 @@ class CudaGraphManager:
 
         effective_loras = self._resolve_effective_loras(num_active_loras)
         key = (num_tokens, effective_loras)
-        if self._graphs_captured and num_tokens > 0 and key in self._candidates:
-            for desc in self._candidates[key]:
-                if _is_compatible(
-                    desc,
-                    num_reqs,
-                    num_tokens,
-                    uniform_token_count,
-                    effective_loras,
-                ):
-                    return desc
+        if self._graphs_captured and num_tokens > 0:
+            candidate_maps = []
+            if uniform_token_count in self.decode_query_lens:
+                candidate_maps.append(self._decode_candidates)
+            candidate_maps.append(self._mixed_candidates)
+
+            for candidates in candidate_maps:
+                for desc in candidates.get(key, ()):
+                    if _is_compatible(
+                        desc,
+                        num_reqs,
+                        num_tokens,
+                        uniform_token_count,
+                        effective_loras,
+                    ):
+                        return desc
         return BatchExecutionDescriptor(
             cg_mode=CUDAGraphMode.NONE,
             num_tokens=num_tokens,

@@ -212,6 +212,7 @@ class OpenAIServingCompletion(GenerateBaseServing):
                     trace_headers=trace_headers,
                     priority=request.priority,
                     data_parallel_rank=data_parallel_rank,
+                    headers=raw_request.headers if raw_request else None,
                 )
 
             generators.append(generator)

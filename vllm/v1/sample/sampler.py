@@ -288,6 +288,7 @@ class Sampler(nn.Module):
             sampling_metadata.generators,
             sampling_metadata.top_k,
             sampling_metadata.top_p,
+            sampling_metadata.top_k_max,
         )
 
         if greedy_sampled is None:
@@ -375,15 +376,26 @@ class Sampler(nn.Module):
         predict_bonus_token: bool,
     ) -> torch.Tensor:
         bad_words_token_ids = sampling_metadata.bad_words_token_ids
-        any_penalties_or_bad_words = (
-            bool(bad_words_token_ids) or not sampling_metadata.no_penalties
+        has_bad_words = bool(bad_words_token_ids)
+        has_penalties = not sampling_metadata.no_penalties
+        any_penalties_or_bad_words = has_bad_words or has_penalties
+        can_use_presence_output_tokens = (
+            has_penalties
+            and sampling_metadata.presence_penalties_only
+            and sampling_metadata.token_ids_cpu is not None
+            and sampling_metadata.num_prompt_tokens_cpu is not None
+            and sampling_metadata.num_tokens_no_spec_cpu is not None
         )
         holder = sampling_metadata.thinking_budget_state_holder
         needs_thinking_combine = holder is not None and holder.has_tracked_requests()
 
         output_token_ids = sampling_metadata.output_token_ids
         if predict_bonus_token and (
-            any_penalties_or_bad_words or needs_thinking_combine
+            needs_thinking_combine
+            or (
+                any_penalties_or_bad_words
+                and not (can_use_presence_output_tokens and not has_bad_words)
+            )
         ):
             # Combine base outputs with spec tokens when speculative decoding
             # is enabled.
@@ -405,8 +417,22 @@ class Sampler(nn.Module):
             logits = processor.apply(logits)
 
         # Apply penalties (e.g., freq_penalties).
-        logits = self.apply_penalties(logits, sampling_metadata, output_token_ids)
-        if holder is not None and holder.has_tracked_requests():
+        penalty_output_token_ids: list[list[int]] | torch.Tensor = output_token_ids
+        if sampling_metadata.presence_penalties_only:
+            fast_output_tokens = self._make_presence_output_token_ids_tensor(
+                sampling_metadata,
+                logits.shape[0],
+                logits.shape[-1],
+                logits.device,
+                include_spec_tokens=predict_bonus_token,
+            )
+            if fast_output_tokens is not None:
+                penalty_output_token_ids = fast_output_tokens
+        logits = self.apply_penalties(
+            logits, sampling_metadata, penalty_output_token_ids
+        )
+        if needs_thinking_combine:
+            assert holder is not None
             holder.update_state(
                 output_token_ids,
                 sampling_metadata.spec_token_ids,
@@ -420,15 +446,68 @@ class Sampler(nn.Module):
         return logits
 
     @staticmethod
+    def _make_presence_output_token_ids_tensor(
+        sampling_metadata: SamplingMetadata,
+        num_rows: int,
+        vocab_size: int,
+        device: torch.device,
+        include_spec_tokens: bool,
+    ) -> torch.Tensor | None:
+        token_ids_cpu = sampling_metadata.token_ids_cpu
+        prompt_lens = sampling_metadata.num_prompt_tokens_cpu
+        token_lens = sampling_metadata.num_tokens_no_spec_cpu
+        if token_ids_cpu is None or prompt_lens is None or token_lens is None:
+            return None
+
+        if num_rows == 0:
+            return torch.empty((0, 0), dtype=torch.int64, device=device)
+
+        max_base_len = max(
+            int(token_lens[req_idx]) - int(prompt_lens[req_idx])
+            for req_idx in range(num_rows)
+        )
+        spec_token_ids = sampling_metadata.spec_token_ids
+        max_extra_len = 0
+        if include_spec_tokens and spec_token_ids is not None:
+            max_extra_len = max(
+                len(spec_token_ids[req_idx]) for req_idx in range(num_rows)
+            )
+        max_output_len = max_base_len + max_extra_len
+        output_tokens_cpu = torch.empty(
+            (num_rows, max_output_len),
+            device="cpu",
+            dtype=torch.int64,
+            pin_memory=sampling_metadata.pin_memory,
+        )
+        output_tokens_np = output_tokens_cpu.numpy()
+        output_tokens_np.fill(vocab_size)
+
+        for req_idx in range(num_rows):
+            start = int(prompt_lens[req_idx])
+            end = int(token_lens[req_idx])
+            base_len = end - start
+            output_tokens_np[req_idx, :base_len] = token_ids_cpu[req_idx, start:end]
+            if include_spec_tokens and spec_token_ids is not None:
+                req_spec_token_ids = spec_token_ids[req_idx]
+                spec_len = len(req_spec_token_ids)
+                if spec_len:
+                    output_tokens_np[req_idx, base_len : base_len + spec_len] = (
+                        req_spec_token_ids
+                    )
+
+        return output_tokens_cpu.to(device=device, non_blocking=True)
+
+    @staticmethod
     def apply_penalties(
         logits: torch.Tensor,
         sampling_metadata: SamplingMetadata,
-        output_token_ids: list[list[int]],
+        output_token_ids: list[list[int]] | torch.Tensor,
     ) -> torch.Tensor:
         if sampling_metadata.no_penalties:
             return logits
 
-        assert sampling_metadata.prompt_token_ids is not None
+        if not sampling_metadata.presence_penalties_only:
+            assert sampling_metadata.prompt_token_ids is not None
         return apply_all_penalties(
             logits,
             sampling_metadata.prompt_token_ids,
@@ -436,4 +515,5 @@ class Sampler(nn.Module):
             sampling_metadata.frequency_penalties,
             sampling_metadata.repetition_penalties,
             output_token_ids,
+            presence_penalties_only=sampling_metadata.presence_penalties_only,
         )

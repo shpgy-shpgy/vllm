@@ -479,6 +479,7 @@ class Worker(WorkerBase):
                 current_platform.is_cuda()
                 and self.vllm_config.compilation_config.cudagraph_mode
                 != CUDAGraphMode.NONE
+                and envs.VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS
             ):
                 cudagraph_memory_estimate = self.model_runner.profile_cudagraph_memory()
 
@@ -843,6 +844,18 @@ class Worker(WorkerBase):
             # fragmentation issue.
             # NOTE: This is called after `capture_model` on purpose to prevent
             # memory buffers from being cleared by `torch.accelerator.empty_cache`.
+            if "Qwen3_5MoeForConditionalGeneration" in self.model_config.architectures:
+                long_prefill_tokens = min(
+                    3000,
+                    self.scheduler_config.max_num_batched_tokens,
+                    self.model_config.max_model_len - 1,
+                )
+                self.model_runner._dummy_run(
+                    num_tokens=long_prefill_tokens,
+                    skip_eplb=True,
+                    cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                )
+
             max_num_reqs = min(
                 self.scheduler_config.max_num_seqs,
                 self.scheduler_config.max_num_batched_tokens,

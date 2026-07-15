@@ -394,6 +394,19 @@ def supports_trtllm_attention(is_prefill: bool = False) -> bool:
     return current_platform.is_device_capability_family(100)
 
 
+@functools.cache
+def supports_xqa_attention() -> bool:
+    """Return `True` if FlashInfer XQA decode is supported on this platform."""
+    if envs.VLLM_BATCH_INVARIANT:
+        return False
+    if not current_platform.is_cuda_alike():
+        return False
+    if not has_flashinfer():
+        return False
+    capability = current_platform.get_device_capability()
+    return capability is not None and capability.major in (9, 10, 12)
+
+
 def force_use_trtllm_attention() -> bool | None:
     """
     This function should only be called during initialization stage when vllm config
@@ -417,6 +430,24 @@ def can_use_trtllm_attention(
     return supports_trtllm_attention(is_prefill=is_prefill) and (
         num_qo_heads % num_kv_heads == 0
     )
+
+
+def can_use_xqa_attention(
+    num_qo_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+) -> bool:
+    """Check if FlashInfer XQA decode supports this attention shape."""
+    if force_use_trtllm_attention() is False:
+        return False
+    if not supports_xqa_attention():
+        return False
+    if num_kv_heads <= 0 or num_qo_heads % num_kv_heads != 0:
+        return False
+    # FlashInfer XQA JIT accepts more head sizes, but verifier tests show D=80
+    # can illegal-address. The pinned FlashInfer version includes the XQA
+    # V-page prefetch fix required for D=256.
+    return head_dim in (64, 128, 256)
 
 
 def use_trtllm_attention(
@@ -1045,7 +1076,9 @@ __all__ = [
     "has_flashinfer_fp8_blockscale_gemm",
     "has_nvidia_artifactory",
     "supports_trtllm_attention",
+    "supports_xqa_attention",
     "can_use_trtllm_attention",
+    "can_use_xqa_attention",
     "use_trtllm_attention",
     "flashinfer_mxfp4_quantize",
     "flashinfer_scaled_fp4_mm",

@@ -96,11 +96,19 @@ class SharedExperts(torch.nn.Module):
         if self._mk_can_overlap_shared_experts():
             return SharedExpertsOrder.MK_INTERNAL_OVERLAPPED
 
+        token_threshold = envs.VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD
+        capability = current_platform.get_device_capability()
+        if (
+            current_platform.is_cuda()
+            and capability is not None
+            and capability.major >= 10
+        ):
+            token_threshold = max(token_threshold, 4096)
+
         should_run_shared_in_aux_stream = (
             current_platform.is_cuda()
             and self._stream is not None
-            and hidden_states.shape[0]
-            <= envs.VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD
+            and hidden_states.shape[0] <= token_threshold
         )
 
         if should_run_shared_in_aux_stream:
