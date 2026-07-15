@@ -99,7 +99,10 @@ from vllm.v1.worker.gpu.model_states import init_model_state
 from vllm.v1.worker.gpu.pool.pooling_runner import PoolingRunner
 from vllm.v1.worker.gpu.pp_utils import PPHandler
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
-from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker
+from vllm.v1.worker.gpu.sample.prompt_logprob import (
+    PromptLogprobsWorker,
+    compute_prompt_logprobs_with_chunking,
+)
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm.v1.worker.gpu.shutdown import free_before_shutdown
 from vllm.v1.worker.gpu.spec_decode import init_speculator
@@ -640,6 +643,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.sampler(logits, dummy_input_batch)
 
     @torch.inference_mode()
+    def _dummy_prompt_logprobs_run(self, hidden_states: torch.Tensor) -> None:
+        """Profile the largest full-logits chunk used by prompt logprobs."""
+        num_tokens = min(1024, hidden_states.shape[0])
+        prompt_token_ids = torch.zeros(
+            num_tokens, dtype=torch.int64, device=hidden_states.device
+        )
+        compute_prompt_logprobs_with_chunking(
+            prompt_token_ids,
+            hidden_states[:num_tokens],
+            self.model.compute_logits,
+            num_prompt_logprobs=1,
+        )
+
+    @torch.inference_mode()
     def _dummy_pooler_run(self, hidden_states: torch.Tensor) -> None:
         assert self.pooling_runner is not None
         self.pooling_runner.dummy_pooler_run(hidden_states)
@@ -655,6 +672,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             assert sample_hidden_states is not None
             if self.pooling_runner is None:
                 self._dummy_sampler_run(sample_hidden_states)
+                assert hidden_states is not None
+                self._dummy_prompt_logprobs_run(hidden_states)
             else:
                 self._dummy_pooler_run(hidden_states)
 
@@ -1052,6 +1071,86 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         grammar_output: GrammarOutput | None,
     ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
         sample_hidden_states = hidden_states[input_batch.logits_indices]
+        assert self.sampler is not None
+
+        fast_path_params = None
+        if grammar_output is None and not input_batch.has_structured_output_reqs:
+            fast_path_params = self.sampler.get_vocab_parallel_sampling_params(
+                input_batch
+            )
+
+        if fast_path_params is not None and input_batch.num_draft_tokens == 0:
+            mode, top_k, top_p, temperature = fast_path_params
+            sampled = None
+            if mode == "greedy" and hasattr(self.model, "get_top_tokens"):
+                logger.info_once(
+                    "Using V2 vocab-parallel greedy sampling fast path.",
+                    scope="global",
+                )
+                sampled = self.model.get_top_tokens(sample_hidden_states)
+            elif mode == "full" and hasattr(self.model, "sample_full_tokens"):
+                logger.info_once(
+                    "Using V2 vocab-parallel full-distribution sampling fast path.",
+                    scope="global",
+                )
+                sampled = self.model.sample_full_tokens(
+                    sample_hidden_states, temperature=temperature
+                )
+            elif mode == "topk" and hasattr(self.model, "sample_topk_tokens"):
+                logger.info_once(
+                    "Using V2 vocab-parallel compact top-k sampling fast path.",
+                    scope="global",
+                )
+                sampled = self.model.sample_topk_tokens(
+                    sample_hidden_states,
+                    top_k=top_k,
+                    top_p=top_p,
+                    temperature=temperature,
+                )
+
+            if sampled is not None:
+                sampler_output = self.sampler.make_sampler_output(
+                    sampled.to(torch.int64), input_batch
+                )
+                return (
+                    sampler_output,
+                    sampler_output.num_sampled,
+                    sampler_output.num_rejected,
+                )
+
+        if (
+            fast_path_params is not None
+            and fast_path_params[0] == "topk"
+            and input_batch.num_draft_tokens > 0
+            and self.rejection_sampler is not None
+            and self.speculator is not None
+            and self.speculator.draft_logits is None
+            and self.rejection_sampler.synthetic_conditional_rates is None
+            and not self.rejection_sampler.use_block_verification
+            and hasattr(self.model, "get_topk_candidates")
+        ):
+            _, top_k, top_p, temperature = fast_path_params
+            logger.info_once(
+                "Using V2 vocab-parallel compact top-k speculative sampling fast path.",
+                scope="global",
+            )
+            candidate_logits, candidate_ids = self.model.get_topk_candidates(
+                sample_hidden_states,
+                top_k=top_k,
+                top_p=top_p,
+                temperature=temperature,
+            )
+            sampler_output = self.rejection_sampler.sample_from_topk_candidates(
+                candidate_logits,
+                candidate_ids,
+                input_batch,
+            )
+            return (
+                sampler_output,
+                sampler_output.num_sampled,
+                sampler_output.num_rejected,
+            )
+
         logits = self.model.compute_logits(sample_hidden_states)
         if grammar_output is not None:
             # Apply grammar bitmask to the logits in-place.
@@ -1064,7 +1163,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
 
         if input_batch.num_draft_tokens == 0 or self.rejection_sampler is None:
-            assert self.sampler is not None
             sampler_output = self.sampler(logits, input_batch)
         else:
             # Rejection sampling for spec decoding.

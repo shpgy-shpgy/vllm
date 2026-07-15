@@ -835,6 +835,23 @@ class Worker(WorkerBase):
 
             logger.debug(msg)
 
+        # Qwen3.5's long-prefill kernels have shapes that are not covered by
+        # decode graph capture. Warm them for both model-runner generations.
+        if (
+            get_pp_group().is_last_rank
+            and "Qwen3_5MoeForConditionalGeneration" in self.model_config.architectures
+        ):
+            long_prefill_tokens = min(
+                3000,
+                self.scheduler_config.max_num_batched_tokens,
+                self.model_config.max_model_len - 1,
+            )
+            self.model_runner._dummy_run(
+                num_tokens=long_prefill_tokens,
+                skip_eplb=True,
+                cudagraph_runtime_mode=CUDAGraphMode.NONE,
+            )
+
         if self.use_v2_model_runner:
             # V2: Run full execute_model + sample_tokens to JIT compile triton kernels.
             warmup_kernels(self.model_runner, self.execute_model, self.sample_tokens)
@@ -844,18 +861,6 @@ class Worker(WorkerBase):
             # fragmentation issue.
             # NOTE: This is called after `capture_model` on purpose to prevent
             # memory buffers from being cleared by `torch.accelerator.empty_cache`.
-            if "Qwen3_5MoeForConditionalGeneration" in self.model_config.architectures:
-                long_prefill_tokens = min(
-                    3000,
-                    self.scheduler_config.max_num_batched_tokens,
-                    self.model_config.max_model_len - 1,
-                )
-                self.model_runner._dummy_run(
-                    num_tokens=long_prefill_tokens,
-                    skip_eplb=True,
-                    cudagraph_runtime_mode=CUDAGraphMode.NONE,
-                )
-
             max_num_reqs = min(
                 self.scheduler_config.max_num_seqs,
                 self.scheduler_config.max_num_batched_tokens,

@@ -69,6 +69,98 @@ class Sampler:
         self.bad_words_state.apply_staged_writes()
         self.logprob_token_ids_state.apply_staged_writes()
 
+    def get_vocab_parallel_sampling_params(
+        self, input_batch: InputBatch
+    ) -> tuple[str, int, float, float] | None:
+        """Return params for a semantics-preserving vocab-parallel fast path.
+
+        The model-level helpers bypass the full-vocabulary logits gather and
+        therefore can only be used when every active request has the same,
+        supported sampling mode. Any feature that needs materialized logits
+        falls back to the regular sampler.
+        """
+        idx_mapping_np = input_batch.idx_mapping_np
+        if idx_mapping_np.size == 0 or self.compute_nans:
+            return None
+
+        if (
+            self.sampling_states.max_num_logprobs(idx_mapping_np) != NO_LOGPROBS
+            or self.logprob_token_ids_state.max_num_token_ids(idx_mapping_np) > 0
+            or np.any(self.penalties_state.use_penalty[idx_mapping_np])
+            or np.any(self.logit_bias_state.use_logit_bias[idx_mapping_np])
+            or np.any(self.bad_words_state.num_bad_words.np[idx_mapping_np] != 0)
+        ):
+            return None
+
+        temperatures = self.sampling_states.temperature.np[idx_mapping_np]
+        top_ks = self.sampling_states.top_k.np[idx_mapping_np]
+        top_ps = self.sampling_states.top_p.np[idx_mapping_np]
+        min_ps = self.sampling_states.min_p.np[idx_mapping_np]
+
+        # Top-k/top-p/min-p preserve argmax, but requiring their default values
+        # keeps this guard deliberately narrow and makes warmup exercise the
+        # regular sampler kernels.
+        default_filters = (
+            np.all(top_ks == self.sampling_states.vocab_size)
+            and np.all(top_ps == 1.0)
+            and np.all(min_ps == 0.0)
+        )
+        if np.all(temperatures == 0.0):
+            if default_filters and not self.sampling_states.any_explicit_seed(
+                idx_mapping_np
+            ):
+                return ("greedy", self.sampling_states.vocab_size, 1.0, 0.0)
+            return None
+
+        if (
+            self.use_fp64_gumbel
+            or self.sampling_states.any_explicit_seed(idx_mapping_np)
+            or np.any(temperatures <= 0.0)
+            or not np.all(temperatures == temperatures[0])
+            or not np.all(min_ps == 0.0)
+        ):
+            return None
+
+        temperature = float(temperatures[0])
+        if default_filters:
+            return ("full", self.sampling_states.vocab_size, 1.0, temperature)
+
+        top_k = int(top_ks[0])
+        top_p = float(top_ps[0])
+        if (
+            top_k <= 0
+            or top_k > 64
+            or top_p <= 0.0
+            or top_p > 1.0
+            or not np.all(top_ks == top_k)
+            or not np.all(top_ps == top_p)
+        ):
+            return None
+        return ("topk", top_k, top_p, temperature)
+
+    def make_sampler_output(
+        self,
+        sampled: torch.Tensor,
+        input_batch: InputBatch,
+        *,
+        num_nans: torch.Tensor | None = None,
+    ) -> SamplerOutput:
+        """Build the standard one-token output for a pre-sampled batch."""
+        num_sampled, num_rejected = get_num_sampled_and_rejected(
+            input_batch.seq_lens.new_ones(input_batch.num_reqs),
+            input_batch.seq_lens,
+            input_batch.cu_num_logits,
+            input_batch.idx_mapping,
+            self.req_states.prefill_len.gpu,
+        )
+        return SamplerOutput(
+            sampled_token_ids=sampled.view(-1, 1),
+            logprobs_tensors=None,
+            num_nans=num_nans,
+            num_sampled=num_sampled,
+            num_rejected=num_rejected,
+        )
+
     def __call__(
         self,
         logits: torch.Tensor,
@@ -131,7 +223,7 @@ class Sampler:
         )
 
         # These are GPU tensors.
-        sampler_output = SamplerOutput(
+        return SamplerOutput(
             # The sampled tokens are expanded to 2D tensor with shape
             # [num_requests, 1], where each row represents one generated
             # token per request.
@@ -141,7 +233,6 @@ class Sampler:
             num_sampled=num_sampled,
             num_rejected=num_rejected,
         )
-        return sampler_output
 
     def apply_sampling_params(
         self,
