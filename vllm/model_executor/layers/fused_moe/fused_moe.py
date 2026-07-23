@@ -74,7 +74,12 @@ def _triton_moe_sum(input: torch.Tensor, output: torch.Tensor) -> None:
     M, topk, K = input.shape
     if M == 0:
         return
-    BLOCK_K = triton.next_power_of_2(min(K, 2048))
+    # Qwen3.5 TP2 B1 has only one 2048-wide output row. A single 2048-wide
+    # program leaves the device almost entirely idle; sixteen 128-wide programs
+    # preserve the per-element expert addition order while reducing the
+    # CUDA-Graph node from ~1.27 us to ~0.87 us on both RTX 5090 ranks.
+    is_qwen35_tp2_b1 = M == 1 and topk == 8 and K == 2048
+    BLOCK_K = 128 if is_qwen35_tp2_b1 else triton.next_power_of_2(min(K, 2048))
     num_k_blocks = triton.cdiv(K, BLOCK_K)
 
     if topk <= 8:
@@ -90,7 +95,7 @@ def _triton_moe_sum(input: torch.Tensor, output: torch.Tensor) -> None:
             output.stride(0),
             output.stride(1),
             BLOCK_K=BLOCK_K,
-            num_warps=max(4, BLOCK_K // 256),
+            num_warps=2 if is_qwen35_tp2_b1 else max(4, BLOCK_K // 256),
         )
     else:
         ops.moe_sum(input, output)
