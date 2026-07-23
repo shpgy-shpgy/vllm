@@ -115,7 +115,8 @@ def _reference(convs, ssms, bt, src_col, dst_col, bias, num_reqs):
 
 @_parametrize("num_reqs", [1, 4, 16])
 @_parametrize("token_bias", [0, 1, 2])
-def test_precopy_matches_v1_copy_specs(num_reqs, token_bias):
+@_parametrize("has_idx_mapping", [False, True])
+def test_precopy_matches_v1_copy_specs(num_reqs, token_bias, has_idx_mapping):
     device = torch.device("cuda")
     torch.manual_seed(0)
     # Distinct physical block per (req, col) so copies never alias.
@@ -145,7 +146,11 @@ def test_precopy_matches_v1_copy_specs(num_reqs, token_bias):
         convs, ssms, device
     )
     bt_ptrs = torch.tensor([bt.data_ptr()], dtype=torch.int64, device=device)
-    idx_mapping = torch.arange(num_reqs, dtype=torch.int32, device=device)
+    idx_mapping = (
+        torch.arange(num_reqs, dtype=torch.int32, device=device)
+        if has_idx_mapping
+        else None
+    )
     grid = (num_reqs, NUM_LAYERS * 2)
     precopy_mamba_align_fused_kernel[grid](
         dst_col,
@@ -165,6 +170,7 @@ def test_precopy_matches_v1_copy_specs(num_reqs, token_bias):
         num_reqs,
         COPY_BLOCK_SIZE=1024,
         CONV_STATE_DIM_FIRST=False,
+        HAS_IDX_MAPPING=has_idx_mapping,
     )
     torch.accelerator.synchronize()
 
@@ -176,5 +182,6 @@ def test_precopy_matches_v1_copy_specs(num_reqs, token_bias):
 if __name__ == "__main__":
     for nr in (1, 4, 16):
         for tb in (0, 1, 2):
-            test_precopy_matches_v1_copy_specs(nr, tb)
-            print(f"OK num_reqs={nr} token_bias={tb}")
+            for mapped in (False, True):
+                test_precopy_matches_v1_copy_specs(nr, tb, mapped)
+                print(f"OK num_reqs={nr} token_bias={tb} mapped={mapped}")

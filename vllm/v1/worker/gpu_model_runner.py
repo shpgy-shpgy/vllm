@@ -4741,6 +4741,7 @@ class GPUModelRunner(
                     self.model.get_mamba_state_copy_func(),
                     mamba_bufs.preprocess,
                 )
+                gpu_ctx=mamba_bufs.postprocess_align,
                 # preprocess_mamba resets num_accepted_tokens_cpu to 1
                 # for requests whose state was copied to a new block.
                 # Re-sync to GPU so the mamba kernel reads from the

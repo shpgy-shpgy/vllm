@@ -626,13 +626,24 @@ def rejection_sample(
     assert bonus_token_ids.is_contiguous()
     assert target_logits.shape == (num_tokens, vocab_size)
 
-    # Create output buffer.
-    output_token_ids = torch.full(
-        (batch_size, max_spec_len + 1),
-        PLACEHOLDER_TOKEN_ID,
-        dtype=torch.int32,  # Consistent with SamplerOutput.sampled_token_ids.
-        device=device,
-    )
+    # The greedy kernel initializes its own output row. Avoid launching a
+    # separate fill kernel on the latency-critical all-greedy path. Mixed and
+    # random batches still need the shared output initialized up front because
+    # different kernels own different rows.
+    output_shape = (batch_size, max_spec_len + 1)
+    if sampling_metadata.all_greedy:
+        output_token_ids = torch.empty(
+            output_shape,
+            dtype=torch.int32,  # Consistent with SamplerOutput.sampled_token_ids.
+            device=device,
+        )
+    else:
+        output_token_ids = torch.full(
+            output_shape,
+            PLACEHOLDER_TOKEN_ID,
+            dtype=torch.int32,
+            device=device,
+        )
 
     if sampling_metadata.all_greedy:
         is_greedy = None
@@ -666,6 +677,8 @@ def rejection_sample(
             uniform_probs,
             synthetic_conditional_rates,
             SYNTHETIC_MODE=synthetic_mode,
+            INIT_OUTPUT=sampling_metadata.all_greedy,
+            PLACEHOLDER_TOKEN_ID=PLACEHOLDER_TOKEN_ID,
         )
         if sampling_metadata.all_greedy:
             return output_token_ids
@@ -959,8 +972,15 @@ def rejection_greedy_sample_kernel(
     uniform_probs_ptr,  # [num_tokens] or None (synthetic mode only)
     synthetic_conditional_rates_ptr,  # [num_speculative_tokens] or None
     SYNTHETIC_MODE: tl.constexpr,
+    INIT_OUTPUT: tl.constexpr,
+    PLACEHOLDER_TOKEN_ID: tl.constexpr,
 ):
     req_idx = tl.program_id(0)
+    if INIT_OUTPUT:
+        output_row = output_token_ids_ptr + req_idx * (max_spec_len + 1)
+        for pos in range(max_spec_len + 1):
+            tl.store(output_row + pos, PLACEHOLDER_TOKEN_ID)
+
     # FIXME(woosuk): Because is_greedy_ptr is not None at profiling run,
     # re-compilation may happen during runtime when is_greedy_ptr is None.
     is_greedy = True if is_greedy_ptr is None else tl.load(is_greedy_ptr + req_idx)
