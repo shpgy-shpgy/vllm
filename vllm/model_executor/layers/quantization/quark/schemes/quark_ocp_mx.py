@@ -15,9 +15,17 @@ from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
     dequant_mxfp4,
     quant_dequant_mxfp4,
 )
+from vllm.model_executor.layers.quantization.utils.mxfp6_sm120_utils import (
+    is_mxfp6_sm120_available,
+    mxfp6_sm120_gemm,
+    pack_mxfp6_sm120_scales,
+)
 from vllm.model_executor.layers.quantization.utils.mxfp6_utils import (
     dequant_mxfp6,
     quant_dequant_mxfp6,
+)
+from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+    mxfp8_e4m3_quantize,
 )
 from vllm.model_executor.layers.quantization.utils.ocp_mx_utils import (
     OCP_MX_BLOCK_SIZE,
@@ -181,9 +189,9 @@ class QuarkOCP_MX(QuarkScheme):
             )
 
         if self.input_dtype is None:
-            self.quant_dequant_func: Callable[[torch.Tensor], torch.Tensor] = (
-                lambda x: x
-            )  # no input Q/DQ for weight-only
+            # No input Q/DQ for weight-only.
+            self.quant_dequant_func: Callable[[torch.Tensor], torch.Tensor]
+            self.quant_dequant_func = lambda x: x
         elif self.input_dtype == "mxfp4":
             self.quant_dequant_func = quant_dequant_mxfp4
         else:
@@ -202,16 +210,25 @@ class QuarkOCP_MX(QuarkScheme):
                 "implemented. Please open an issue."
             )
 
-        # TODO: integrate (or test) mixed-precision kernel.
-        self.emulate = not current_platform.supports_mx() or (
-            self.input_dtype != "mxfp4" or self.weight_dtype != "mxfp4"
+        self.use_mxfp6_sm120 = (
+            self._is_mxfp6_sm120_config() and is_mxfp6_sm120_available()
+        )
+        self.output_size_per_partition: int | None = None
+        self.emulate = not self.use_mxfp6_sm120 and (
+            not current_platform.supports_mx()
+            or self.input_dtype != "mxfp4"
+            or self.weight_dtype != "mxfp4"
         )
 
         self.rocm_use_aiter_fp4_asm_gemm = (
             rocm_aiter_ops.is_asm_fp4_gemm_dynamic_quant_enabled()
         )
 
-        if not self.emulate and (dynamic_mxfp4_quant is None or gemm_afp4wfp4 is None):
+        if (
+            not self.emulate
+            and not self.use_mxfp6_sm120
+            and (dynamic_mxfp4_quant is None or gemm_afp4wfp4 is None)
+        ):
             # Currently need these kernels if not emulating
             raise NotImplementedError(
                 f"{self.__class__.__name__} requires AITER to be installed "
@@ -219,7 +236,23 @@ class QuarkOCP_MX(QuarkScheme):
                 "https://github.com/ROCm/aiter for installation details."
             )
 
-        if not current_platform.supports_mx():
+        if self.use_mxfp6_sm120:
+            logger.info_once(
+                "Using the mxfp6-sm120 native W6A8 kernel for Quark "
+                "E3M2 weights and dynamic E4M3 activations."
+            )
+        elif (
+            self._is_mxfp6_sm120_config()
+            and current_platform.is_cuda()
+            and current_platform.is_device_capability(120)
+        ):
+            logger.warning_once(
+                "The Quark W6A8 checkpoint is compatible with the native "
+                "SM120 kernel, but mxfp6-sm120 could not be loaded. Install "
+                "a wheel built for the current PyTorch/CUDA version. "
+                "Falling back to MXFP6 emulation."
+            )
+        elif not current_platform.supports_mx():
             logger.warning_once(
                 "The current platform does not support native MXFP4/MXFP6 "
                 "computation. Simulated weight dequantization and activation "
@@ -227,8 +260,10 @@ class QuarkOCP_MX(QuarkScheme):
                 "layers computed in high precision."
             )
 
-        if current_platform.supports_mx() and (
-            self.input_dtype != "mxfp4" or self.weight_dtype != "mxfp4"
+        if (
+            not self.use_mxfp6_sm120
+            and current_platform.supports_mx()
+            and (self.input_dtype != "mxfp4" or self.weight_dtype != "mxfp4")
         ):
             logger.warning_once(
                 "The current platform supports native MXFP4/MXFP6 "
@@ -238,6 +273,30 @@ class QuarkOCP_MX(QuarkScheme):
                 "QDQ (quantize and dequantize) will be used, with the linear "
                 "layers computed in high precision."
             )
+
+    def _is_mxfp6_sm120_config(self) -> bool:
+        input_spec = self.input_quant_spec
+        return (
+            self.weight_quant_spec.get("dtype") == "fp6_e3m2"
+            and self.weight_quant_spec.get("qscheme") == "per_group"
+            and self.weight_quant_spec.get("group_size") == OCP_MX_BLOCK_SIZE
+            and self.weight_quant_spec.get("scale_format") == "e8m0"
+            and self.weight_quant_spec.get("symmetric") is True
+            and not self.weight_quant_spec.get("is_dynamic")
+            and input_spec is not None
+            and input_spec.get("dtype") == "fp8_e4m3"
+            and input_spec.get("qscheme") == "per_group"
+            and input_spec.get("group_size") == OCP_MX_BLOCK_SIZE
+            and input_spec.get("scale_format") == "e8m0"
+            and input_spec.get("symmetric") is True
+            and input_spec.get("is_dynamic") is True
+        )
+
+    @staticmethod
+    def _is_mxfp6_sm120_problem_supported(
+        output_features: int, input_features: int
+    ) -> bool:
+        return output_features % 8 == 0 and input_features % 128 == 0
 
     def get_packed_dim(self, dim: int, quant_dtype: str):
         if quant_dtype == "mxfp4":
@@ -268,7 +327,12 @@ class QuarkOCP_MX(QuarkScheme):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         layer.weight = torch.nn.Parameter(layer.weight.data, requires_grad=False)
 
-        if self.emulate:
+        if self.use_mxfp6_sm120:
+            layer.weight_scale = torch.nn.Parameter(
+                pack_mxfp6_sm120_scales(layer.weight_scale.data),
+                requires_grad=False,
+            )
+        elif self.emulate:
             if self.dynamic_mxfp4_quant:
                 self.process_dynamic_mxfp4_weights_after_loading(layer)
             else:
@@ -328,6 +392,20 @@ class QuarkOCP_MX(QuarkScheme):
         else:
             output_size_per_partition = sum(output_partition_sizes)
             layer.logical_widths = output_partition_sizes
+            self.output_size_per_partition = output_size_per_partition
+
+            if self.use_mxfp6_sm120 and not self._is_mxfp6_sm120_problem_supported(
+                output_size_per_partition, input_size_per_partition
+            ):
+                self.use_mxfp6_sm120 = False
+                self.emulate = True
+                logger.warning_once(
+                    "mxfp6-sm120 requires N to be divisible by 8 and K by "
+                    "128, but a partition has N=%d and K=%d. Falling back "
+                    "to MXFP6 emulation for that layer.",
+                    output_size_per_partition,
+                    input_size_per_partition,
+                )
 
             # WEIGHT
             weight = PackedvLLMParameter(
@@ -363,6 +441,25 @@ class QuarkOCP_MX(QuarkScheme):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if self.use_mxfp6_sm120:
+            assert self.output_size_per_partition is not None
+            output_shape = (*x.shape[:-1], self.output_size_per_partition)
+            x_2d = x.reshape(-1, x.shape[-1]).contiguous()
+            quantized_x, input_scale = mxfp8_e4m3_quantize(
+                x_2d, is_sf_swizzled_layout=True
+            )
+            y = mxfp6_sm120_gemm(
+                quantized_x,
+                input_scale,
+                layer.weight,
+                layer.weight_scale,
+                self.output_size_per_partition,
+                x.dtype,
+            ).reshape(output_shape)
+            if bias is not None:
+                y = y + bias
+            return y
+
         if self.emulate:
             dq_w = self.dequant_func(layer.weight, layer.weight_scale, x.dtype)
             qdq_x = self.quant_dequant_func(x)

@@ -12,6 +12,9 @@ import torch
 
 import vllm.envs as envs
 from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization.utils.mxfp6_sm120_utils import (
+    warmup_mxfp6_sm120,
+)
 from vllm.model_executor.warmup.cutedsl_warmup import cutedsl_warmup
 from vllm.model_executor.warmup.deep_gemm_warmup import deep_gemm_warmup
 from vllm.model_executor.warmup.deepseek_v4_mhc_warmup import (
@@ -82,6 +85,13 @@ def kernel_warmup(worker: "Worker"):
         model = worker.get_model()
         max_tokens = worker.scheduler_config.max_num_batched_tokens
         deep_gemm_warmup(model, max_tokens)
+
+    capture_sizes = worker.vllm_config.compilation_config.cudagraph_capture_sizes or []
+    warmup_mxfp6_sm120(
+        worker.get_model(),
+        [1, worker.scheduler_config.max_num_batched_tokens, *capture_sizes],
+        worker.model_config.dtype,
+    )
 
     minimax_m3_msa_warmup(worker)
 
