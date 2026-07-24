@@ -16,6 +16,8 @@ from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
 
+_W6A8Problem = tuple[int, int, torch.Tensor, torch.Tensor]
+
 _REQUIRED_API = (
     "MXFP8Tensor",
     "PackedMXFP6Tensor",
@@ -26,6 +28,7 @@ _REQUIRED_API = (
     "is_available",
     "load_library",
     "pack_scales",
+    "workspace_stats",
 )
 
 
@@ -123,13 +126,7 @@ def mxfp6_sm120_gemm(
     )
 
 
-@torch.inference_mode()
-def warmup_mxfp6_sm120(
-    model: torch.nn.Module,
-    token_sizes: list[int],
-    dtype: torch.dtype,
-) -> None:
-    """Warm and autotune each distinct native W6A8 problem before capture."""
+def _collect_w6a8_problems(model: torch.nn.Module) -> list[_W6A8Problem]:
     problems: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]] = {}
     for layer in model.modules():
         scheme = getattr(layer, "scheme", None)
@@ -142,25 +139,35 @@ def warmup_mxfp6_sm120(
         input_features = packed_features * 4 // 3
         problems.setdefault((output_features, input_features), (weight, weight_scale))
 
-    if not problems:
-        return
+    return [
+        (output_features, input_features, weight, weight_scale)
+        for (output_features, input_features), (
+            weight,
+            weight_scale,
+        ) in problems.items()
+    ]
 
+
+def _normalize_warmup_inputs(
+    token_sizes: list[int],
+    dtype: torch.dtype,
+) -> tuple[list[int], torch.dtype]:
     sizes = sorted({size for size in token_sizes if size > 0}, reverse=True)
-    if not sizes:
-        return
-
     if dtype not in (torch.float16, torch.bfloat16):
         dtype = torch.bfloat16
+    return sizes, dtype
 
-    mxfp6 = _import_mxfp6()
-    workspace_device = next(iter(problems.values()))[0].device
-    mxfp6.begin_workspace_planning(workspace_device)
-    logger.info(
-        "Warming mxfp6-sm120 for %d W6A8 shapes and %d token sizes",
-        len(problems),
-        len(sizes),
-    )
-    for (output_features, input_features), (weight, weight_scale) in problems.items():
+
+def _run_w6a8_warmup(
+    mxfp6: ModuleType,
+    problems: list[_W6A8Problem],
+    sizes: list[int],
+    dtype: torch.dtype,
+    *,
+    autotune: bool,
+    initial_lane_count: int | None = None,
+) -> None:
+    for output_features, input_features, weight, weight_scale in problems:
         packed_weight = mxfp6.PackedMXFP6Tensor(
             values=weight,
             scales=weight_scale,
@@ -180,10 +187,42 @@ def warmup_mxfp6_sm120(
                 rows=num_tokens,
                 k=input_features,
             )
-            mxfp6.autotune_w6a8(quantized_x, packed_weight, out_dtype=dtype)
+            if autotune:
+                mxfp6.autotune_w6a8(quantized_x, packed_weight, out_dtype=dtype)
             output = mxfp6.gemm_w6a8(quantized_x, packed_weight, out_dtype=dtype)
             del quantized_values, input_scale, quantized_x
             del x, output
+            if (
+                initial_lane_count is not None
+                and mxfp6.workspace_stats(weight.device)["lanes"] > initial_lane_count
+            ):
+                return
+
+
+@torch.inference_mode()
+def warmup_mxfp6_sm120(
+    model: torch.nn.Module,
+    token_sizes: list[int],
+    dtype: torch.dtype,
+) -> None:
+    """Warm and autotune each distinct native W6A8 problem before capture."""
+    problems = _collect_w6a8_problems(model)
+    if not problems:
+        return
+
+    sizes, dtype = _normalize_warmup_inputs(token_sizes, dtype)
+    if not sizes:
+        return
+
+    mxfp6 = _import_mxfp6()
+    workspace_device = problems[0][2].device
+    mxfp6.begin_workspace_planning(workspace_device)
+    logger.info(
+        "Warming mxfp6-sm120 for %d W6A8 shapes and %d token sizes",
+        len(problems),
+        len(sizes),
+    )
+    _run_w6a8_warmup(mxfp6, problems, sizes, dtype, autotune=True)
 
     workspace_stats = mxfp6.finalize_workspace_planning(workspace_device)
     torch.accelerator.synchronize()
@@ -193,3 +232,36 @@ def warmup_mxfp6_sm120(
         workspace_stats["layouts"],
         workspace_stats["arena_bytes"] / (1 << 20),
     )
+
+
+@torch.inference_mode()
+def warmup_mxfp6_sm120_stream(
+    model: torch.nn.Module,
+    token_sizes: list[int],
+    dtype: torch.dtype,
+) -> None:
+    """Register the current CUDA stream with the frozen Stream-K workspace."""
+    problems = _collect_w6a8_problems(model)
+    if not problems:
+        return
+
+    sizes, dtype = _normalize_warmup_inputs(token_sizes, dtype)
+    if not sizes:
+        return
+    sizes.reverse()
+
+    mxfp6 = _import_mxfp6()
+    workspace_device = problems[0][2].device
+    workspace_stats = mxfp6.workspace_stats(workspace_device)
+    if workspace_stats["layouts"] == 0:
+        return
+
+    _run_w6a8_warmup(
+        mxfp6,
+        problems,
+        sizes,
+        dtype,
+        autotune=False,
+        initial_lane_count=workspace_stats["lanes"],
+    )
+    torch.accelerator.synchronize()

@@ -330,6 +330,7 @@ class CudaGraphManager:
         self,
         create_forward_fn: CreateForwardFn,
         progress_bar_desc: str = "Capturing CUDA graphs",
+        capture_stream_warmup: Callable[[], None] | None = None,
     ) -> dict[BatchExecutionDescriptor, AttentionStatePair]:
         """Capture CUDA graphs.
 
@@ -341,9 +342,14 @@ class CudaGraphManager:
                 backends that perform lazy metadata initialization (e.g. FlashMLA),
                 FULL cudagraph capture requires distinct metadatas for warmup and
                 capture.
+            capture_stream_warmup: Optional eager warmup that runs on the CUDA
+                Graph capture stream before any graph capture begins.
         """
         attn_states: dict[BatchExecutionDescriptor, AttentionStatePair] = {}
-        with graph_capture(device=self.device):
+        with graph_capture(device=self.device) as graph_capture_context:
+            if capture_stream_warmup is not None:
+                capture_stream_warmup()
+
             # Capture in order: PIECEWISE first, then FULL. PIECEWISE has larger
             # activations so FULL activations should fit in already allocated
             # buffers in the graph pool.
@@ -385,7 +391,11 @@ class CudaGraphManager:
                         # Sync offloader's copy stream before capture.
                         # Ensure any pre-capture prefetches from offloader are complete.
                         get_offloader().sync_prev_onload()
-                        with torch.cuda.graph(graph, self.pool):
+                        with torch.cuda.graph(
+                            graph,
+                            self.pool,
+                            stream=graph_capture_context.stream,
+                        ):
                             forward_fn(CUDAGraphMode.NONE)
                             # Join offloader's copy stream after forward to avoid
                             # unjoined stream error. The last layer's start_prefetch
@@ -608,7 +618,26 @@ class ModelCudaGraphManager(CudaGraphManager):
 
             return forward_fn, AttentionState(attn_metadata, slot_mappings)
 
-        return super().capture(create_forward_fn, progress_bar_desc)
+        capture_sizes = [
+            desc.num_tokens for descs in self._capture_descs.values() for desc in descs
+        ]
+
+        def warmup_capture_stream() -> None:
+            from vllm.model_executor.layers.quantization.utils import (
+                mxfp6_sm120_utils,
+            )
+
+            mxfp6_sm120_utils.warmup_mxfp6_sm120_stream(
+                model,
+                capture_sizes,
+                self.vllm_config.model_config.dtype,
+            )
+
+        return super().capture(
+            create_forward_fn,
+            progress_bar_desc,
+            capture_stream_warmup=warmup_capture_stream,
+        )
 
     def run_fullgraph(
         self, desc: BatchExecutionDescriptor
