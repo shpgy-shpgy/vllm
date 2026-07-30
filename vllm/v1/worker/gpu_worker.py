@@ -275,6 +275,22 @@ class Worker(WorkerBase):
             restore = original_value if original_value else str(_SIZE_MAX_MB)
             torch._C._accelerator_setAllocatorSettings(f"max_split_size_mb:{restore}")
 
+    def _warmup_v2_tp_gather(self) -> None:
+        if (
+            not self.use_v2_model_runner
+            or self.model_config.runner_type != "generate"
+            or self.parallel_config.tensor_parallel_size == 1
+            or not get_pp_group().is_last_rank
+        ):
+            return
+
+        # V2 vocab-parallel sampling uses NCCL gather. ProcessGroupNCCL
+        # initializes its P2P channels lazily on the first gather, so warm them
+        # before the memory snapshot accounts for persistent non-Torch memory.
+        local_pair = torch.empty((1, 2), dtype=torch.float64, device=self.device)
+        get_tp_group().gather(local_pair, dst=0, dim=-1)
+        torch.accelerator.synchronize()
+
     @instrument(span_name="Init device")
     def init_device(self):
         if self.device_config.device_type == "cuda":
@@ -358,6 +374,7 @@ class Worker(WorkerBase):
 
             if self.use_v2_model_runner:
                 logger.info_once("Using V2 Model Runner")
+                self._warmup_v2_tp_gather()
 
             # Set random seed.
             set_random_seed(self.model_config.seed)

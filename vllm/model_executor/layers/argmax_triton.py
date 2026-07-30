@@ -31,11 +31,19 @@ def _block_argmax_kernel(
         mask=mask,
         other=-float("inf"),
     ).to(tl.float32)
+    # Padded dummy rows can contain NaNs; exclude them from the reduction.
+    values = tl.where(values == values, values, -float("inf"))
     value, lane_idx = tl.max(values, axis=0, return_indices=True)
 
+    token_offset = block_id * BLOCK_SIZE + lane_idx
+    token_offset = tl.where(
+        token_offset < ACTIVE_VOCAB_SIZE,
+        token_offset,
+        block_id * BLOCK_SIZE,
+    )
     out_offset = row * NUM_BLOCKS + block_id
     tl.store(BLOCK_VALUES + out_offset, value)
-    tl.store(BLOCK_INDICES + out_offset, VOCAB_START + block_id * BLOCK_SIZE + lane_idx)
+    tl.store(BLOCK_INDICES + out_offset, VOCAB_START + token_offset)
 
 
 @triton.jit

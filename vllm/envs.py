@@ -231,7 +231,7 @@ if TYPE_CHECKING:
     VLLM_HAS_FLASHINFER_CUBIN: bool = False
     VLLM_ROCM_FP8_MFMA_PAGE_ATTN: bool = False
     VLLM_ALLREDUCE_USE_SYMM_MEM: bool = True
-    VLLM_ALLREDUCE_USE_FLASHINFER: bool = False
+    VLLM_ALLREDUCE_USE_FLASHINFER: bool | None = None
     VLLM_TUNED_CONFIG_FOLDER: str | None = None
     VLLM_GPT_OSS_SYSTEM_TOOL_MCP_LABELS: set[str] = set()
     VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT: bool = False
@@ -391,6 +391,21 @@ def env_with_choices(
         return value
 
     return _get_validated_env
+
+
+def env_flag_or_none(
+    env_name: str,
+    fallback_env_name: str | None = None,
+) -> Callable[[], bool | None]:
+    """Return a tri-state flag: unset for auto, false, or true."""
+
+    def _get_optional_flag() -> bool | None:
+        value = os.getenv(env_name)
+        if value is None and fallback_env_name is not None:
+            value = os.getenv(fallback_env_name)
+        return None if value is None else bool(int(value))
+
+    return _get_optional_flag
 
 
 def env_list_with_choices(
@@ -1707,10 +1722,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ALLREDUCE_USE_SYMM_MEM": lambda: bool(
         int(os.getenv("VLLM_ALLREDUCE_USE_SYMM_MEM", "1"))
     ),
-    # Whether to use FlashInfer allreduce
-    "VLLM_ALLREDUCE_USE_FLASHINFER": lambda: bool(
-        int(os.getenv("VLLM_ALLREDUCE_USE_FLASHINFER", "0"))
-    ),
+    # Whether to use FlashInfer allreduce. Unset auto-selects the validated
+    # SM120 TP2 FlashInfer path; 0 disables it and 1 forces the existing path.
+    "VLLM_ALLREDUCE_USE_FLASHINFER": env_flag_or_none("VLLM_ALLREDUCE_USE_FLASHINFER"),
     # Experimental: use this to enable MCP tool calling for non harmony models
     "VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT": lambda: bool(
         int(os.getenv("VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT", "0"))
