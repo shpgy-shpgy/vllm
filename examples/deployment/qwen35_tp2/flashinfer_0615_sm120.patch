@@ -1,0 +1,96 @@
+diff --git a/flashinfer/jit/comm.py b/flashinfer/jit/comm.py
+--- a/flashinfer/jit/comm.py
++++ b/flashinfer/jit/comm.py
+@@ -189,7 +189,7 @@ def gen_mixed_comm_module() -> JitSpec:
+ 
+ def gen_trtllm_comm_module() -> JitSpec:
+     nvcc_flags = current_compilation_context.get_nvcc_flags_list(
+-        supported_major_versions=[9, 10]
++        supported_major_versions=[9, 10, 12]
+     )
+     return gen_jit_spec(
+         "trtllm_comm",
+diff --git a/flashinfer/comm/mnnvl.py b/flashinfer/comm/mnnvl.py
+--- a/flashinfer/comm/mnnvl.py
++++ b/flashinfer/comm/mnnvl.py
+@@ -1254,7 +1254,9 @@ class UnifiedWorkspace:
+             cuda.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
+         )
+         allocation_prop.location.id = self.device_idx
+-        allocation_prop.allocFlags.gpuDirectRDMACapable = 1
++        # Local TRT-LLM IPC on consumer Blackwell does not require GDR.
++        # Requesting it makes cuMemCreate fail on the second RTX 5090.
++        allocation_prop.allocFlags.gpuDirectRDMACapable = 0
+ 
+         # Get allocation granularity
+         alloc_granularity = checkCudaErrors(
+diff --git a/flashinfer/data/csrc/trtllm_allreduce_fusion.cu b/flashinfer/data/csrc/trtllm_allreduce_fusion.cu
+--- a/flashinfer/data/csrc/trtllm_allreduce_fusion.cu
++++ b/flashinfer/data/csrc/trtllm_allreduce_fusion.cu
+@@ -75,6 +75,7 @@ void trtllm_allreduce_fusion(
+                               ? reinterpret_cast<float*>(scale_factor.value().data_ptr())
+                               : nullptr;
+     params.use_oneshot = use_oneshot;
++    params.launch_with_pdl = launch_with_pdl;
+     params.layout = layout_code.has_value() ? static_cast<QuantizationSFLayout>(layout_code.value())
+                                             : QuantizationSFLayout::SWIZZLED_128x4;
+     params.pattern = static_cast<AllReduceFusionPattern>(pattern_code);
+diff --git a/flashinfer/data/include/flashinfer/comm/trtllm_allreduce_fusion.cuh b/flashinfer/data/include/flashinfer/comm/trtllm_allreduce_fusion.cuh
+--- a/flashinfer/data/include/flashinfer/comm/trtllm_allreduce_fusion.cuh
++++ b/flashinfer/data/include/flashinfer/comm/trtllm_allreduce_fusion.cuh
+@@ -917,6 +917,7 @@ struct AllReduceFusionParams {
+   float weight_bias = 0.f;
+   float* scale_factor;
+   bool use_oneshot;
++  bool launch_with_pdl = false;
+   QuantizationSFLayout layout = QuantizationSFLayout::SWIZZLED_128x4;
+   cudaStream_t stream;
+   AllReduceFusionPattern pattern;
+@@ -1510,9 +1511,13 @@ __global__ void allreduce_fusion_kernel_oneshot_lamport(
+   FusedOp<Pattern, T> fused_op(params, access_id, access_id_in_token);
+ 
+ #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+-  cudaGridDependencySynchronize();
++  if (params.launch_with_pdl) {
++    cudaGridDependencySynchronize();
++  }
+   if constexpr (!TriggerCompletionAtEnd) {
+-    cudaTriggerProgrammaticLaunchCompletion();
++    if (params.launch_with_pdl) {
++      cudaTriggerProgrammaticLaunchCompletion();
++    }
+   }
+ #endif
+   LamportComm<NRanks> comm(params.workspace, params.rank);
+@@ -1558,7 +1563,9 @@ __global__ void allreduce_fusion_kernel_oneshot_lamport(
+ 
+ #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+   if constexpr (TriggerCompletionAtEnd) {
+-    cudaTriggerProgrammaticLaunchCompletion();
++    if (params.launch_with_pdl) {
++      cudaTriggerProgrammaticLaunchCompletion();
++    }
+   }
+ #endif
+ }
+@@ -1577,7 +1584,9 @@ __global__ void allreduce_fusion_kernel_twoshot_sync(
+   int tot_access = index_helper.tot_access;
+   FusedOp<Pattern, T> fused_op(params, access_id, access_id_in_token);
+ #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+-  cudaGridDependencySynchronize();
++  if (params.launch_with_pdl) {
++    cudaGridDependencySynchronize();
++  }
+ #endif
+   SyncComm<NRanks> comm(params.workspace);
+ #pragma unroll
+@@ -1623,7 +1632,9 @@ __global__ void allreduce_fusion_kernel_twoshot_sync(
+   }
+   comm.update(barrier.m_flag_value);
+ #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+-  cudaTriggerProgrammaticLaunchCompletion();
++  if (params.launch_with_pdl) {
++    cudaTriggerProgrammaticLaunchCompletion();
++  }
+ #endif
+ }
