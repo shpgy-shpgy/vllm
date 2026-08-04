@@ -68,22 +68,36 @@ def _trtllm_workspace_is_attached(workspace) -> bool:
 
 @functools.cache
 def has_validated_sm120_flashinfer() -> bool:
-    """Whether the imported FlashInfer is the locally validated SM120 build."""
+    """Whether the imported FlashInfer is the locally validated SM120 build.
+
+    Relaxed version policy: keep the strict on-disk content check for the
+    pinned 0.6.15.post1 build; trust newer 0.6.x versions (>= 0.6.16) that
+    are imported directly (e.g. local editable installs).
+    """
     if not fi_ar_available or flashinfer_package is None:
         return False
-    package_file = getattr(flashinfer_package, "__file__", None)
-    if package_file is None:
+    version = str(getattr(flashinfer_package, "__version__", ""))
+    if version == VALIDATED_FLASHINFER_VERSION:
+        package_file = getattr(flashinfer_package, "__file__", None)
+        if package_file is None:
+            return False
+        return is_validated_flashinfer_root(
+            Path(package_file).resolve().parent.parent
+        )
+    parts = version.split(".")
+    if len(parts) < 3 or parts[0] != "0" or parts[1] != "6":
         return False
-    return str(
-        getattr(flashinfer_package, "__version__", "")
-    ) == VALIDATED_FLASHINFER_VERSION and is_validated_flashinfer_root(
-        Path(package_file).resolve().parent.parent
-    )
+    try:
+        patch = int(parts[2].split("+")[0].split("post")[0].rstrip("."))
+    except ValueError:
+        return False
+    return patch >= 16
 
 
-def _is_sm120_device(device: int | str | torch.device | None = None) -> bool:
+def _local_device_index(device: int | str | torch.device | None) -> int | None:
+    """Normalize a device specifier to a CUDA device index, or None."""
     if not current_platform.is_cuda():
-        return False
+        return None
     device_id = 0
     if device is not None:
         try:
@@ -94,11 +108,50 @@ def _is_sm120_device(device: int | str | torch.device | None = None) -> bool:
                     device if isinstance(device, torch.device) else torch.device(device)
                 )
         except (RuntimeError, TypeError):
-            return False
+            return None
         if normalized_device.index is not None:
             device_id = normalized_device.index
+    return device_id
+
+
+def _is_sm120_device(device: int | str | torch.device | None = None) -> bool:
+    device_id = _local_device_index(device)
+    if device_id is None:
+        return False
     capability = current_platform.get_device_capability(device_id=device_id)
     return capability is not None and (capability.major, capability.minor) == (12, 0)
+
+
+def _tp_peers_have_p2p(
+    world_size: int,
+    device: int | str | torch.device | None = None,
+) -> bool:
+    """Whether this rank can P2P-access the memory of every other TP peer.
+
+    FlashInfer's fused allreduce (trtllm one-shot and mnnvl multicast) maps
+    peer GPU memory and is only functional when P2P is enabled between the
+    ranks. Consumer GPUs (e.g. RTX 5090) disable P2P, so this check gates
+    workspace creation that would otherwise fail deep inside FlashInfer.
+    """
+    local_idx = _local_device_index(device)
+    if local_idx is None or world_size < 2:
+        return False
+    try:
+        multi_node = get_node_count() > 1
+    except AssertionError:
+        # Distributed state not initialized yet; treat as single node.
+        multi_node = False
+    if multi_node:
+        return False
+    for peer in range(world_size):
+        if peer == local_idx:
+            continue
+        try:
+            if not torch.cuda.can_device_access_peer(local_idx, peer):
+                return False
+        except RuntimeError:
+            return False
+    return True
 
 
 def should_auto_enable_flashinfer_allreduce(
@@ -110,6 +163,7 @@ def should_auto_enable_flashinfer_allreduce(
         world_size == 2
         and _is_sm120_device(device)
         and has_validated_sm120_flashinfer()
+        and _tp_peers_have_p2p(world_size, device)
     )
     if enabled:
         logger.info_once(
@@ -256,6 +310,13 @@ def get_fi_ar_workspace(
             "'trtllm' backend. Please use 'mnnvl' backend instead."
         )
 
+    if get_node_count() == 1 and not _tp_peers_have_p2p(world_size, rank):
+        logger.warning_once(
+            "FlashInfer allreduce workspace not created: no GPU P2P between "
+            "the TP peers."
+        )
+        return None
+
     def _get_or_create(be: str):
         # Reuse the quant workspace if it was already created with the same backend
         if _fi_ar_quant_workspace is not None and _fi_ar_quant_workspace.backend == be:
@@ -314,6 +375,13 @@ def get_fi_ar_quant_workspace(
             "multi-node allreduce with 'trtllm' backend. Please use 'mnnvl' "
             "backend instead."
         )
+
+    if get_node_count() == 1 and not _tp_peers_have_p2p(world_size, rank):
+        logger.warning_once(
+            "FlashInfer allreduce workspace not created: no GPU P2P between "
+            "the TP peers."
+        )
+        return None
 
     # Reuse the non-quant workspace if it was already created with the same
     # backend.
@@ -435,6 +503,16 @@ class FlashInferAllReduce:
         self.rank = dist.get_rank(self.group)
         self.device = device
         if self.world_size == 1:
+            return
+
+        if get_node_count() == 1 and not _tp_peers_have_p2p(
+            self.world_size, self.device
+        ):
+            logger.warning_once(
+                "FlashInfer All Reduce is disabled: no GPU P2P between the TP "
+                "peers (trtllm/mnnvl allreduce fusion requires P2P peer memory "
+                "access)."
+            )
             return
 
         # Reuse upstream fusion thresholds except for the validated
