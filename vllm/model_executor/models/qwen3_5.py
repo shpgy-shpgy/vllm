@@ -311,6 +311,7 @@ class Qwen3_5ForCausalLMBase(
         if get_pp_group().is_last_rank:
             if config.tie_word_embeddings:
                 self.lm_head = self.model.embed_tokens
+                self.lm_head._is_tied_lm_head = True
             else:
                 self.lm_head = ParallelLMHead(
                     config.vocab_size,
@@ -367,6 +368,8 @@ class Qwen3_5ForCausalLMBase(
         temperature: float,
         presence_penalties: torch.Tensor | None = None,
         output_token_ids: torch.Tensor | None = None,
+        output_token_counts: torch.Tensor | None = None,
+        presence_request_indices: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         return self.logits_processor.get_topk_candidates(
             self.lm_head,
@@ -376,6 +379,8 @@ class Qwen3_5ForCausalLMBase(
             temperature=temperature,
             presence_penalties=presence_penalties,
             output_token_ids=output_token_ids,
+            output_token_counts=output_token_counts,
+            presence_request_indices=presence_request_indices,
         )
 
     def sample_topk_tokens(
@@ -386,6 +391,8 @@ class Qwen3_5ForCausalLMBase(
         temperature: float,
         presence_penalties: torch.Tensor | None = None,
         output_token_ids: torch.Tensor | None = None,
+        output_token_counts: torch.Tensor | None = None,
+        presence_request_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return self.logits_processor.sample_topk_tokens(
             self.lm_head,
@@ -395,6 +402,8 @@ class Qwen3_5ForCausalLMBase(
             temperature=temperature,
             presence_penalties=presence_penalties,
             output_token_ids=output_token_ids,
+            output_token_counts=output_token_counts,
+            presence_request_indices=presence_request_indices,
         )
 
     def sample_full_tokens(
@@ -565,6 +574,8 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
         temperature: float,
         presence_penalties: torch.Tensor | None = None,
         output_token_ids: torch.Tensor | None = None,
+        output_token_counts: torch.Tensor | None = None,
+        presence_request_indices: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         return self.language_model.get_topk_candidates(
             hidden_states,
@@ -573,6 +584,8 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
             temperature=temperature,
             presence_penalties=presence_penalties,
             output_token_ids=output_token_ids,
+            output_token_counts=output_token_counts,
+            presence_request_indices=presence_request_indices,
         )
 
     def sample_topk_tokens(
@@ -583,6 +596,8 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
         temperature: float,
         presence_penalties: torch.Tensor | None = None,
         output_token_ids: torch.Tensor | None = None,
+        output_token_counts: torch.Tensor | None = None,
+        presence_request_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return self.language_model.sample_topk_tokens(
             hidden_states,
@@ -591,6 +606,8 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
             temperature=temperature,
             presence_penalties=presence_penalties,
             output_token_ids=output_token_ids,
+            output_token_counts=output_token_counts,
+            presence_request_indices=presence_request_indices,
         )
 
     def sample_full_tokens(

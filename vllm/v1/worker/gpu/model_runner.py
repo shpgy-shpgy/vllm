@@ -1089,7 +1089,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
 
         if fast_path_params is not None and input_batch.num_draft_tokens == 0:
-            mode, top_k, top_p, temperature = fast_path_params
+            mode, top_k, top_p, temperature, presence_only = fast_path_params
             sampled = None
             if mode == "greedy" and hasattr(self.model, "get_top_tokens"):
                 logger.info_once(
@@ -1110,11 +1110,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     "Using V2 vocab-parallel compact top-k sampling fast path.",
                     scope="global",
                 )
+                if presence_only:
+                    (
+                        presence_penalties,
+                        output_token_counts,
+                        presence_request_indices,
+                    ) = self.sampler.get_vocab_parallel_presence_inputs(input_batch)
+                else:
+                    presence_penalties = None
+                    output_token_counts = None
+                    presence_request_indices = None
                 sampled = self.model.sample_topk_tokens(
                     sample_hidden_states,
                     top_k=top_k,
                     top_p=top_p,
                     temperature=temperature,
+                    presence_penalties=presence_penalties,
+                    output_token_counts=output_token_counts,
+                    presence_request_indices=presence_request_indices,
                 )
 
             if sampled is not None:
@@ -1130,6 +1143,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if (
             fast_path_params is not None
             and fast_path_params[0] == "topk"
+            and not fast_path_params[4]
             and input_batch.num_draft_tokens > 0
             and self.rejection_sampler is not None
             and self.speculator is not None
@@ -1138,7 +1152,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             and not self.rejection_sampler.use_block_verification
             and hasattr(self.model, "get_topk_candidates")
         ):
-            _, top_k, top_p, temperature = fast_path_params
+            _, top_k, top_p, temperature, _ = fast_path_params
             logger.info_once(
                 "Using V2 vocab-parallel compact top-k speculative sampling fast path.",
                 scope="global",

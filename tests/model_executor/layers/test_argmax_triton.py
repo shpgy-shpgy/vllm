@@ -4,7 +4,10 @@
 import pytest
 import torch
 
-from vllm.model_executor.layers.argmax_triton import local_argmax_triton
+from vllm.model_executor.layers.argmax_triton import (
+    indexed_argmax_triton,
+    local_argmax_triton,
+)
 
 
 @pytest.mark.parametrize(
@@ -35,3 +38,24 @@ def test_local_argmax_all_nan_row_stays_in_active_vocab(
     assert torch.isneginf(values).all()
     assert token_ids.item() == vocab_start
     assert token_ids.item() < vocab_start + active_vocab_size
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_indexed_argmax_uses_minimum_token_id_for_ties() -> None:
+    values = torch.tensor(
+        [[1.0, 3.0, 3.0, 2.0], [4.0, 4.0, 3.0, 2.0]],
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    token_ids = torch.tensor(
+        [[8, 7, 2, 1], [9, 4, 3, 2]],
+        dtype=torch.int64,
+        device="cuda",
+    )
+
+    max_values, max_token_ids = indexed_argmax_triton(
+        values, token_ids, index_offset=100
+    )
+
+    assert max_values.tolist() == [3.0, 4.0]
+    assert max_token_ids.tolist() == [102, 104]

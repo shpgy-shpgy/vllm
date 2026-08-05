@@ -71,7 +71,7 @@ class Sampler:
 
     def get_vocab_parallel_sampling_params(
         self, input_batch: InputBatch
-    ) -> tuple[str, int, float, float] | None:
+    ) -> tuple[str, int, float, float, bool] | None:
         """Return params for a semantics-preserving vocab-parallel fast path.
 
         The model-level helpers bypass the full-vocabulary logits gather and
@@ -83,10 +83,26 @@ class Sampler:
         if idx_mapping_np.size == 0 or self.compute_nans:
             return None
 
+        use_penalty = self.penalties_state.use_penalty[idx_mapping_np]
+        has_penalty = bool(np.any(use_penalty))
+        presence_only = False
+        if has_penalty:
+            repetition_penalties = self.penalties_state.repetition_penalty.np[
+                idx_mapping_np
+            ]
+            frequency_penalties = self.penalties_state.frequency_penalty.np[
+                idx_mapping_np
+            ]
+            presence_only = bool(
+                np.all(repetition_penalties == 1.0)
+                and np.all(frequency_penalties == 0.0)
+            )
+            if not presence_only:
+                return None
+
         if (
             self.sampling_states.max_num_logprobs(idx_mapping_np) != NO_LOGPROBS
             or self.logprob_token_ids_state.max_num_token_ids(idx_mapping_np) > 0
-            or np.any(self.penalties_state.use_penalty[idx_mapping_np])
             or np.any(self.logit_bias_state.use_logit_bias[idx_mapping_np])
             or np.any(self.bad_words_state.num_bad_words.np[idx_mapping_np] != 0)
         ):
@@ -106,10 +122,18 @@ class Sampler:
             and np.all(min_ps == 0.0)
         )
         if np.all(temperatures == 0.0):
-            if default_filters and not self.sampling_states.any_explicit_seed(
-                idx_mapping_np
+            if (
+                not presence_only
+                and default_filters
+                and not self.sampling_states.any_explicit_seed(idx_mapping_np)
             ):
-                return ("greedy", self.sampling_states.vocab_size, 1.0, 0.0)
+                return (
+                    "greedy",
+                    self.sampling_states.vocab_size,
+                    1.0,
+                    0.0,
+                    False,
+                )
             return None
 
         if (
@@ -123,7 +147,15 @@ class Sampler:
 
         temperature = float(temperatures[0])
         if default_filters:
-            return ("full", self.sampling_states.vocab_size, 1.0, temperature)
+            if presence_only:
+                return None
+            return (
+                "full",
+                self.sampling_states.vocab_size,
+                1.0,
+                temperature,
+                False,
+            )
 
         top_k = int(top_ks[0])
         top_p = float(top_ps[0])
@@ -136,7 +168,21 @@ class Sampler:
             or not np.all(top_ps == top_p)
         ):
             return None
-        return ("topk", top_k, top_p, temperature)
+        return ("topk", top_k, top_p, temperature, presence_only)
+
+    def get_vocab_parallel_presence_inputs(
+        self, input_batch: InputBatch
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return per-row penalties and V2's persistent output-token counts."""
+        request_indices = input_batch.idx_mapping
+        presence_penalties = self.penalties_state.presence_penalty.gpu.index_select(
+            0, request_indices.to(torch.int64)
+        )
+        return (
+            presence_penalties,
+            self.penalties_state.output_bin_counts,
+            request_indices,
+        )
 
     def make_sampler_output(
         self,

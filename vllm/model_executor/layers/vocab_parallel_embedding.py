@@ -63,6 +63,19 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
             from vllm.model_executor.layers.utils import dispatch_cpu_unquantized_gemm
 
             dispatch_cpu_unquantized_gemm(layer, remove_weight=False)
+        elif envs.VLLM_HYBRID_FP4_LM_HEAD and (
+            isinstance(layer, ParallelLMHead)
+            or getattr(layer, "_is_tied_lm_head", False)
+        ):
+            from vllm.model_executor.layers.hybrid_fp4_lm_head import (
+                prepare_hybrid_fp4_lm_head,
+            )
+
+            prepare_hybrid_fp4_lm_head(
+                layer,
+                candidates=envs.VLLM_HYBRID_FP4_LM_HEAD_CANDIDATES,
+                input_amax=envs.VLLM_HYBRID_FP4_LM_HEAD_INPUT_AMAX,
+            )
 
     def apply(
         self,
@@ -272,6 +285,7 @@ class VocabParallelEmbedding(PluggableLayer):
             self.tp_size,
         )
         self.embedding_dim = embedding_dim
+        self._is_tied_lm_head = False
 
         quant_method = None
         if quant_config is not None:

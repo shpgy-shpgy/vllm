@@ -17,8 +17,12 @@ from vllm.triton_utils import HAS_TRITON
 
 if HAS_TRITON:
     from vllm.model_executor.layers.argmax_triton import (
+        indexed_argmax_triton,
         local_argmax_triton,
         reduce_global_argmax_triton,
+    )
+    from vllm.model_executor.layers.presence_penalty_triton import (
+        apply_presence_penalty_from_counts,
     )
     from vllm.v1.sample.ops.topk_topp_triton import (
         pack_topk_pairs_triton,
@@ -27,12 +31,14 @@ if HAS_TRITON:
         select_compact_topk_pairs_triton,
     )
 else:
+    indexed_argmax_triton = None  # type: ignore[assignment]
     local_argmax_triton = None  # type: ignore[assignment]
     reduce_global_argmax_triton = None  # type: ignore[assignment]
     pack_topk_pairs_triton = None  # type: ignore[assignment]
     sample_from_compact_topk_pairs_triton = None  # type: ignore[assignment]
     sample_full_vocab_from_shard_triton = None  # type: ignore[assignment]
     select_compact_topk_pairs_triton = None  # type: ignore[assignment]
+    apply_presence_penalty_from_counts = None  # type: ignore[assignment]
 
 
 # --8<-- [start:logits_processor]
@@ -216,6 +222,22 @@ class LogitsProcessor(PluggableLayer):
         winner_ranks = pairs[..., 0].argmax(dim=-1, keepdim=True)
         return pairs[..., 1].to(torch.int64).gather(1, winner_ranks).view(-1)
 
+    def reduce_local_argmax(
+        self,
+        local_max_vals: torch.Tensor,
+        global_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Reduce TP-local winners using a pair-only all-gather."""
+        tp_size = get_tensor_model_parallel_world_size()
+        if tp_size == 1:
+            return global_indices
+
+        local_pair = torch.stack(
+            [local_max_vals.float(), global_indices.float()], dim=-1
+        )
+        gathered = tensor_model_parallel_all_gather(local_pair, dim=-1)
+        return self._reduce_global_argmax_pairs(gathered, tp_size)
+
     def get_top_tokens(
         self,
         lm_head: VocabParallelEmbedding,
@@ -228,16 +250,76 @@ class LogitsProcessor(PluggableLayer):
         are gathered and reduced. Communication: O(batch * 2 * tp_size) vs
         O(batch * vocab_size).
         """
-        tp_size = get_tensor_model_parallel_world_size()
-
-        logits = lm_head.quant_method.apply(lm_head, hidden_states, bias=embedding_bias)
         shard_indices = lm_head.shard_indices
         num_pad = shard_indices.num_org_vocab_padding
-        active_vocab_size = logits.shape[-1] - num_pad
+        local_vocab_size = getattr(
+            shard_indices,
+            "num_elements_padded",
+            lm_head.num_embeddings_per_partition,
+        )
+        active_vocab_size = local_vocab_size - num_pad
         vocab_start = shard_indices.org_vocab_start_index
         shard_token_ids = None
         if not self._is_contiguous_org_shard(lm_head):
-            shard_token_ids = self._get_shard_token_ids(lm_head, logits.device)
+            shard_token_ids = self._get_shard_token_ids(lm_head, hidden_states.device)
+            active_vocab_size = local_vocab_size
+
+        hybrid_state = getattr(lm_head, "_hybrid_fp4_lm_head_state", None)
+        if (
+            hybrid_state is not None
+            and shard_token_ids is None
+            and self.soft_cap is None
+            and self.scale > 0.0
+            and hybrid_state.can_use(
+                hidden_states,
+                bf16_weight=lm_head.weight,
+                active_vocab_size=active_vocab_size,
+                top_k=1,
+            )
+        ):
+            coarse_logits = hybrid_state.coarse_logits(
+                hidden_states,
+                embedding_bias,
+            )
+            self._mask_invalid_shard_logits(
+                coarse_logits,
+                None,
+                active_vocab_size,
+            )
+            candidate_indices = hybrid_state.select_candidates(coarse_logits)
+            exact_logits = hybrid_state.refine_logits(
+                hidden_states,
+                lm_head.weight,
+                candidate_indices,
+                embedding_bias,
+            )
+            if (
+                indexed_argmax_triton is not None
+                and exact_logits.is_cuda
+                and 0 < exact_logits.shape[-1] <= 1024
+            ):
+                local_max_vals, global_indices = indexed_argmax_triton(
+                    exact_logits,
+                    candidate_indices,
+                    index_offset=vocab_start,
+                )
+            else:
+                local_max_vals = exact_logits.max(dim=-1).values
+                local_max_indices = (
+                    candidate_indices.masked_fill(
+                        exact_logits != local_max_vals.unsqueeze(-1),
+                        lm_head.weight.shape[0],
+                    )
+                    .min(dim=-1)
+                    .values
+                )
+                global_indices = local_max_indices.to(torch.int32) + vocab_start
+
+            return self.reduce_local_argmax(local_max_vals, global_indices)
+
+        logits = lm_head.quant_method.apply(lm_head, hidden_states, bias=embedding_bias)
+        active_vocab_size = logits.shape[-1] - num_pad
+        if shard_token_ids is not None:
             active_vocab_size = logits.shape[-1]
 
         if (
@@ -269,17 +351,7 @@ class LogitsProcessor(PluggableLayer):
                 shard_token_ids=shard_token_ids,
             )
 
-        if tp_size == 1:
-            return global_indices
-
-        # All-gather (value, index) pairs, then reduce to global argmax.
-        # Use float32 to avoid bf16 precision loss on large vocab indices.
-        local_pair = torch.stack(
-            [local_max_vals.float(), global_indices.float()], dim=-1
-        )
-        # [batch, 2] -> [batch, 2 * tp_size]
-        gathered = tensor_model_parallel_all_gather(local_pair, dim=-1)
-        return self._reduce_global_argmax_pairs(gathered, tp_size)
+        return self.reduce_local_argmax(local_max_vals, global_indices)
 
     def _get_full_vocab_sample_seeds(
         self, batch_size: int, device: torch.device
@@ -423,6 +495,8 @@ class LogitsProcessor(PluggableLayer):
         temperature: float,
         presence_penalties: torch.Tensor | None = None,
         output_token_ids: torch.Tensor | None = None,
+        output_token_counts: torch.Tensor | None = None,
+        presence_request_indices: torch.Tensor | None = None,
         embedding_bias: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return global compact top-k/top-p candidates without full all-gather.
@@ -436,35 +510,20 @@ class LogitsProcessor(PluggableLayer):
             raise ValueError(
                 f"get_topk_candidates requires positive temperature; got {temperature}"
             )
-        logits = lm_head.quant_method.apply(lm_head, hidden_states, bias=embedding_bias)
-        logits = logits.to(torch.float32)
-        if self.soft_cap is not None:
-            logits = torch.tanh(logits / self.soft_cap) * self.soft_cap
-        if self.scale != 1.0:
-            logits = logits * self.scale
-
-        shard_indices = lm_head.shard_indices
-        vocab_start = shard_indices.org_vocab_start_index
-        active_vocab_size = logits.shape[-1] - shard_indices.num_org_vocab_padding
-        shard_token_ids = None
-        if not self._is_contiguous_org_shard(lm_head):
-            shard_token_ids = self._get_shard_token_ids(lm_head, logits.device)
-            active_vocab_size = logits.shape[-1]
-        if presence_penalties is not None:
-            assert output_token_ids is not None
-            self._apply_sharded_presence_penalty(
-                logits,
-                presence_penalties,
-                output_token_ids,
-                shard_indices=shard_indices,
-            )
-        if temperature != 1.0:
-            logits = logits / temperature
-        self._mask_invalid_shard_logits(logits, shard_token_ids, active_vocab_size)
-
-        local_top_k = min(top_k, active_vocab_size)
+        local_vals, local_indices, vocab_start, shard_token_ids = self._get_local_topk(
+            lm_head,
+            hidden_states,
+            top_k=top_k,
+            temperature=temperature,
+            presence_penalties=presence_penalties,
+            output_token_ids=output_token_ids,
+            output_token_counts=output_token_counts,
+            presence_request_indices=presence_request_indices,
+            embedding_bias=embedding_bias,
+        )
+        local_top_k = local_vals.shape[-1]
+        batch_size = hidden_states.shape[0]
         tp_size = get_tensor_model_parallel_world_size()
-        local_vals, local_indices = torch.topk(logits, local_top_k, dim=-1)
         local_pairs = self._pack_topk_pairs(
             local_vals,
             local_indices,
@@ -472,16 +531,165 @@ class LogitsProcessor(PluggableLayer):
             shard_token_ids=shard_token_ids,
         )
         if tp_size == 1:
-            gathered_pairs = local_pairs.view(logits.shape[0], local_top_k, 2)
+            gathered_pairs = local_pairs.view(batch_size, local_top_k, 2)
         else:
             gathered_pairs = tensor_model_parallel_all_gather(local_pairs, dim=-1)
-            gathered_pairs = gathered_pairs.view(
-                logits.shape[0], tp_size * local_top_k, 2
-            )
+            gathered_pairs = gathered_pairs.view(batch_size, tp_size * local_top_k, 2)
 
         return self._select_from_compact_topk_pairs(
             gathered_pairs, top_k=top_k, top_p=top_p
         )
+
+    def _get_local_topk(
+        self,
+        lm_head: VocabParallelEmbedding,
+        hidden_states: torch.Tensor,
+        *,
+        top_k: int,
+        temperature: float,
+        presence_penalties: torch.Tensor | None = None,
+        output_token_ids: torch.Tensor | None = None,
+        output_token_counts: torch.Tensor | None = None,
+        presence_request_indices: torch.Tensor | None = None,
+        embedding_bias: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, int, torch.Tensor | None]:
+        """Compute a processed local top-k, using hybrid NVFP4 when eligible."""
+        shard_indices = lm_head.shard_indices
+        vocab_start = shard_indices.org_vocab_start_index
+        local_vocab_size = getattr(
+            shard_indices,
+            "num_elements_padded",
+            lm_head.num_embeddings_per_partition,
+        )
+        active_vocab_size = local_vocab_size - shard_indices.num_org_vocab_padding
+        shard_token_ids = None
+        if not self._is_contiguous_org_shard(lm_head):
+            shard_token_ids = self._get_shard_token_ids(lm_head, hidden_states.device)
+            active_vocab_size = local_vocab_size
+
+        local_top_k = min(top_k, active_vocab_size)
+        hybrid_state = getattr(lm_head, "_hybrid_fp4_lm_head_state", None)
+        if (
+            hybrid_state is not None
+            and shard_token_ids is None
+            and hybrid_state.can_use(
+                hidden_states,
+                bf16_weight=lm_head.weight,
+                active_vocab_size=active_vocab_size,
+                top_k=local_top_k,
+            )
+        ):
+            coarse_logits = hybrid_state.coarse_logits(
+                hidden_states,
+                embedding_bias,
+            ).to(torch.float32)
+            if self.soft_cap is not None:
+                coarse_logits = (
+                    torch.tanh(coarse_logits / self.soft_cap) * self.soft_cap
+                )
+            if self.scale != 1.0:
+                coarse_logits = coarse_logits * self.scale
+
+            penalty_mask = None
+            if presence_penalties is not None:
+                if output_token_counts is not None:
+                    assert presence_request_indices is not None
+                    self._apply_sharded_presence_penalty_from_counts(
+                        coarse_logits,
+                        presence_penalties,
+                        output_token_counts,
+                        presence_request_indices,
+                        shard_indices=shard_indices,
+                    )
+                else:
+                    assert output_token_ids is not None
+                    penalty_mask = self._get_sharded_presence_penalty_mask(
+                        coarse_logits,
+                        presence_penalties,
+                        output_token_ids,
+                        shard_indices=shard_indices,
+                    )
+                    if penalty_mask is not None:
+                        coarse_logits.sub_(penalty_mask)
+            if temperature != 1.0:
+                coarse_logits = coarse_logits / temperature
+            self._mask_invalid_shard_logits(
+                coarse_logits,
+                None,
+                active_vocab_size,
+            )
+            candidate_indices = hybrid_state.select_candidates(coarse_logits)
+
+            exact_logits = hybrid_state.refine_logits(
+                hidden_states,
+                lm_head.weight,
+                candidate_indices,
+                embedding_bias,
+            ).to(torch.float32)
+            if self.soft_cap is not None:
+                exact_logits = torch.tanh(exact_logits / self.soft_cap) * self.soft_cap
+            if self.scale != 1.0:
+                exact_logits = exact_logits * self.scale
+            if penalty_mask is not None:
+                exact_logits.sub_(penalty_mask.gather(1, candidate_indices))
+            elif presence_penalties is not None and output_token_counts is not None:
+                assert presence_request_indices is not None
+                self._apply_sharded_presence_penalty_from_counts(
+                    exact_logits,
+                    presence_penalties,
+                    output_token_counts,
+                    presence_request_indices,
+                    shard_indices=shard_indices,
+                    local_token_ids=candidate_indices,
+                )
+            if temperature != 1.0:
+                exact_logits = exact_logits / temperature
+
+            local_vals, candidate_positions = torch.topk(
+                exact_logits,
+                local_top_k,
+                dim=-1,
+            )
+            local_indices = candidate_indices.gather(1, candidate_positions)
+
+            return local_vals, local_indices, vocab_start, None
+
+        logits = lm_head.quant_method.apply(
+            lm_head,
+            hidden_states,
+            bias=embedding_bias,
+        ).to(torch.float32)
+        active_vocab_size = logits.shape[-1] - shard_indices.num_org_vocab_padding
+        if shard_token_ids is not None:
+            active_vocab_size = logits.shape[-1]
+        if self.soft_cap is not None:
+            logits = torch.tanh(logits / self.soft_cap) * self.soft_cap
+        if self.scale != 1.0:
+            logits = logits * self.scale
+        if presence_penalties is not None:
+            if output_token_counts is not None:
+                assert presence_request_indices is not None
+                self._apply_sharded_presence_penalty_from_counts(
+                    logits,
+                    presence_penalties,
+                    output_token_counts,
+                    presence_request_indices,
+                    shard_indices=shard_indices,
+                )
+            else:
+                assert output_token_ids is not None
+                self._apply_sharded_presence_penalty(
+                    logits,
+                    presence_penalties,
+                    output_token_ids,
+                    shard_indices=shard_indices,
+                )
+        if temperature != 1.0:
+            logits = logits / temperature
+        self._mask_invalid_shard_logits(logits, shard_token_ids, active_vocab_size)
+        local_top_k = min(top_k, active_vocab_size)
+        local_vals, local_indices = torch.topk(logits, local_top_k, dim=-1)
+        return local_vals, local_indices, vocab_start, shard_token_ids
 
     def _pack_topk_pairs(
         self,
@@ -599,6 +807,8 @@ class LogitsProcessor(PluggableLayer):
         temperature: float,
         presence_penalties: torch.Tensor | None = None,
         output_token_ids: torch.Tensor | None = None,
+        output_token_counts: torch.Tensor | None = None,
+        presence_request_indices: torch.Tensor | None = None,
         embedding_bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Vocab-parallel random sampling for small uniform top-k batches.
@@ -614,36 +824,20 @@ class LogitsProcessor(PluggableLayer):
             raise ValueError(
                 f"sample_topk_tokens requires positive temperature; got {temperature}"
             )
-        logits = lm_head.quant_method.apply(lm_head, hidden_states, bias=embedding_bias)
-        logits = logits.to(torch.float32)
-        if self.soft_cap is not None:
-            logits = torch.tanh(logits / self.soft_cap) * self.soft_cap
-        if self.scale != 1.0:
-            logits = logits * self.scale
-
-        shard_indices = lm_head.shard_indices
-        vocab_start = shard_indices.org_vocab_start_index
-        active_vocab_size = logits.shape[-1] - shard_indices.num_org_vocab_padding
-        shard_token_ids = None
-        if not self._is_contiguous_org_shard(lm_head):
-            shard_token_ids = self._get_shard_token_ids(lm_head, logits.device)
-            active_vocab_size = logits.shape[-1]
-        if presence_penalties is not None:
-            assert output_token_ids is not None
-            self._apply_sharded_presence_penalty(
-                logits,
-                presence_penalties,
-                output_token_ids,
-                shard_indices=shard_indices,
-            )
-        if temperature != 1.0:
-            logits = logits / temperature
-
-        self._mask_invalid_shard_logits(logits, shard_token_ids, active_vocab_size)
-
-        local_top_k = min(top_k, active_vocab_size)
+        local_vals, local_indices, vocab_start, shard_token_ids = self._get_local_topk(
+            lm_head,
+            hidden_states,
+            top_k=top_k,
+            temperature=temperature,
+            presence_penalties=presence_penalties,
+            output_token_ids=output_token_ids,
+            output_token_counts=output_token_counts,
+            presence_request_indices=presence_request_indices,
+            embedding_bias=embedding_bias,
+        )
+        local_top_k = local_vals.shape[-1]
+        batch_size = hidden_states.shape[0]
         tp_size = get_tensor_model_parallel_world_size()
-        local_vals, local_indices = torch.topk(logits, local_top_k, dim=-1)
         local_pairs = self._pack_topk_pairs(
             local_vals,
             local_indices,
@@ -651,7 +845,7 @@ class LogitsProcessor(PluggableLayer):
             shard_token_ids=shard_token_ids,
         )
         if tp_size == 1:
-            gathered_pairs = local_pairs.view(logits.shape[0], local_top_k, 2)
+            gathered_pairs = local_pairs.view(batch_size, local_top_k, 2)
             return self._sample_from_compact_topk_pairs(
                 gathered_pairs, top_k=top_k, top_p=top_p
             )
@@ -660,9 +854,7 @@ class LogitsProcessor(PluggableLayer):
         gathered_pairs = tensor_model_parallel_gather(local_pairs, dst=0, dim=-1)
         if tp_group.rank_in_group == 0:
             assert gathered_pairs is not None
-            gathered_pairs = gathered_pairs.view(
-                logits.shape[0], tp_size * local_top_k, 2
-            )
+            gathered_pairs = gathered_pairs.view(batch_size, tp_size * local_top_k, 2)
             sampled = self._sample_from_compact_topk_pairs(
                 gathered_pairs, top_k=top_k, top_p=top_p
             )
@@ -677,32 +869,115 @@ class LogitsProcessor(PluggableLayer):
                 and top_k <= 64
                 and top_k <= total_top_k <= 1024
             ):
-                self._get_compact_topk_sample_seeds(logits.shape[0], logits.device)
+                self._get_compact_topk_sample_seeds(batch_size, hidden_states.device)
             else:
                 q = torch.empty(
-                    (logits.shape[0], top_k),
+                    (batch_size, top_k),
                     dtype=torch.float32,
-                    device=logits.device,
+                    device=hidden_states.device,
                 )
                 q.exponential_()
             sampled = torch.empty(
-                (logits.shape[0],), dtype=torch.int64, device=logits.device
+                (batch_size,), dtype=torch.int64, device=hidden_states.device
             )
 
         tp_group.broadcast(sampled, src=0)
         return sampled
 
     @staticmethod
-    def _apply_sharded_presence_penalty(
+    def _apply_sharded_presence_penalty_from_counts(
+        logits: torch.Tensor,
+        presence_penalties: torch.Tensor,
+        output_token_counts: torch.Tensor,
+        presence_request_indices: torch.Tensor,
+        *,
+        shard_indices,
+        local_token_ids: torch.Tensor | None = None,
+    ) -> None:
+        """Apply V2's persistent output-token counts directly to local logits."""
+        num_org_elements = getattr(
+            shard_indices,
+            "num_org_elements",
+            logits.shape[-1] - shard_indices.num_org_vocab_padding,
+        )
+        num_org_elements_padded = getattr(
+            shard_indices,
+            "num_org_elements_padded",
+            num_org_elements + shard_indices.num_org_vocab_padding,
+        )
+        added_vocab_start = getattr(
+            shard_indices,
+            "added_vocab_start_index",
+            shard_indices.org_vocab_end_index,
+        )
+        num_added_elements = getattr(shard_indices, "num_added_elements", 0)
+
+        if (
+            HAS_TRITON
+            and apply_presence_penalty_from_counts is not None
+            and current_platform.is_cuda()
+            and logits.is_cuda
+            and output_token_counts.is_cuda
+            and presence_request_indices.is_cuda
+            and presence_penalties.is_cuda
+            and (local_token_ids is None or local_token_ids.is_cuda)
+        ):
+            apply_presence_penalty_from_counts(
+                logits,
+                output_token_counts,
+                presence_request_indices,
+                presence_penalties,
+                org_vocab_start=shard_indices.org_vocab_start_index,
+                num_org_elements=num_org_elements,
+                num_org_elements_padded=num_org_elements_padded,
+                added_vocab_start=added_vocab_start,
+                num_added_elements=num_added_elements,
+                local_token_ids=local_token_ids,
+            )
+            return
+
+        if output_token_counts.ndim != 2:
+            raise ValueError("output_token_counts must be rank 2")
+        if presence_request_indices.shape != (logits.shape[0],):
+            raise ValueError("presence_request_indices must have one entry per row")
+        if presence_penalties.shape != (logits.shape[0],):
+            raise ValueError("presence_penalties must have one entry per row")
+        if local_token_ids is not None and local_token_ids.shape != logits.shape:
+            raise ValueError("local_token_ids must match logits")
+
+        if local_token_ids is None:
+            local_ids = torch.arange(
+                logits.shape[-1], dtype=torch.int64, device=logits.device
+            ).expand_as(logits)
+        else:
+            local_ids = local_token_ids.to(torch.int64)
+        is_org = local_ids < num_org_elements
+        added_offsets = local_ids - num_org_elements_padded
+        is_added = (added_offsets >= 0) & (added_offsets < num_added_elements)
+        global_ids = torch.where(
+            is_org,
+            local_ids + shard_indices.org_vocab_start_index,
+            added_offsets + added_vocab_start,
+        )
+        valid = (is_org | is_added) & (global_ids >= 0)
+        valid &= global_ids < output_token_counts.shape[-1]
+        safe_ids = global_ids.clamp(0, output_token_counts.shape[-1] - 1)
+        request_indices = presence_request_indices.to(torch.int64).unsqueeze(1)
+        counts = output_token_counts[request_indices, safe_ids]
+        penalty = presence_penalties.to(logits.dtype).unsqueeze(1)
+        logits.sub_(torch.where(valid & (counts > 0), penalty, 0.0))
+
+    @staticmethod
+    def _get_sharded_presence_penalty_mask(
         logits: torch.Tensor,
         presence_penalties: torch.Tensor,
         output_token_ids: torch.Tensor,
         *,
         shard_indices,
-    ) -> None:
-        """Apply presence-only penalty to a vocab-parallel logits shard."""
+    ) -> torch.Tensor | None:
+        """Build the local dense presence mask used before and after refine."""
         if output_token_ids.numel() == 0:
-            return
+            return None
 
         num_org_padding = shard_indices.num_org_vocab_padding
         org_start = shard_indices.org_vocab_start_index
@@ -740,7 +1015,26 @@ class LogitsProcessor(PluggableLayer):
             device=logits.device,
         )
         penalty_mask.scatter_(1, local_token_ids, penalty_values)
-        logits.sub_(penalty_mask[:, : logits.shape[1]])
+        return penalty_mask[:, : logits.shape[1]]
+
+    @classmethod
+    def _apply_sharded_presence_penalty(
+        cls,
+        logits: torch.Tensor,
+        presence_penalties: torch.Tensor,
+        output_token_ids: torch.Tensor,
+        *,
+        shard_indices,
+    ) -> None:
+        """Apply presence-only penalty to a vocab-parallel logits shard."""
+        penalty_mask = cls._get_sharded_presence_penalty_mask(
+            logits,
+            presence_penalties,
+            output_token_ids,
+            shard_indices=shard_indices,
+        )
+        if penalty_mask is not None:
+            logits.sub_(penalty_mask)
 
     def extra_repr(self) -> str:
         s = f"vocab_size={self.vocab_size}"

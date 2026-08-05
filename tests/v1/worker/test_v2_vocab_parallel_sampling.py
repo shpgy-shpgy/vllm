@@ -23,6 +23,7 @@ def _make_fast_path_sampler(
     num_logprobs: int = NO_LOGPROBS,
     num_logprob_token_ids: int = 0,
     use_penalty: bool = False,
+    presence_only_penalty: bool = False,
     use_logit_bias: bool = False,
     num_bad_words: int = 0,
     explicit_seed: bool = False,
@@ -43,8 +44,20 @@ def _make_fast_path_sampler(
     sampler.compute_nans = False
     sampler.use_fp64_gumbel = use_fp64_gumbel
     sampler.sampling_states = sampling_states
+    any_penalty = use_penalty or presence_only_penalty
     sampler.penalties_state = SimpleNamespace(
-        use_penalty=np.full(num_reqs, use_penalty, dtype=np.bool_)
+        use_penalty=np.full(num_reqs, any_penalty, dtype=np.bool_),
+        repetition_penalty=SimpleNamespace(np=np.ones(num_reqs, dtype=np.float32)),
+        frequency_penalty=SimpleNamespace(
+            np=np.full(num_reqs, 0.1 if use_penalty else 0.0, dtype=np.float32)
+        ),
+        presence_penalty=SimpleNamespace(
+            np=np.full(
+                num_reqs,
+                0.1 if presence_only_penalty else 0.0,
+                dtype=np.float32,
+            )
+        ),
     )
     sampler.logit_bias_state = SimpleNamespace(
         use_logit_bias=np.full(num_reqs, use_logit_bias, dtype=np.bool_)
@@ -80,6 +93,26 @@ def test_vocab_parallel_sampling_modes(
     )
     params = sampler.get_vocab_parallel_sampling_params(input_batch)
     assert (params[0] if params is not None else None) == expected_mode
+
+
+def test_vocab_parallel_topk_supports_presence_only_penalty() -> None:
+    sampler, input_batch = _make_fast_path_sampler(
+        [0.7], top_k=20, top_p=0.9, presence_only_penalty=True
+    )
+    params = sampler.get_vocab_parallel_sampling_params(input_batch)
+    assert params is not None
+    assert params[0] == "topk"
+    assert params[4]
+
+
+@pytest.mark.parametrize("temperature", [0.0, 1.0])
+def test_vocab_parallel_non_topk_falls_back_for_presence_penalty(
+    temperature: float,
+) -> None:
+    sampler, input_batch = _make_fast_path_sampler(
+        [temperature], presence_only_penalty=True
+    )
+    assert sampler.get_vocab_parallel_sampling_params(input_batch) is None
 
 
 @pytest.mark.parametrize(

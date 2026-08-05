@@ -11,6 +11,7 @@ from vllm.v1.worker.gpu.spec_decode.autoregressive import speculator as spec_mod
 from vllm.v1.worker.gpu.spec_decode.autoregressive.speculator import (
     AutoRegressiveSpeculator,
 )
+from vllm.v1.worker.gpu.spec_decode.eagle import utils as eagle_utils
 
 
 class _TestSpeculator(AutoRegressiveSpeculator):
@@ -80,3 +81,61 @@ def test_run_model_reuses_tensor_return_for_mtp(monkeypatch):
 
     assert actual_logits_hidden is hidden
     assert actual_feedback_hidden is hidden
+
+
+def test_eagle_loader_shares_inner_language_model_lm_head(monkeypatch):
+    target_language_model = torch.nn.Module()
+    target_language_model.model = torch.nn.Module()
+    target_language_model.model.embed_tokens = torch.nn.Module()
+    target_language_model.lm_head = torch.nn.Module()
+
+    class _TargetWrapper(torch.nn.Module):
+        def get_language_model(self):
+            return target_language_model
+
+    draft_model = torch.nn.Module()
+    draft_model.model = torch.nn.Module()
+    draft_model.model.embed_tokens = torch.nn.Module()
+    draft_model.lm_head = torch.nn.Module()
+    old_draft_lm_head = draft_model.lm_head
+    old_draft_lm_head.register_buffer(
+        "_hybrid_fp4_lm_head_weight",
+        torch.empty((8, 2), dtype=torch.uint8),
+        persistent=False,
+    )
+    old_draft_lm_head.register_buffer(
+        "_hybrid_fp4_lm_head_scale",
+        torch.empty((128, 4), dtype=torch.float8_e4m3fn),
+        persistent=False,
+    )
+    old_draft_lm_head.register_buffer(
+        "_hybrid_fp4_lm_head_input_scale",
+        torch.empty((), dtype=torch.float32),
+        persistent=False,
+    )
+    old_draft_lm_head.register_buffer(
+        "_hybrid_fp4_lm_head_alpha",
+        torch.empty((), dtype=torch.float32),
+        persistent=False,
+    )
+    old_draft_lm_head._hybrid_fp4_lm_head_state = object()
+
+    monkeypatch.setattr(eagle_utils, "get_model", lambda **kwargs: draft_model)
+    monkeypatch.setattr(
+        eagle_utils,
+        "get_pp_group",
+        lambda: SimpleNamespace(world_size=1),
+    )
+    vllm_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(draft_model_config=object())
+    )
+
+    loaded = eagle_utils.load_eagle_model(_TargetWrapper(), vllm_config)
+
+    assert loaded.lm_head is target_language_model.lm_head
+    assert loaded.model.embed_tokens is target_language_model.model.embed_tokens
+    assert not hasattr(old_draft_lm_head, "_hybrid_fp4_lm_head_state")
+    assert not hasattr(old_draft_lm_head, "_hybrid_fp4_lm_head_weight")
+    assert not hasattr(old_draft_lm_head, "_hybrid_fp4_lm_head_scale")
+    assert not hasattr(old_draft_lm_head, "_hybrid_fp4_lm_head_input_scale")
+    assert not hasattr(old_draft_lm_head, "_hybrid_fp4_lm_head_alpha")

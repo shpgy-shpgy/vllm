@@ -64,12 +64,22 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
                 del draft_inner.embed_tokens
             draft_inner.embed_tokens = target_embed
 
-    target_lm_head = getattr(target_model, "lm_head", None)
+    target_lm_head = getattr(target_language_model, "lm_head", None)
     draft_lm_head = getattr(eagle_model, "lm_head", None)
     if target_lm_head is not None and _should_share(
         eagle_model, "has_own_lm_head", draft_lm_head, target_lm_head
     ):
         if draft_lm_head is not None:
+            # Model loading may already have prepared an NVFP4 copy on the draft
+            # head.  Drop it before replacing the draft head so references held
+            # by loader wrappers cannot retain a vocabulary-sized allocation.
+            # Keep the import off the normal path when the feature is disabled.
+            if hasattr(draft_lm_head, "_hybrid_fp4_lm_head_state"):
+                from vllm.model_executor.layers.hybrid_fp4_lm_head import (
+                    release_hybrid_fp4_lm_head,
+                )
+
+                release_hybrid_fp4_lm_head(draft_lm_head)
             del eagle_model.lm_head
         eagle_model.lm_head = target_lm_head
 

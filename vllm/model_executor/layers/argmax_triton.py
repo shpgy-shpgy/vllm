@@ -90,6 +90,38 @@ def _global_pair_argmax_kernel(
     tl.store(OUT_INDICES + row, token_id)
 
 
+@triton.jit
+def _indexed_argmax_kernel(
+    VALUES,
+    TOKEN_IDS,
+    OUT_VALUES,
+    OUT_TOKEN_IDS,
+    VALUE_STRIDE_0: tl.constexpr,
+    TOKEN_STRIDE_0: tl.constexpr,
+    NUM_CANDIDATES: tl.constexpr,
+    BLOCK_CANDIDATES: tl.constexpr,
+    INDEX_OFFSET: tl.constexpr,
+):
+    row = tl.program_id(0)
+    lane = tl.arange(0, BLOCK_CANDIDATES)
+    mask = lane < NUM_CANDIDATES
+    values = tl.load(
+        VALUES + row * VALUE_STRIDE_0 + lane,
+        mask=mask,
+        other=-float("inf"),
+    ).to(tl.float32)
+    token_ids = tl.load(
+        TOKEN_IDS + row * TOKEN_STRIDE_0 + lane,
+        mask=mask,
+        other=0x7FFFFFFF,
+    ).to(tl.int32)
+    values = tl.where(values == values, values, -float("inf"))
+    max_value = tl.max(values, axis=0)
+    min_token_id = tl.min(tl.where(values == max_value, token_ids, 0x7FFFFFFF), axis=0)
+    tl.store(OUT_VALUES + row, max_value)
+    tl.store(OUT_TOKEN_IDS + row, min_token_id + INDEX_OFFSET)
+
+
 def local_argmax_triton(
     logits: torch.Tensor,
     *,
@@ -136,6 +168,39 @@ def local_argmax_triton(
         BLOCK_NUM_BLOCKS=block_num_blocks,
     )
     return out_values, out_indices
+
+
+def indexed_argmax_triton(
+    values: torch.Tensor,
+    token_ids: torch.Tensor,
+    *,
+    index_offset: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reduce compact values with exact minimum-token-id tie breaking."""
+    assert values.ndim == 2
+    assert values.is_cuda
+    assert values.shape == token_ids.shape
+    assert 0 < values.shape[1] <= 1024
+    if not values.is_contiguous():
+        values = values.contiguous()
+    if not token_ids.is_contiguous():
+        token_ids = token_ids.contiguous()
+
+    batch_size, num_candidates = values.shape
+    out_values = torch.empty((batch_size,), device=values.device, dtype=torch.float32)
+    out_token_ids = torch.empty((batch_size,), device=values.device, dtype=torch.int32)
+    _indexed_argmax_kernel[(batch_size,)](
+        values,
+        token_ids,
+        out_values,
+        out_token_ids,
+        VALUE_STRIDE_0=values.stride(0),
+        TOKEN_STRIDE_0=token_ids.stride(0),
+        NUM_CANDIDATES=num_candidates,
+        BLOCK_CANDIDATES=next_power_of_2(num_candidates),
+        INDEX_OFFSET=index_offset,
+    )
+    return out_values, out_token_ids
 
 
 def reduce_global_argmax_triton(
