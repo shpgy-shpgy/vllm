@@ -8,7 +8,9 @@ import numpy as np
 import pytest
 import torch
 
+import vllm.envs as envs
 from vllm.platforms import current_platform
+from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
@@ -195,6 +197,174 @@ def test_compact_rejection_sampler(
     output = rejection_sampler.sample_from_topk_candidates(
         candidate_logits,
         torch.tensor(candidate_ids, dtype=torch.int64, device=device),
+        input_batch,
+    )
+    torch.accelerator.synchronize()
+
+    assert output.sampled_token_ids.tolist() == expected_tokens
+    assert output.num_sampled.tolist() == expected_sampled
+    assert output.num_rejected.tolist() == expected_rejected
+
+
+def test_greedy_speculative_sampling_uses_compact_tokens(monkeypatch) -> None:
+    monkeypatch.setattr(envs, "VLLM_HYBRID_MXFP8_LM_HEAD", True)
+    runner = object.__new__(GPUModelRunner)
+    runner.sampler = SimpleNamespace(
+        get_vocab_parallel_sampling_params=lambda _: (
+            "greedy",
+            100,
+            1.0,
+            0.0,
+            False,
+        )
+    )
+
+    captured: dict[str, Any] = {}
+
+    def get_top_tokens(hidden_states: torch.Tensor):
+        captured["hidden_states"] = hidden_states
+        return torch.tensor([11, 12, 13])
+
+    runner.model = SimpleNamespace(get_top_tokens=get_top_tokens)
+    expected_output = SimpleNamespace(num_sampled="sampled", num_rejected="rejected")
+
+    def sample_from_greedy_tokens(token_ids, input_batch):
+        captured["target_token_ids"] = token_ids
+        captured["input_batch"] = input_batch
+        return expected_output
+
+    runner.rejection_sampler = SimpleNamespace(
+        synthetic_conditional_rates=None,
+        use_block_verification=False,
+        sample_from_greedy_tokens=sample_from_greedy_tokens,
+    )
+    runner.speculator = SimpleNamespace(draft_logits=None)
+    input_batch = SimpleNamespace(
+        logits_indices=torch.tensor([0, 1, 2]),
+        has_structured_output_reqs=False,
+        num_draft_tokens=2,
+    )
+    hidden_states = torch.randn((3, 4))
+
+    output, num_sampled, num_rejected = GPUModelRunner.sample(
+        runner,
+        hidden_states,
+        input_batch,
+        grammar_output=None,
+    )
+
+    assert output is expected_output
+    assert num_sampled == "sampled"
+    assert num_rejected == "rejected"
+    assert torch.equal(captured["hidden_states"], hidden_states)
+    assert captured["target_token_ids"].tolist() == [11, 12, 13]
+    assert captured["input_batch"] is input_batch
+
+
+def test_greedy_speculative_sampling_keeps_bf16_route(monkeypatch) -> None:
+    monkeypatch.setattr(envs, "VLLM_HYBRID_MXFP8_LM_HEAD", False)
+    runner = object.__new__(GPUModelRunner)
+    runner.sampler = SimpleNamespace(
+        get_vocab_parallel_sampling_params=lambda _: (
+            "greedy",
+            100,
+            1.0,
+            0.0,
+            False,
+        )
+    )
+
+    captured: dict[str, Any] = {}
+    logits = torch.randn((3, 8))
+
+    def get_top_tokens(_hidden_states: torch.Tensor):
+        pytest.fail("BF16 speculative sampling must not enter the hybrid fast path")
+
+    def compute_logits(hidden_states: torch.Tensor):
+        captured["hidden_states"] = hidden_states
+        return logits
+
+    runner.model = SimpleNamespace(
+        get_top_tokens=get_top_tokens,
+        compute_logits=compute_logits,
+    )
+    expected_output = SimpleNamespace(num_sampled="sampled", num_rejected="rejected")
+
+    class FakeRejectionSampler:
+        synthetic_conditional_rates = None
+        use_block_verification = False
+
+        def __call__(self, target_logits, input_batch, draft_logits):
+            captured["target_logits"] = target_logits
+            captured["input_batch"] = input_batch
+            captured["draft_logits"] = draft_logits
+            return expected_output
+
+    runner.rejection_sampler = FakeRejectionSampler()
+    runner.speculator = SimpleNamespace(draft_logits=None)
+    input_batch = SimpleNamespace(
+        logits_indices=torch.tensor([0, 1, 2]),
+        has_structured_output_reqs=False,
+        num_draft_tokens=2,
+    )
+    hidden_states = torch.randn((3, 4))
+
+    output, num_sampled, num_rejected = GPUModelRunner.sample(
+        runner,
+        hidden_states,
+        input_batch,
+        grammar_output=None,
+    )
+
+    assert output is expected_output
+    assert num_sampled == "sampled"
+    assert num_rejected == "rejected"
+    assert torch.equal(captured["hidden_states"], hidden_states)
+    assert captured["target_logits"] is logits
+    assert captured["input_batch"] is input_batch
+    assert captured["draft_logits"] is None
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
+@pytest.mark.parametrize(
+    ("target_token_ids", "expected_tokens", "expected_sampled", "expected_rejected"),
+    [
+        ([11, 12, 31, 21, 41], [[11, 12, 31], [21, 41, -1]], [3, 2], [0, 0]),
+        ([51, 52, 31, 61, 41], [[51, -1, -1], [61, -1, -1]], [1, 1], [2, 1]),
+    ],
+)
+def test_compact_greedy_rejection_sampler(
+    target_token_ids: list[int],
+    expected_tokens: list[list[int]],
+    expected_sampled: list[int],
+    expected_rejected: list[int],
+) -> None:
+    device = torch.device("cuda:0")
+    input_batch = SimpleNamespace(
+        num_reqs=2,
+        num_draft_tokens=3,
+        num_draft_tokens_per_req=np.array([2, 1], dtype=np.int32),
+        cu_num_logits=torch.tensor([0, 3, 5], dtype=torch.int32, device=device),
+        cu_num_logits_np=np.array([0, 3, 5], dtype=np.int32),
+        input_ids=torch.tensor([99, 11, 12, 88, 21], dtype=torch.int32, device=device),
+        logits_indices=torch.arange(5, dtype=torch.int64, device=device),
+        seq_lens=torch.tensor([10, 10], dtype=torch.int32, device=device),
+        idx_mapping=torch.tensor([0, 1], dtype=torch.int32, device=device),
+    )
+    rejection_sampler = RejectionSampler.__new__(RejectionSampler)
+    rejection_sampler.num_speculative_steps = 2
+    rejection_sampler.synthetic_conditional_rates = None
+    rejection_sampler.use_block_verification = False
+    rejection_sampler.sampler = SimpleNamespace(
+        req_states=SimpleNamespace(
+            prefill_len=SimpleNamespace(
+                gpu=torch.tensor([1, 1], dtype=torch.int32, device=device)
+            )
+        )
+    )
+
+    output = rejection_sampler.sample_from_greedy_tokens(
+        torch.tensor(target_token_ids, dtype=torch.int64, device=device),
         input_batch,
     )
     torch.accelerator.synchronize()

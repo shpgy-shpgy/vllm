@@ -172,8 +172,14 @@ class Sampler:
 
     def get_vocab_parallel_presence_inputs(
         self, input_batch: InputBatch
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return per-row penalties and V2's persistent output-token counts."""
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]:
+        """Return per-row penalties and persistent output-token statistics."""
         request_indices = input_batch.idx_mapping
         presence_penalties = self.penalties_state.presence_penalty.gpu.index_select(
             0, request_indices.to(torch.int64)
@@ -182,6 +188,8 @@ class Sampler:
             presence_penalties,
             self.penalties_state.output_bin_counts,
             request_indices,
+            self.penalties_state.output_unique_token_ids,
+            self.penalties_state.num_output_unique_tokens,
         )
 
     def make_sampler_output(

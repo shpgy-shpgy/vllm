@@ -23,6 +23,7 @@ if HAS_TRITON:
     )
     from vllm.model_executor.layers.presence_penalty_triton import (
         apply_presence_penalty_from_counts,
+        apply_sparse_presence_penalty,
     )
     from vllm.v1.sample.ops.topk_topp_triton import (
         pack_topk_pairs_triton,
@@ -39,6 +40,7 @@ else:
     sample_full_vocab_from_shard_triton = None  # type: ignore[assignment]
     select_compact_topk_pairs_triton = None  # type: ignore[assignment]
     apply_presence_penalty_from_counts = None  # type: ignore[assignment]
+    apply_sparse_presence_penalty = None  # type: ignore[assignment]
 
 
 # --8<-- [start:logits_processor]
@@ -264,7 +266,7 @@ class LogitsProcessor(PluggableLayer):
             shard_token_ids = self._get_shard_token_ids(lm_head, hidden_states.device)
             active_vocab_size = local_vocab_size
 
-        hybrid_state = getattr(lm_head, "_hybrid_fp4_lm_head_state", None)
+        hybrid_state = getattr(lm_head, "_hybrid_mxfp8_lm_head_state", None)
         if (
             hybrid_state is not None
             and shard_token_ids is None
@@ -497,6 +499,8 @@ class LogitsProcessor(PluggableLayer):
         output_token_ids: torch.Tensor | None = None,
         output_token_counts: torch.Tensor | None = None,
         presence_request_indices: torch.Tensor | None = None,
+        output_unique_token_ids: torch.Tensor | None = None,
+        num_output_unique_tokens: torch.Tensor | None = None,
         embedding_bias: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return global compact top-k/top-p candidates without full all-gather.
@@ -519,6 +523,8 @@ class LogitsProcessor(PluggableLayer):
             output_token_ids=output_token_ids,
             output_token_counts=output_token_counts,
             presence_request_indices=presence_request_indices,
+            output_unique_token_ids=output_unique_token_ids,
+            num_output_unique_tokens=num_output_unique_tokens,
             embedding_bias=embedding_bias,
         )
         local_top_k = local_vals.shape[-1]
@@ -551,9 +557,11 @@ class LogitsProcessor(PluggableLayer):
         output_token_ids: torch.Tensor | None = None,
         output_token_counts: torch.Tensor | None = None,
         presence_request_indices: torch.Tensor | None = None,
+        output_unique_token_ids: torch.Tensor | None = None,
+        num_output_unique_tokens: torch.Tensor | None = None,
         embedding_bias: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, int, torch.Tensor | None]:
-        """Compute a processed local top-k, using hybrid NVFP4 when eligible."""
+        """Compute a processed local top-k, using hybrid MXFP8 when eligible."""
         shard_indices = lm_head.shard_indices
         vocab_start = shard_indices.org_vocab_start_index
         local_vocab_size = getattr(
@@ -568,7 +576,7 @@ class LogitsProcessor(PluggableLayer):
             active_vocab_size = local_vocab_size
 
         local_top_k = min(top_k, active_vocab_size)
-        hybrid_state = getattr(lm_head, "_hybrid_fp4_lm_head_state", None)
+        hybrid_state = getattr(lm_head, "_hybrid_mxfp8_lm_head_state", None)
         if (
             hybrid_state is not None
             and shard_token_ids is None
@@ -582,25 +590,49 @@ class LogitsProcessor(PluggableLayer):
             coarse_logits = hybrid_state.coarse_logits(
                 hidden_states,
                 embedding_bias,
-            ).to(torch.float32)
-            if self.soft_cap is not None:
-                coarse_logits = (
-                    torch.tanh(coarse_logits / self.soft_cap) * self.soft_cap
-                )
-            if self.scale != 1.0:
-                coarse_logits = coarse_logits * self.scale
+            )
+
+            # With no additive processor, soft-cap, positive scale, and
+            # temperature are monotonic and cannot change the candidate set.
+            # Keep BF16 here so the selector needs neither an [M, N] FP32 copy
+            # nor twice as many radix rounds.
+            process_coarse_logits = self.scale <= 0.0 or (
+                presence_penalties is not None
+                and (self.soft_cap is not None or self.scale != 1.0)
+            )
+            if process_coarse_logits:
+                coarse_logits = coarse_logits.to(torch.float32)
+                if self.soft_cap is not None:
+                    coarse_logits = (
+                        torch.tanh(coarse_logits / self.soft_cap) * self.soft_cap
+                    )
+                if self.scale != 1.0:
+                    coarse_logits = coarse_logits * self.scale
 
             penalty_mask = None
             if presence_penalties is not None:
                 if output_token_counts is not None:
                     assert presence_request_indices is not None
-                    self._apply_sharded_presence_penalty_from_counts(
-                        coarse_logits,
-                        presence_penalties,
-                        output_token_counts,
-                        presence_request_indices,
-                        shard_indices=shard_indices,
+                    sparse_applied = (
+                        output_unique_token_ids is not None
+                        and num_output_unique_tokens is not None
+                        and self._apply_sharded_sparse_presence_penalty(
+                            coarse_logits,
+                            presence_penalties,
+                            output_unique_token_ids,
+                            num_output_unique_tokens,
+                            presence_request_indices,
+                            shard_indices=shard_indices,
+                        )
                     )
+                    if not sparse_applied:
+                        self._apply_sharded_presence_penalty_from_counts(
+                            coarse_logits,
+                            presence_penalties,
+                            output_token_counts,
+                            presence_request_indices,
+                            shard_indices=shard_indices,
+                        )
                 else:
                     assert output_token_ids is not None
                     penalty_mask = self._get_sharded_presence_penalty_mask(
@@ -611,8 +643,6 @@ class LogitsProcessor(PluggableLayer):
                     )
                     if penalty_mask is not None:
                         coarse_logits.sub_(penalty_mask)
-            if temperature != 1.0:
-                coarse_logits = coarse_logits / temperature
             self._mask_invalid_shard_logits(
                 coarse_logits,
                 None,
@@ -669,13 +699,26 @@ class LogitsProcessor(PluggableLayer):
         if presence_penalties is not None:
             if output_token_counts is not None:
                 assert presence_request_indices is not None
-                self._apply_sharded_presence_penalty_from_counts(
-                    logits,
-                    presence_penalties,
-                    output_token_counts,
-                    presence_request_indices,
-                    shard_indices=shard_indices,
+                sparse_applied = (
+                    output_unique_token_ids is not None
+                    and num_output_unique_tokens is not None
+                    and self._apply_sharded_sparse_presence_penalty(
+                        logits,
+                        presence_penalties,
+                        output_unique_token_ids,
+                        num_output_unique_tokens,
+                        presence_request_indices,
+                        shard_indices=shard_indices,
+                    )
                 )
+                if not sparse_applied:
+                    self._apply_sharded_presence_penalty_from_counts(
+                        logits,
+                        presence_penalties,
+                        output_token_counts,
+                        presence_request_indices,
+                        shard_indices=shard_indices,
+                    )
             else:
                 assert output_token_ids is not None
                 self._apply_sharded_presence_penalty(
@@ -809,6 +852,8 @@ class LogitsProcessor(PluggableLayer):
         output_token_ids: torch.Tensor | None = None,
         output_token_counts: torch.Tensor | None = None,
         presence_request_indices: torch.Tensor | None = None,
+        output_unique_token_ids: torch.Tensor | None = None,
+        num_output_unique_tokens: torch.Tensor | None = None,
         embedding_bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Vocab-parallel random sampling for small uniform top-k batches.
@@ -833,6 +878,8 @@ class LogitsProcessor(PluggableLayer):
             output_token_ids=output_token_ids,
             output_token_counts=output_token_counts,
             presence_request_indices=presence_request_indices,
+            output_unique_token_ids=output_unique_token_ids,
+            num_output_unique_tokens=num_output_unique_tokens,
             embedding_bias=embedding_bias,
         )
         local_top_k = local_vals.shape[-1]
@@ -883,6 +930,60 @@ class LogitsProcessor(PluggableLayer):
 
         tp_group.broadcast(sampled, src=0)
         return sampled
+
+    @staticmethod
+    def _apply_sharded_sparse_presence_penalty(
+        logits: torch.Tensor,
+        presence_penalties: torch.Tensor,
+        output_unique_token_ids: torch.Tensor,
+        num_output_unique_tokens: torch.Tensor,
+        presence_request_indices: torch.Tensor,
+        *,
+        shard_indices,
+    ) -> bool:
+        """Apply presence penalties by touching only generated token ids."""
+        if not (
+            HAS_TRITON
+            and apply_sparse_presence_penalty is not None
+            and current_platform.is_cuda()
+            and logits.shape[0] >= 32
+            and logits.is_cuda
+            and output_unique_token_ids.is_cuda
+            and num_output_unique_tokens.is_cuda
+            and presence_request_indices.is_cuda
+            and presence_penalties.is_cuda
+        ):
+            return False
+
+        num_org_elements = getattr(
+            shard_indices,
+            "num_org_elements",
+            logits.shape[-1] - shard_indices.num_org_vocab_padding,
+        )
+        num_org_elements_padded = getattr(
+            shard_indices,
+            "num_org_elements_padded",
+            num_org_elements + shard_indices.num_org_vocab_padding,
+        )
+        added_vocab_start = getattr(
+            shard_indices,
+            "added_vocab_start_index",
+            shard_indices.org_vocab_end_index,
+        )
+        num_added_elements = getattr(shard_indices, "num_added_elements", 0)
+        apply_sparse_presence_penalty(
+            logits,
+            output_unique_token_ids,
+            num_output_unique_tokens,
+            presence_request_indices,
+            presence_penalties,
+            org_vocab_start=shard_indices.org_vocab_start_index,
+            num_org_elements=num_org_elements,
+            num_org_elements_padded=num_org_elements_padded,
+            added_vocab_start=added_vocab_start,
+            num_added_elements=num_added_elements,
+        )
+        return True
 
     @staticmethod
     def _apply_sharded_presence_penalty_from_counts(

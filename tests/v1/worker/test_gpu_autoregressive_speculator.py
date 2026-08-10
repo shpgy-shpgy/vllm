@@ -99,26 +99,16 @@ def test_eagle_loader_shares_inner_language_model_lm_head(monkeypatch):
     draft_model.lm_head = torch.nn.Module()
     old_draft_lm_head = draft_model.lm_head
     old_draft_lm_head.register_buffer(
-        "_hybrid_fp4_lm_head_weight",
-        torch.empty((8, 2), dtype=torch.uint8),
+        "_hybrid_mxfp8_lm_head_weight",
+        torch.empty((8, 4), dtype=torch.float8_e4m3fn),
         persistent=False,
     )
     old_draft_lm_head.register_buffer(
-        "_hybrid_fp4_lm_head_scale",
-        torch.empty((128, 4), dtype=torch.float8_e4m3fn),
+        "_hybrid_mxfp8_lm_head_scale",
+        torch.empty((32,), dtype=torch.uint8),
         persistent=False,
     )
-    old_draft_lm_head.register_buffer(
-        "_hybrid_fp4_lm_head_input_scale",
-        torch.empty((), dtype=torch.float32),
-        persistent=False,
-    )
-    old_draft_lm_head.register_buffer(
-        "_hybrid_fp4_lm_head_alpha",
-        torch.empty((), dtype=torch.float32),
-        persistent=False,
-    )
-    old_draft_lm_head._hybrid_fp4_lm_head_state = object()
+    old_draft_lm_head._hybrid_mxfp8_lm_head_state = object()
 
     monkeypatch.setattr(eagle_utils, "get_model", lambda **kwargs: draft_model)
     monkeypatch.setattr(
@@ -134,8 +124,6 @@ def test_eagle_loader_shares_inner_language_model_lm_head(monkeypatch):
 
     assert loaded.lm_head is target_language_model.lm_head
     assert loaded.model.embed_tokens is target_language_model.model.embed_tokens
-    assert not hasattr(old_draft_lm_head, "_hybrid_fp4_lm_head_state")
-    assert not hasattr(old_draft_lm_head, "_hybrid_fp4_lm_head_weight")
-    assert not hasattr(old_draft_lm_head, "_hybrid_fp4_lm_head_scale")
-    assert not hasattr(old_draft_lm_head, "_hybrid_fp4_lm_head_input_scale")
-    assert not hasattr(old_draft_lm_head, "_hybrid_fp4_lm_head_alpha")
+    assert not hasattr(old_draft_lm_head, "_hybrid_mxfp8_lm_head_state")
+    assert not hasattr(old_draft_lm_head, "_hybrid_mxfp8_lm_head_weight")
+    assert not hasattr(old_draft_lm_head, "_hybrid_mxfp8_lm_head_scale")

@@ -983,7 +983,13 @@ class Worker(WorkerBase):
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        return self.model_runner.sample_tokens(grammar_output)
+        context = (
+            self.profiler.annotate_context_manager("sample_tokens")
+            if self.profiler
+            else nullcontext()
+        )
+        with context:
+            return self.model_runner.sample_tokens(grammar_output)
 
     @torch.inference_mode()
     @with_gpu_sync_check

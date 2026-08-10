@@ -182,10 +182,11 @@ if TYPE_CHECKING:
     VLLM_MOE_USE_DEEP_GEMM: bool = True
     VLLM_USE_DEEP_GEMM_E8M0: bool = True
     VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES: bool = True
-    VLLM_HYBRID_FP4_LM_HEAD: bool = False
-    VLLM_HYBRID_FP4_LM_HEAD_CANDIDATES: int = 128
-    VLLM_HYBRID_FP4_LM_HEAD_INPUT_AMAX: float = 48.0
-    VLLM_HYBRID_FP4_LM_HEAD_USE_FLASHINFER_TOPK: bool = True
+    VLLM_SCHED_TT_DEBUG: bool = False
+    VLLM_HYBRID_MXFP8_LM_HEAD: bool = False
+    VLLM_HYBRID_MXFP8_LM_HEAD_CANDIDATES: int = 128
+    VLLM_HYBRID_MXFP8_LM_HEAD_MAX_ROWS: int = 512
+    VLLM_HYBRID_MXFP8_LM_HEAD_USE_FLASHINFER_TOPK: bool = True
     VLLM_DEEP_GEMM_WARMUP: Literal[
         "skip",
         "full",
@@ -1486,18 +1487,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES": lambda: bool(
         int(os.getenv("VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES", "1"))
     ),
-    # Experimental NVFP4-coarse/BF16-refined path for unquantized lm heads.
-    "VLLM_HYBRID_FP4_LM_HEAD": lambda: bool(
-        int(os.getenv("VLLM_HYBRID_FP4_LM_HEAD", "0"))
+    # Opt-in per-request QUEUED/SCHEDULED timing debug logs (SCHED_TT).
+    "VLLM_SCHED_TT_DEBUG": lambda: bool(
+        int(os.getenv("VLLM_SCHED_TT_DEBUG", "0"))
     ),
-    "VLLM_HYBRID_FP4_LM_HEAD_CANDIDATES": lambda: int(
-        os.getenv("VLLM_HYBRID_FP4_LM_HEAD_CANDIDATES", "128")
+    # Experimental MXFP8-coarse/BF16-refined path for unquantized lm heads.
+    "VLLM_HYBRID_MXFP8_LM_HEAD": lambda: bool(
+        int(os.getenv("VLLM_HYBRID_MXFP8_LM_HEAD", "0"))
     ),
-    "VLLM_HYBRID_FP4_LM_HEAD_INPUT_AMAX": lambda: float(
-        os.getenv("VLLM_HYBRID_FP4_LM_HEAD_INPUT_AMAX", "48.0")
+    "VLLM_HYBRID_MXFP8_LM_HEAD_CANDIDATES": lambda: int(
+        os.getenv("VLLM_HYBRID_MXFP8_LM_HEAD_CANDIDATES", "128")
     ),
-    "VLLM_HYBRID_FP4_LM_HEAD_USE_FLASHINFER_TOPK": lambda: bool(
-        int(os.getenv("VLLM_HYBRID_FP4_LM_HEAD_USE_FLASHINFER_TOPK", "1"))
+    "VLLM_HYBRID_MXFP8_LM_HEAD_MAX_ROWS": lambda: int(
+        os.getenv("VLLM_HYBRID_MXFP8_LM_HEAD_MAX_ROWS", "512")
+    ),
+    "VLLM_HYBRID_MXFP8_LM_HEAD_USE_FLASHINFER_TOPK": lambda: bool(
+        int(os.getenv("VLLM_HYBRID_MXFP8_LM_HEAD_USE_FLASHINFER_TOPK", "1"))
     ),
     # DeepGemm JITs the kernels on-demand. The warmup attempts to make DeepGemm
     # JIT all the required kernels before model execution so there is no

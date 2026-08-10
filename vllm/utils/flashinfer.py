@@ -11,6 +11,7 @@ import importlib
 import importlib.util
 import os
 import shutil
+import threading
 from collections.abc import Callable
 from typing import Any, NoReturn
 
@@ -166,6 +167,57 @@ autotune = _lazy_import_wrapper(
     "autotune",
     fallback_fn=lambda *args, **kwargs: contextlib.nullcontext(),
 )
+
+_AUTOTUNE_DELAY_LOCK = threading.RLock()
+
+
+@contextlib.contextmanager
+def autotune_with_torch_cuda_delay(*args, **kwargs):
+    """Run FlashInfer autotuning without its optional TRT-LLM delay JIT.
+
+    Some CUDA toolkit installations provide the runtime libraries but omit
+    compatible cuBLAS development headers. FlashInfer's profiling-only delay
+    kernel then fails to build and every otherwise-valid tactic is discarded.
+    ``torch.cuda._sleep`` provides the same stream delay without a JIT build.
+    """
+    if not has_flashinfer():
+        yield
+        return
+
+    autotuner = _get_submodule("flashinfer.autotuner")
+    if autotuner is None or not hasattr(autotuner, "autotune"):
+        yield
+        return
+
+    autotune_fn = autotuner.autotune
+    implementation_name = getattr(autotune_fn, "__module__", "")
+    implementation = (
+        _get_submodule(implementation_name) if implementation_name else None
+    )
+    delay_owners = []
+    for module in (autotuner, implementation):
+        if (
+            module is not None
+            and hasattr(module, "delay_kernel")
+            and all(module is not owner for owner in delay_owners)
+        ):
+            delay_owners.append(module)
+
+    def torch_delay(microseconds: int) -> None:
+        torch.cuda._sleep(max(1, int(microseconds) * 1000))
+
+    with _AUTOTUNE_DELAY_LOCK:
+        original_delays = [owner.delay_kernel for owner in delay_owners]
+        for owner in delay_owners:
+            owner.delay_kernel = torch_delay
+        try:
+            with autotune_fn(*args, **kwargs):
+                yield
+        finally:
+            for owner, original_delay in zip(
+                delay_owners, original_delays, strict=True
+            ):
+                owner.delay_kernel = original_delay
 
 
 @functools.cache
@@ -1064,6 +1116,7 @@ __all__ = [
     "flashinfer_trtllm_batch_decode_with_kv_cache_mla",
     "flashinfer_trtllm_batch_decode_sparse_mla_dsv4",
     "autotune",
+    "autotune_with_torch_cuda_delay",
     "has_flashinfer_moe",
     "has_flashinfer_comm",
     "has_flashinfer_nvlink_two_sided",

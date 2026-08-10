@@ -51,6 +51,7 @@ from vllm.utils.torch_utils import PIN_MEMORY, STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
+from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
 from vllm.v1.worker.gpu.async_utils import AsyncOutput, AsyncPoolingOutput
 from vllm.v1.worker.gpu.attn_utils import (
@@ -1096,7 +1097,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     "Using V2 vocab-parallel greedy sampling fast path.",
                     scope="global",
                 )
-                sampled = self.model.get_top_tokens(sample_hidden_states)
+                with record_function_or_nullcontext(
+                    "lm_head.target.compact_nodraft"
+                    f"[M={sample_hidden_states.shape[0]}]"
+                ):
+                    sampled = self.model.get_top_tokens(sample_hidden_states)
             elif mode == "full" and hasattr(self.model, "sample_full_tokens"):
                 logger.info_once(
                     "Using V2 vocab-parallel full-distribution sampling fast path.",
@@ -1115,11 +1120,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         presence_penalties,
                         output_token_counts,
                         presence_request_indices,
+                        output_unique_token_ids,
+                        num_output_unique_tokens,
                     ) = self.sampler.get_vocab_parallel_presence_inputs(input_batch)
                 else:
                     presence_penalties = None
                     output_token_counts = None
                     presence_request_indices = None
+                    output_unique_token_ids = None
+                    num_output_unique_tokens = None
                 sampled = self.model.sample_topk_tokens(
                     sample_hidden_states,
                     top_k=top_k,
@@ -1128,6 +1137,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     presence_penalties=presence_penalties,
                     output_token_counts=output_token_counts,
                     presence_request_indices=presence_request_indices,
+                    output_unique_token_ids=output_unique_token_ids,
+                    num_output_unique_tokens=num_output_unique_tokens,
                 )
 
             if sampled is not None:
@@ -1139,6 +1150,38 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     sampler_output.num_sampled,
                     sampler_output.num_rejected,
                 )
+
+        if (
+            envs.VLLM_HYBRID_MXFP8_LM_HEAD
+            and fast_path_params is not None
+            and fast_path_params[0] == "greedy"
+            and input_batch.num_draft_tokens > 0
+            and self.rejection_sampler is not None
+            and self.speculator is not None
+            and self.speculator.draft_logits is None
+            and self.rejection_sampler.synthetic_conditional_rates is None
+            and not self.rejection_sampler.use_block_verification
+            and hasattr(self.model, "get_top_tokens")
+        ):
+            logger.info_once(
+                "Using V2 vocab-parallel compact greedy speculative "
+                "sampling fast path.",
+                scope="global",
+            )
+            with record_function_or_nullcontext(
+                "lm_head.target.compact_spec"
+                f"[M={sample_hidden_states.shape[0]}]"
+            ):
+                target_token_ids = self.model.get_top_tokens(sample_hidden_states)
+            sampler_output = self.rejection_sampler.sample_from_greedy_tokens(
+                target_token_ids,
+                input_batch,
+            )
+            return (
+                sampler_output,
+                sampler_output.num_sampled,
+                sampler_output.num_rejected,
+            )
 
         if (
             fast_path_params is not None
@@ -1174,7 +1217,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 sampler_output.num_rejected,
             )
 
-        logits = self.model.compute_logits(sample_hidden_states)
+        with record_function_or_nullcontext(
+            "lm_head.target.full_logits"
+            f"[M={sample_hidden_states.shape[0]}]"
+        ):
+            logits = self.model.compute_logits(sample_hidden_states)
         if grammar_output is not None:
             # Apply grammar bitmask to the logits in-place.
             assert self.structured_outputs_worker is not None
@@ -1212,13 +1259,26 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.is_last_pp_rank:
             assert self.sampler is not None
             output_bin_counts = self.sampler.penalties_state.output_bin_counts
+            output_unique_token_ids = (
+                self.sampler.penalties_state.output_unique_token_ids
+            )
+            num_output_unique_tokens = (
+                self.sampler.penalties_state.num_output_unique_tokens
+            )
+            presence_penalty = self.sampler.penalties_state.presence_penalty.gpu
         else:
             output_bin_counts = None
+            output_unique_token_ids = None
+            num_output_unique_tokens = None
+            presence_penalty = None
         post_update(
             idx_mapping,
             self.req_states.num_computed_tokens.gpu,
             self.req_states.last_sampled_tokens,
             output_bin_counts,
+            output_unique_token_ids,
+            num_output_unique_tokens,
+            presence_penalty,
             sampled_tokens,
             num_sampled,
             num_rejected,

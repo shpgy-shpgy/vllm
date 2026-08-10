@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Benchmark shape-generic FP8-coarse/BF16-refined lm-head top-k.
+"""Benchmark shape-generic MXFP8-coarse/BF16-refined lm-head top-k.
 
 This is an evaluation harness, not a serving path. It intentionally composes
 existing vLLM and PyTorch kernels so their intermediate allocations and launch
@@ -22,18 +22,22 @@ import torch
 import torch.nn.functional as F
 from safetensors import safe_open
 
-from vllm import _custom_ops as ops
 from vllm.model_executor.layers.argmax_triton import (
     indexed_argmax_triton,
     local_argmax_triton,
 )
-from vllm.model_executor.layers.hybrid_fp4_lm_head import (
+from vllm.model_executor.layers.hybrid_mxfp8_lm_head import (
+    indexed_bf16_dot,
     select_lm_head_candidates,
 )
-from vllm.model_executor.layers.quantization.utils.fp8_utils import (
-    per_token_group_quant_fp8,
+from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+    MXFP8_BLOCK_SIZE,
+    mxfp8_e4m3_quantize,
 )
-from vllm.utils.deep_gemm import per_block_cast_to_fp8
+from vllm.utils.flashinfer import (
+    autotune_with_torch_cuda_delay as flashinfer_autotune,
+)
+from vllm.utils.flashinfer import flashinfer_mm_mxfp8
 
 _EMBEDDING_WEIGHT_KEYS = (
     "lm_head.weight",
@@ -43,10 +47,11 @@ _EMBEDDING_WEIGHT_KEYS = (
 
 
 @dataclass
-class Fp8Weight:
+class Mxfp8Weight:
     weight: torch.Tensor
     scale: torch.Tensor
-    scheme: str
+    output_size: int
+    backend: str
 
 
 @dataclass
@@ -101,46 +106,48 @@ def _load_weight_shard(
     return weight.contiguous().to(device), start, weight_key
 
 
-def _quantize_weight(weight: torch.Tensor, scheme: str) -> Fp8Weight:
-    if scheme == "block128":
-        quantized, scale = per_block_cast_to_fp8(
-            weight,
-            block_size=[128, 128],
-            use_ue8m0=False,
-        )
-    elif scheme == "channel":
-        quantized, scale = ops.scaled_fp8_quant(
-            weight,
-            use_per_token_if_dynamic=True,
-        )
-    else:
-        raise ValueError(f"unknown FP8 weight scheme: {scheme}")
-    return Fp8Weight(quantized, scale, scheme)
-
-
-def _fp8_linear(hidden: torch.Tensor, weight: Fp8Weight) -> torch.Tensor:
-    if weight.scheme == "block128":
-        hidden_q, hidden_scale = per_token_group_quant_fp8(
-            hidden.contiguous(),
-            group_size=128,
-            column_major_scales=True,
-            use_ue8m0=False,
-        )
-        weight_scale = weight.scale.T
-    else:
-        hidden_q, hidden_scale = ops.scaled_fp8_quant(
-            hidden.contiguous(),
-            use_per_token_if_dynamic=True,
-        )
-        weight_scale = weight.scale
-
-    return ops.cutlass_scaled_mm(
-        hidden_q,
-        weight.weight.T,
-        scale_a=hidden_scale,
-        scale_b=weight_scale,
-        out_dtype=torch.bfloat16,
+def _quantize_weight(weight: torch.Tensor, backend: str) -> Mxfp8Weight:
+    output_size = weight.shape[0]
+    padded_output_size = (
+        (output_size + MXFP8_BLOCK_SIZE - 1) // MXFP8_BLOCK_SIZE
+    ) * MXFP8_BLOCK_SIZE
+    if padded_output_size != output_size:
+        weight = F.pad(weight, (0, 0, 0, padded_output_size - output_size))
+    quantized, scale = mxfp8_e4m3_quantize(
+        weight,
+        is_sf_swizzled_layout=True,
+        alignment=MXFP8_BLOCK_SIZE,
     )
+    return Mxfp8Weight(quantized, scale, output_size, backend)
+
+
+def _quantize_hidden(hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    return mxfp8_e4m3_quantize(
+        hidden.contiguous(),
+        is_sf_swizzled_layout=True,
+        alignment=MXFP8_BLOCK_SIZE,
+    )
+
+
+def _mxfp8_mm(
+    hidden_q: torch.Tensor,
+    hidden_scale: torch.Tensor,
+    weight: Mxfp8Weight,
+) -> torch.Tensor:
+    logits = flashinfer_mm_mxfp8(
+        hidden_q,
+        weight.weight,
+        hidden_scale,
+        weight.scale,
+        torch.bfloat16,
+        backend=weight.backend,
+    )
+    return logits[:, : weight.output_size]
+
+
+def _mxfp8_linear(hidden: torch.Tensor, weight: Mxfp8Weight) -> torch.Tensor:
+    hidden_q, hidden_scale = _quantize_hidden(hidden)
+    return _mxfp8_mm(hidden_q, hidden_scale, weight)
 
 
 def _make_presence_inputs(
@@ -220,14 +227,12 @@ def _native_topk(
 
 def _hybrid_coarse_logits(
     hidden: torch.Tensor,
-    fp8_weight: Fp8Weight,
+    mxfp8_weight: Mxfp8Weight,
     *,
     token_ids: torch.Tensor | None,
     penalties: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    coarse_logits = _fp8_linear(hidden, fp8_weight)
-    if token_ids is not None:
-        coarse_logits = coarse_logits.float()
+    coarse_logits = _mxfp8_linear(hidden, mxfp8_weight)
     return _apply_presence_penalty(
         coarse_logits,
         token_ids,
@@ -245,14 +250,29 @@ def _refine_topk(
     candidates: int,
 ) -> CandidateResult:
     coarse_indices = select_lm_head_candidates(coarse_logits, candidates)
+    values, indices = _refine_selected_topk(
+        hidden,
+        bf16_weight,
+        coarse_indices,
+        penalty_mask,
+        top_k=top_k,
+    )
+    return CandidateResult(values, indices, coarse_indices)
 
-    # Advanced indexing intentionally materializes [M, candidates, K]. This is
-    # the generic PyTorch cost that a fused gathered-dot kernel would remove.
-    selected_weight = bf16_weight[coarse_indices]
-    exact_logits = torch.bmm(
-        selected_weight,
-        hidden.unsqueeze(-1),
-    ).squeeze(-1)
+
+def _refine_selected_topk(
+    hidden: torch.Tensor,
+    bf16_weight: torch.Tensor,
+    coarse_indices: torch.Tensor,
+    penalty_mask: torch.Tensor | None,
+    *,
+    top_k: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    exact_logits = indexed_bf16_dot(
+        hidden,
+        bf16_weight,
+        coarse_indices,
+    )
     if top_k > 1 or penalty_mask is not None:
         exact_logits = exact_logits.float()
     if penalty_mask is not None:
@@ -268,13 +288,13 @@ def _refine_topk(
     else:
         values, positions = torch.topk(exact_logits, top_k, dim=-1)
         indices = coarse_indices.gather(1, positions)
-    return CandidateResult(values, indices, coarse_indices)
+    return values, indices
 
 
 def _hybrid_topk(
     hidden: torch.Tensor,
     bf16_weight: torch.Tensor,
-    fp8_weight: Fp8Weight,
+    mxfp8_weight: Mxfp8Weight,
     *,
     top_k: int,
     candidates: int,
@@ -283,7 +303,7 @@ def _hybrid_topk(
 ) -> CandidateResult:
     coarse_logits, penalty_mask = _hybrid_coarse_logits(
         hidden,
-        fp8_weight,
+        mxfp8_weight,
         token_ids=token_ids,
         penalties=penalties,
     )
@@ -336,6 +356,56 @@ def _time_cuda_graph(
     }
 
 
+def _scan_cutlass_tactics(
+    hidden: torch.Tensor,
+    weight: Mxfp8Weight,
+    *,
+    steps: int,
+    warmup: int,
+    trials: int,
+) -> dict[str, object]:
+    from flashinfer.gemm.gemm_base import (
+        DEFAULT_WORKSPACE_SIZE,
+        get_cutlass_mxfp8_gemm_module,
+    )
+    from flashinfer.utils import _get_cache_buf
+
+    hidden_q, hidden_scale = _quantize_hidden(hidden)
+    output = torch.empty(
+        (hidden.shape[0], weight.weight.shape[0]),
+        dtype=torch.bfloat16,
+        device=hidden.device,
+    )
+    workspace = _get_cache_buf(
+        "benchmark_mxfp8_workspace",
+        DEFAULT_WORKSPACE_SIZE,
+        hidden.device,
+    )
+    runner = get_cutlass_mxfp8_gemm_module(12).cutlass_mxfp8_gemm_runner()
+    inputs = [
+        hidden_q,
+        weight.weight.T,
+        hidden_scale,
+        weight.scale,
+        torch.bfloat16,
+        output,
+        workspace,
+    ]
+    results: dict[str, object] = {}
+    for tactic in runner.get_valid_tactics(inputs, None):
+        try:
+            runner(inputs=inputs, tactic=tactic)
+            results[str(tactic)] = _time_cuda_graph(
+                partial(runner, inputs=inputs, tactic=tactic),
+                steps=steps,
+                warmup=warmup,
+                trials=trials,
+            )
+        except RuntimeError as error:
+            results[str(tactic)] = {"error": str(error)}
+    return results
+
+
 def _candidate_recall(
     native_indices: torch.Tensor,
     coarse_indices: torch.Tensor,
@@ -351,11 +421,6 @@ def main() -> int:
     parser.add_argument("--model-dir", type=Path, required=True)
     parser.add_argument("--tp-size", type=_positive_int, default=2)
     parser.add_argument("--tp-rank", type=int, default=0)
-    parser.add_argument(
-        "--weight-scheme",
-        choices=("block128", "channel"),
-        default="block128",
-    )
     parser.add_argument("--batch-sizes", type=_positive_int, nargs="+", default=[1])
     parser.add_argument("--top-k", type=_positive_int, nargs="+", default=[1, 64])
     parser.add_argument(
@@ -367,6 +432,14 @@ def main() -> int:
     parser.add_argument("--steps", type=_positive_int, default=50)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--trials", type=_positive_int, default=5)
+    parser.add_argument(
+        "--backend",
+        choices=("cutlass", "cudnn"),
+        default="cutlass",
+    )
+    parser.add_argument("--skip-autotune", action="store_true")
+    parser.add_argument("--scan-cutlass-tactics", action="store_true")
+    parser.add_argument("--scan-only", action="store_true")
     parser.add_argument("--json-out", type=Path)
     args = parser.parse_args()
 
@@ -385,10 +458,10 @@ def main() -> int:
         device=device,
     )
     local_vocab, hidden_size = weight.shape
-    if hidden_size % 128:
-        raise ValueError(f"hidden size must be divisible by 128, got {hidden_size}")
-    if local_vocab % 16:
-        raise ValueError(f"local vocabulary must be divisible by 16, got {local_vocab}")
+    if hidden_size % MXFP8_BLOCK_SIZE:
+        raise ValueError(
+            f"hidden size must be divisible by {MXFP8_BLOCK_SIZE}, got {hidden_size}"
+        )
     if max(args.top_k) > local_vocab:
         raise ValueError("top-k exceeds the local vocabulary")
     if max(args.candidates) > local_vocab:
@@ -397,25 +470,69 @@ def main() -> int:
         raise ValueError("every candidate count must be at least every top-k")
 
     quant_start = perf_counter()
-    fp8_weight = _quantize_weight(weight, args.weight_scheme)
+    mxfp8_weight = _quantize_weight(weight, args.backend)
     torch.accelerator.synchronize()
     quantize_seconds = perf_counter() - quant_start
 
+    autotune_seconds = 0.0
+    if not args.skip_autotune:
+        tune_start = perf_counter()
+        max_batch_size = max(args.batch_sizes)
+        tune_rows = 1 << (max_batch_size - 1).bit_length()
+        tune_hidden = torch.zeros(
+            (tune_rows, hidden_size),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        with flashinfer_autotune(tune_mode=True):
+            _mxfp8_linear(tune_hidden, mxfp8_weight)
+        torch.accelerator.synchronize()
+        autotune_seconds = perf_counter() - tune_start
+
+    tactic_scan: dict[str, object] | None = None
+    if args.scan_cutlass_tactics:
+        if args.backend != "cutlass":
+            raise ValueError("--scan-cutlass-tactics requires --backend cutlass")
+        scan_hidden = torch.zeros(
+            (max(args.batch_sizes), hidden_size),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        tactic_scan = {
+            str(batch_size): _scan_cutlass_tactics(
+                scan_hidden[:batch_size],
+                mxfp8_weight,
+                steps=args.steps,
+                warmup=args.warmup,
+                trials=args.trials,
+            )
+            for batch_size in args.batch_sizes
+        }
+        print(f"cutlass_tactics={tactic_scan}", flush=True)
+    if args.scan_only:
+        if tactic_scan is None:
+            raise ValueError("--scan-only requires --scan-cutlass-tactics")
+        return 0
+
     payload: dict[str, object] = {
-        "standard": "shape-generic-fp8-coarse-bf16-refined-lm-head",
+        "standard": "shape-generic-mxfp8-coarse-bf16-refined-lm-head",
         "model_dir": str(args.model_dir),
         "weight_key": weight_key,
         "tp_size": args.tp_size,
         "tp_rank": args.tp_rank,
         "vocab_start": vocab_start,
         "shape": {"n_local": local_vocab, "k": hidden_size},
-        "weight_scheme": args.weight_scheme,
+        "weight_scheme": "mxfp8-e4m3-e8m0-block32",
+        "backend": args.backend,
         "candidate_selector": "flashinfer_radix_or_torch_unsorted",
         "quantize_seconds": quantize_seconds,
+        "autotune_seconds": autotune_seconds,
+        "cutlass_tactic_scan": tactic_scan,
         "weight_bytes": weight.numel() * weight.element_size(),
-        "fp8_weight_bytes": fp8_weight.weight.numel()
-        * fp8_weight.weight.element_size(),
-        "fp8_scale_bytes": fp8_weight.scale.numel() * fp8_weight.scale.element_size(),
+        "mxfp8_weight_bytes": mxfp8_weight.weight.numel()
+        * mxfp8_weight.weight.element_size(),
+        "mxfp8_scale_bytes": mxfp8_weight.scale.numel()
+        * mxfp8_weight.scale.element_size(),
         "presence_penalty": args.presence_penalty,
         "history_tokens": args.history_tokens,
         "results": {},
@@ -482,7 +599,7 @@ def main() -> int:
                 native_sorted = native_indices.sort(dim=-1).values
                 coarse_logits, penalty_mask = _hybrid_coarse_logits(
                     seed_hidden,
-                    fp8_weight,
+                    mxfp8_weight,
                     token_ids=token_ids,
                     penalties=penalties,
                 )
@@ -547,13 +664,78 @@ def main() -> int:
                 )
             }
             native_us = float(timings["native"]["median_us"])
+            hidden_q, hidden_scale = _quantize_hidden(hidden)
+            coarse_logits, penalty_mask = _hybrid_coarse_logits(
+                hidden,
+                mxfp8_weight,
+                token_ids=token_ids,
+                penalties=penalties,
+            )
             for candidates in correctness:
+                coarse_indices = select_lm_head_candidates(
+                    coarse_logits,
+                    candidates,
+                )
+                components = {
+                    "activation_quant": _time_cuda_graph(
+                        partial(_quantize_hidden, hidden),
+                        steps=args.steps,
+                        warmup=args.warmup,
+                        trials=args.trials,
+                    ),
+                    "gemm": _time_cuda_graph(
+                        partial(
+                            _mxfp8_mm,
+                            hidden_q,
+                            hidden_scale,
+                            mxfp8_weight,
+                        ),
+                        steps=args.steps,
+                        warmup=args.warmup,
+                        trials=args.trials,
+                    ),
+                    "coarse": _time_cuda_graph(
+                        partial(
+                            _hybrid_coarse_logits,
+                            hidden,
+                            mxfp8_weight,
+                            token_ids=token_ids,
+                            penalties=penalties,
+                        ),
+                        steps=args.steps,
+                        warmup=args.warmup,
+                        trials=args.trials,
+                    ),
+                    "selector": _time_cuda_graph(
+                        partial(
+                            select_lm_head_candidates,
+                            coarse_logits,
+                            candidates,
+                        ),
+                        steps=args.steps,
+                        warmup=args.warmup,
+                        trials=args.trials,
+                    ),
+                    "refine": _time_cuda_graph(
+                        partial(
+                            _refine_selected_topk,
+                            hidden,
+                            weight,
+                            coarse_indices,
+                            penalty_mask,
+                            top_k=top_k,
+                        ),
+                        steps=args.steps,
+                        warmup=args.warmup,
+                        trials=args.trials,
+                    ),
+                }
                 timing = _time_cuda_graph(
                     partial(
                         _hybrid_topk,
                         hidden,
                         weight,
-                        fp8_weight,
+                        mxfp8_weight,
                         top_k=top_k,
                         candidates=candidates,
                         token_ids=token_ids,
@@ -564,6 +746,7 @@ def main() -> int:
                     trials=args.trials,
                 )
                 timing["speedup"] = native_us / float(timing["median_us"])
+                timing["components"] = components
                 timings[f"hybrid_candidates_{candidates}"] = timing
 
             topk_result = {
@@ -575,6 +758,12 @@ def main() -> int:
             batch_results[str(top_k)] = topk_result
             for candidates, stats in correctness.items():
                 hybrid_timing = timings[f"hybrid_candidates_{candidates}"]
+                components = hybrid_timing["components"]
+                quant_us = components["activation_quant"]["median_us"]
+                gemm_us = components["gemm"]["median_us"]
+                coarse_us = components["coarse"]["median_us"]
+                selector_us = components["selector"]["median_us"]
+                refine_us = components["refine"]["median_us"]
                 print(
                     f"m={batch_size} top_k={top_k} candidates={candidates} "
                     f"exact_set={stats['exact_topk_rows']}/"
@@ -585,7 +774,10 @@ def main() -> int:
                     f"{stats['candidate_total']} "
                     f"native={native_us:.3f}us "
                     f"hybrid={hybrid_timing['median_us']:.3f}us "
-                    f"speedup={hybrid_timing['speedup']:.3f}x",
+                    f"speedup={hybrid_timing['speedup']:.3f}x "
+                    f"components=q:{quant_us:.3f},gemm:{gemm_us:.3f},"
+                    f"coarse:{coarse_us:.3f},select:{selector_us:.3f},"
+                    f"refine:{refine_us:.3f}us",
                     flush=True,
                 )
             for relation, stats in nesting.items():
