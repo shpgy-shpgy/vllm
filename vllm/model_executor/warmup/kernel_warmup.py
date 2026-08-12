@@ -28,8 +28,8 @@ from vllm.model_executor.warmup.flashinfer_sparse_mla_warmup import (
     deepseek_v4_sparse_mla_attention_warmup,
     flashinfer_sparse_mla_decode_autotune_warmup,
 )
-from vllm.model_executor.warmup.hybrid_mxfp8_lm_head_warmup import (
-    hybrid_mxfp8_lm_head_warmup,
+from vllm.model_executor.warmup.hybrid_lm_head_warmup import (
+    hybrid_lm_head_warmup,
 )
 from vllm.model_executor.warmup.qwen_triton_warmup import qwen_triton_warmup
 from vllm.model_executor.warmup.sparse_mla_triton_warmup import (
@@ -62,10 +62,10 @@ def kernel_warmup(worker: "Worker"):
         )
     qwen_triton_warmup(worker.model_runner, worker.vllm_config.model_config)
 
-    # Hybrid MXFP8 lm head: FlashInfer tactic autotune and kernel JIT warmup
-    # for every runtime row bucket before CUDA graph capture; no-op when the
-    # feature is disabled or no head was prepared.
-    hybrid_mxfp8_lm_head_warmup(worker)
+    # Hybrid MXFP4/MXFP8 lm head: FlashInfer tactic autotune and kernel JIT warmup
+    # for every runtime row bucket before CUDA graph capture; no-op when both
+    # features are disabled or no head was prepared.
+    hybrid_lm_head_warmup(worker)
 
     # DSv4 mHC TileLang kernels (hc_pre/hc_post/hc_head_op) run every decoder
     # layer per token; warm them across token sizes first so the first real

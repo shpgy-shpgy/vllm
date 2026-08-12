@@ -183,9 +183,35 @@ if TYPE_CHECKING:
     VLLM_USE_DEEP_GEMM_E8M0: bool = True
     VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES: bool = True
     VLLM_SCHED_TT_DEBUG: bool = False
+    # Experimental NVFP4-coarse/BF16-refined lm-head path.  On SM120 this
+    # uses FlashInfer's b12x dense GEMM backend.
+    VLLM_HYBRID_NVFP4_LM_HEAD: bool = False
+    VLLM_HYBRID_NVFP4_LM_HEAD_BACKEND: Literal["b12x", "auto"] = "b12x"
+    VLLM_HYBRID_NVFP4_LM_HEAD_CANDIDATES: int = 128
+    VLLM_HYBRID_NVFP4_LM_HEAD_MAX_ROWS: int = 0
+    VLLM_HYBRID_NVFP4_LM_HEAD_USE_FLASHINFER_TOPK: bool = True
+    VLLM_HYBRID_MXFP4_LM_HEAD: bool = False
+    # Base coarse candidate width; larger top-k requests may expand only the
+    # transient refinement width (the persistent MXFP4 copy is unchanged).
+    VLLM_HYBRID_MXFP4_LM_HEAD_CANDIDATES: int = 128
+    # 0 means no row-count limit; positive values enable the safety cap.
+    VLLM_HYBRID_MXFP4_LM_HEAD_MAX_ROWS: int = 0
+    VLLM_HYBRID_MXFP4_LM_HEAD_USE_FLASHINFER_TOPK: bool = True
+    # Pad the dynamic M dimension to FlashInfer's cuDNN tuning bucket.  This
+    # avoids a cuDNN override-shape workspace query on request completion,
+    # which otherwise causes occasional 170--190 ms decode iterations.
+    VLLM_HYBRID_MXFP4_LM_HEAD_ROW_BUCKET_PAD: bool = True
+    # Mixed prefill/decode policy for the experimental hybrid lm-head path.
+    # ``row_split`` keeps prompt-tail rows and the draft graph on the
+    # full-vocab path; ``draft_all`` additionally keeps draft rows hybrid;
+    # ``all`` uses the hybrid path for every target/draft row in the batch.
+    VLLM_HYBRID_MXFP4_LM_HEAD_MIXED_BATCH_MODE: str = "all"
     VLLM_HYBRID_MXFP8_LM_HEAD: bool = False
+    # Base coarse candidate width; larger top-k requests may expand only the
+    # transient refinement width (the persistent MXFP8 copy is unchanged).
     VLLM_HYBRID_MXFP8_LM_HEAD_CANDIDATES: int = 128
-    VLLM_HYBRID_MXFP8_LM_HEAD_MAX_ROWS: int = 512
+    # 0 means no row-count limit; positive values enable the safety cap.
+    VLLM_HYBRID_MXFP8_LM_HEAD_MAX_ROWS: int = 0
     VLLM_HYBRID_MXFP8_LM_HEAD_USE_FLASHINFER_TOPK: bool = True
     VLLM_DEEP_GEMM_WARMUP: Literal[
         "skip",
@@ -1491,6 +1517,40 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SCHED_TT_DEBUG": lambda: bool(
         int(os.getenv("VLLM_SCHED_TT_DEBUG", "0"))
     ),
+    # Experimental MXFP4-coarse/BF16-refined path for unquantized lm heads.
+    "VLLM_HYBRID_NVFP4_LM_HEAD": lambda: bool(
+        int(os.getenv("VLLM_HYBRID_NVFP4_LM_HEAD", "0"))
+    ),
+    "VLLM_HYBRID_NVFP4_LM_HEAD_BACKEND": lambda: os.getenv(
+        "VLLM_HYBRID_NVFP4_LM_HEAD_BACKEND", "b12x"
+    ).strip().lower(),
+    "VLLM_HYBRID_NVFP4_LM_HEAD_CANDIDATES": lambda: int(
+        os.getenv("VLLM_HYBRID_NVFP4_LM_HEAD_CANDIDATES", "128")
+    ),
+    "VLLM_HYBRID_NVFP4_LM_HEAD_MAX_ROWS": lambda: int(
+        os.getenv("VLLM_HYBRID_NVFP4_LM_HEAD_MAX_ROWS", "0")
+    ),
+    "VLLM_HYBRID_NVFP4_LM_HEAD_USE_FLASHINFER_TOPK": lambda: bool(
+        int(os.getenv("VLLM_HYBRID_NVFP4_LM_HEAD_USE_FLASHINFER_TOPK", "1"))
+    ),
+    "VLLM_HYBRID_MXFP4_LM_HEAD": lambda: bool(
+        int(os.getenv("VLLM_HYBRID_MXFP4_LM_HEAD", "0"))
+    ),
+    "VLLM_HYBRID_MXFP4_LM_HEAD_CANDIDATES": lambda: int(
+        os.getenv("VLLM_HYBRID_MXFP4_LM_HEAD_CANDIDATES", "128")
+    ),
+    "VLLM_HYBRID_MXFP4_LM_HEAD_MAX_ROWS": lambda: int(
+        os.getenv("VLLM_HYBRID_MXFP4_LM_HEAD_MAX_ROWS", "0")
+    ),
+    "VLLM_HYBRID_MXFP4_LM_HEAD_USE_FLASHINFER_TOPK": lambda: bool(
+        int(os.getenv("VLLM_HYBRID_MXFP4_LM_HEAD_USE_FLASHINFER_TOPK", "1"))
+    ),
+    "VLLM_HYBRID_MXFP4_LM_HEAD_ROW_BUCKET_PAD": lambda: bool(
+        int(os.getenv("VLLM_HYBRID_MXFP4_LM_HEAD_ROW_BUCKET_PAD", "1"))
+    ),
+    "VLLM_HYBRID_MXFP4_LM_HEAD_MIXED_BATCH_MODE": lambda: os.getenv(
+        "VLLM_HYBRID_MXFP4_LM_HEAD_MIXED_BATCH_MODE", "all"
+    ).strip().lower(),
     # Experimental MXFP8-coarse/BF16-refined path for unquantized lm heads.
     "VLLM_HYBRID_MXFP8_LM_HEAD": lambda: bool(
         int(os.getenv("VLLM_HYBRID_MXFP8_LM_HEAD", "0"))
@@ -1499,7 +1559,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_HYBRID_MXFP8_LM_HEAD_CANDIDATES", "128")
     ),
     "VLLM_HYBRID_MXFP8_LM_HEAD_MAX_ROWS": lambda: int(
-        os.getenv("VLLM_HYBRID_MXFP8_LM_HEAD_MAX_ROWS", "512")
+        os.getenv("VLLM_HYBRID_MXFP8_LM_HEAD_MAX_ROWS", "0")
     ),
     "VLLM_HYBRID_MXFP8_LM_HEAD_USE_FLASHINFER_TOPK": lambda: bool(
         int(os.getenv("VLLM_HYBRID_MXFP8_LM_HEAD_USE_FLASHINFER_TOPK", "1"))

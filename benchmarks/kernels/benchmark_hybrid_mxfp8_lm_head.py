@@ -356,6 +356,39 @@ def _time_cuda_graph(
     }
 
 
+def _annotate_lm_head_timing(
+    timing: dict[str, object],
+    native_timing: dict[str, object],
+    components: dict[str, object] | None = None,
+) -> None:
+    """Add explicit lm-head savings to a hybrid timing record.
+
+    ``native`` and ``hybrid`` are both timed as complete CUDA-graph replays,
+    so their difference is the CUDA-event estimate for the end-to-end lm-head
+    path.  The component sum is deliberately based on ``coarse`` (which
+    already includes activation quantization and GEMM), plus selector and
+    refine; adding ``activation_quant`` and ``gemm`` again would double count.
+    """
+    native_median = float(native_timing["median_us"])
+    native_p95 = float(native_timing["p95_us"])
+    hybrid_median = float(timing["median_us"])
+    hybrid_p95 = float(timing["p95_us"])
+    saved_median = native_median - hybrid_median
+    saved_p95 = native_p95 - hybrid_p95
+    timing["speedup"] = native_median / hybrid_median
+    timing["lm_head_saved_us"] = saved_median
+    timing["lm_head_saved_ms"] = saved_median / 1000.0
+    timing["lm_head_saved_p95_us"] = saved_p95
+    timing["lm_head_saved_fraction"] = saved_median / native_median
+    if components is not None:
+        coarse_us = float(components["coarse"]["median_us"])
+        selector_us = float(components["selector"]["median_us"])
+        refine_us = float(components["refine"]["median_us"])
+        stage_sum = coarse_us + selector_us + refine_us
+        timing["logical_stage_sum_us"] = stage_sum
+        timing["hybrid_unaccounted_us"] = hybrid_median - stage_sum
+
+
 def _scan_cutlass_tactics(
     hidden: torch.Tensor,
     weight: Mxfp8Weight,
@@ -745,8 +778,8 @@ def main() -> int:
                     warmup=args.warmup,
                     trials=args.trials,
                 )
-                timing["speedup"] = native_us / float(timing["median_us"])
                 timing["components"] = components
+                _annotate_lm_head_timing(timing, timings["native"], components)
                 timings[f"hybrid_candidates_{candidates}"] = timing
 
             topk_result = {
@@ -775,9 +808,12 @@ def main() -> int:
                     f"native={native_us:.3f}us "
                     f"hybrid={hybrid_timing['median_us']:.3f}us "
                     f"speedup={hybrid_timing['speedup']:.3f}x "
+                    f"saved={hybrid_timing['lm_head_saved_us']:.3f}us "
+                    f"saved_p95={hybrid_timing['lm_head_saved_p95_us']:.3f}us "
                     f"components=q:{quant_us:.3f},gemm:{gemm_us:.3f},"
                     f"coarse:{coarse_us:.3f},select:{selector_us:.3f},"
-                    f"refine:{refine_us:.3f}us",
+                    f"refine:{refine_us:.3f},"
+                    f"unaccounted:{hybrid_timing['hybrid_unaccounted_us']:.3f}us",
                     flush=True,
                 )
             for relation, stats in nesting.items():

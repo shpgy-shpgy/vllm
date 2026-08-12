@@ -41,7 +41,11 @@ class PenaltiesState:
         self.output_bin_counts = torch.zeros(
             max_num_reqs, self.vocab_size, dtype=torch.int32, device=self.device
         )
-        if envs.VLLM_HYBRID_MXFP8_LM_HEAD:
+        if (
+            envs.VLLM_HYBRID_NVFP4_LM_HEAD
+            or envs.VLLM_HYBRID_MXFP4_LM_HEAD
+            or envs.VLLM_HYBRID_MXFP8_LM_HEAD
+        ):
             self.output_unique_token_ids = torch.empty(
                 max_num_reqs,
                 min(req_states.max_model_len, self.vocab_size),

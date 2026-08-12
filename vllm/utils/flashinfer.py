@@ -127,6 +127,7 @@ flashinfer_cutedsl_grouped_gemm_nt_masked = _lazy_import_wrapper(
     "flashinfer.cute_dsl.blockscaled_gemm", "grouped_gemm_nt_masked"
 )
 flashinfer_fp4_quantize = _lazy_import_wrapper("flashinfer", "fp4_quantize")
+flashinfer_mxfp4_quantize = _lazy_import_wrapper("flashinfer", "mxfp4_quantize")
 nvfp4_batched_quantize = _lazy_import_wrapper("flashinfer", "nvfp4_batched_quantize")
 silu_and_mul_scaled_nvfp4_experts_quantize = _lazy_import_wrapper(
     "flashinfer", "silu_and_mul_scaled_nvfp4_experts_quantize"
@@ -783,6 +784,36 @@ if has_flashinfer():
         )
 
     @torch.library.custom_op(
+        "vllm::flashinfer_nvfp4_quantize_128x4",
+        mutates_args=[],
+        device_types="cuda",
+    )
+    def flashinfer_nvfp4_quantize_128x4_op(
+        a: torch.Tensor, a_global_sf: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        from flashinfer import SfLayout
+        from flashinfer import nvfp4_quantize as nvfp4_quantize_
+
+        return nvfp4_quantize_(
+            a,
+            a_global_sf,
+            sfLayout=SfLayout.layout_128x4,
+            do_shuffle=False,
+        )
+
+    @torch.library.register_fake("vllm::flashinfer_nvfp4_quantize_128x4")
+    def flashinfer_nvfp4_quantize_128x4_fake(
+        a: torch.Tensor, a_global_sf: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        m, n = a.shape
+        rounded_m = cdiv(m, 128) * 128
+        scale_n = cdiv(n // 16, 4) * 4
+        return (
+            torch.empty(m, n // 2, dtype=torch.uint8, device=a.device),
+            torch.empty(rounded_m, scale_n, dtype=torch.uint8, device=a.device),
+        )
+
+    @torch.library.custom_op(
         "vllm::mm_mxfp8",
         mutates_args=[],
         device_types="cuda",
@@ -1008,6 +1039,17 @@ def flashinfer_quant_nvfp4_8x4_sf_layout(
     return flashinfer_nvfp4_quantize(a, a_global_sf)
 
 
+def flashinfer_nvfp4_quantize_128x4(
+    a: torch.Tensor, a_global_sf: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize NVFP4 with the 128x4 scale layout required by b12x."""
+    if not has_flashinfer():
+        raise RuntimeError("FlashInfer is required for NVFP4 quantization")
+    return torch.ops.vllm.flashinfer_nvfp4_quantize_128x4.default(
+        a, a_global_sf
+    )
+
+
 flashinfer_fp8_blockscale_gemm = _lazy_import_wrapper(
     "flashinfer.gemm", "fp8_blockscale_gemm_sm90"
 )
@@ -1139,6 +1181,7 @@ __all__ = [
     "flashinfer_scaled_fp8_mm",
     "flashinfer_scaled_fp8_mm_out",
     "flashinfer_quant_nvfp4_8x4_sf_layout",
+    "flashinfer_nvfp4_quantize_128x4",
     "flashinfer_fp8_blockscale_gemm",
     "should_use_flashinfer_for_blockscale_fp8_gemm",
     "is_flashinfer_fp8_blockscale_gemm_supported",

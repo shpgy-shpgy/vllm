@@ -79,6 +79,19 @@ class LogitsProcessor(PluggableLayer):
         self.soft_cap = soft_cap
         # Whether to use gather or all-gather to gather the logits.
         self.use_all_gather = current_platform.use_all_gather()
+        # Hybrid lm-heads are optimized for decode.  The V2 model runner can
+        # temporarily disable the compact path while a batch still contains
+        # prompt-prefill requests; this avoids paying the FP4 quantize/GEMM
+        # setup cost on the TTFT-critical prefill tail.  Keep the default
+        # enabled so existing callers and eager execution are unchanged.
+        self.hybrid_lm_head_enabled = True
+        # Optional per-logit-row override used by the V2 runner for a mixed
+        # prefill/decode batch.  ``True`` means that the compact hybrid path
+        # may be used for that row; ``False`` keeps the original full-vocab
+        # path.  A row mask is deliberately separate from the boolean above:
+        # the latter is still useful for draft CUDA-graph calls where the
+        # entire graph must take one path.
+        self.hybrid_lm_head_row_mask: torch.Tensor | None = None
         self._compact_topk_sample_seeds: torch.Tensor | None = None
         self._full_vocab_sample_seeds: torch.Tensor | None = None
 
@@ -138,6 +151,40 @@ class LogitsProcessor(PluggableLayer):
     def _is_contiguous_org_shard(lm_head: VocabParallelEmbedding) -> bool:
         shard_indices = lm_head.shard_indices
         return getattr(shard_indices, "num_added_elements_padded", 0) == 0
+
+    @staticmethod
+    def _get_hybrid_lm_head_state(lm_head: VocabParallelEmbedding):
+        """Return the active NVFP4/MXFP4/MXFP8 coarse-search state."""
+        state = getattr(lm_head, "_hybrid_nvfp4_lm_head_state", None)
+        if state is not None:
+            return state
+        state = getattr(lm_head, "_hybrid_mxfp4_lm_head_state", None)
+        if state is not None:
+            return state
+        return getattr(lm_head, "_hybrid_mxfp8_lm_head_state", None)
+
+    @staticmethod
+    def _select_hybrid_candidates(hybrid_state, coarse_logits, top_k: int):
+        """Select candidates while keeping compatibility with old test states."""
+        if hasattr(hybrid_state, "candidate_count_for_topk"):
+            return hybrid_state.select_candidates(coarse_logits, top_k=top_k)
+        return hybrid_state.select_candidates(coarse_logits)
+
+    def _get_hybrid_lm_head_row_mask(
+        self, hidden_states: torch.Tensor
+    ) -> torch.Tensor | None:
+        """Return a valid per-row compact-path mask, if one is installed."""
+        mask = self.hybrid_lm_head_row_mask
+        if mask is None:
+            return None
+        if mask.ndim != 1 or mask.shape[0] != hidden_states.shape[0]:
+            # The mask is tied to one target sampling call.  Prompt-logprob
+            # and draft calls can have a different number of rows, in which
+            # case silently using the normal all-row policy is safest.
+            return None
+        if mask.device != hidden_states.device:
+            mask = mask.to(hidden_states.device, non_blocking=True)
+        return mask.to(dtype=torch.bool)
 
     @staticmethod
     def _get_shard_token_ids(
@@ -246,6 +293,46 @@ class LogitsProcessor(PluggableLayer):
         hidden_states: torch.Tensor,
         embedding_bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        row_mask = self._get_hybrid_lm_head_row_mask(hidden_states)
+        if row_mask is not None and not bool(row_mask.all()):
+            # Mixed prefill/decode batches are ordered by request, while the
+            # compact lm-head receives one row per sampled logit.  Compute
+            # only decode rows with the hybrid path and preserve the full
+            # BF16 path for prompt-tail rows.
+            result = torch.empty(
+                hidden_states.shape[0], dtype=torch.int32, device=hidden_states.device
+            )
+            enabled_rows = torch.nonzero(row_mask, as_tuple=True)[0]
+            if enabled_rows.numel() > 0:
+                result[enabled_rows] = self._get_top_tokens_single(
+                    lm_head,
+                    hidden_states[enabled_rows].contiguous(),
+                    embedding_bias=embedding_bias,
+                    _hybrid_enabled=True,
+                )
+            disabled_rows = torch.nonzero(~row_mask, as_tuple=True)[0]
+            if disabled_rows.numel() > 0:
+                result[disabled_rows] = self._get_top_tokens_single(
+                    lm_head,
+                    hidden_states[disabled_rows].contiguous(),
+                    embedding_bias=embedding_bias,
+                    _hybrid_enabled=False,
+                )
+            return result
+        return self._get_top_tokens_single(
+            lm_head,
+            hidden_states,
+            embedding_bias=embedding_bias,
+        )
+
+    def _get_top_tokens_single(
+        self,
+        lm_head: VocabParallelEmbedding,
+        hidden_states: torch.Tensor,
+        embedding_bias: torch.Tensor | None = None,
+        *,
+        _hybrid_enabled: bool | None = None,
+    ) -> torch.Tensor:
         """Vocab-parallel argmax without all-gathering full logits.
 
         Each TP rank computes local argmax, then only the (value, index) pairs
@@ -266,12 +353,14 @@ class LogitsProcessor(PluggableLayer):
             shard_token_ids = self._get_shard_token_ids(lm_head, hidden_states.device)
             active_vocab_size = local_vocab_size
 
-        hybrid_state = getattr(lm_head, "_hybrid_mxfp8_lm_head_state", None)
+        hybrid_state = self._get_hybrid_lm_head_state(lm_head)
         if (
             hybrid_state is not None
             and shard_token_ids is None
             and self.soft_cap is None
             and self.scale > 0.0
+            and self.hybrid_lm_head_enabled
+            and _hybrid_enabled is not False
             and hybrid_state.can_use(
                 hidden_states,
                 bf16_weight=lm_head.weight,
@@ -288,7 +377,9 @@ class LogitsProcessor(PluggableLayer):
                 None,
                 active_vocab_size,
             )
-            candidate_indices = hybrid_state.select_candidates(coarse_logits)
+            candidate_indices = self._select_hybrid_candidates(
+                hybrid_state, coarse_logits, top_k=1
+            )
             exact_logits = hybrid_state.refine_logits(
                 hidden_states,
                 lm_head.weight,
@@ -560,8 +651,9 @@ class LogitsProcessor(PluggableLayer):
         output_unique_token_ids: torch.Tensor | None = None,
         num_output_unique_tokens: torch.Tensor | None = None,
         embedding_bias: torch.Tensor | None = None,
+        _hybrid_enabled: bool | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, int, torch.Tensor | None]:
-        """Compute a processed local top-k, using hybrid MXFP8 when eligible."""
+        """Compute local top-k, using hybrid MXFP4/MXFP8 when eligible."""
         shard_indices = lm_head.shard_indices
         vocab_start = shard_indices.org_vocab_start_index
         local_vocab_size = getattr(
@@ -576,10 +668,75 @@ class LogitsProcessor(PluggableLayer):
             active_vocab_size = local_vocab_size
 
         local_top_k = min(top_k, active_vocab_size)
-        hybrid_state = getattr(lm_head, "_hybrid_mxfp8_lm_head_state", None)
+
+        row_mask = (
+            None
+            if _hybrid_enabled is not None
+            else self._get_hybrid_lm_head_row_mask(hidden_states)
+        )
+        hybrid_state = self._get_hybrid_lm_head_state(lm_head)
+        can_split_rows = (
+            row_mask is not None
+            and not bool(row_mask.all())
+            and hybrid_state is not None
+            and self.hybrid_lm_head_enabled
+            and shard_token_ids is None
+            and self.soft_cap is None
+            and self.scale == 1.0
+            and presence_penalties is None
+            and output_token_ids is None
+            and output_token_counts is None
+            and presence_request_indices is None
+            and output_unique_token_ids is None
+            and num_output_unique_tokens is None
+            and embedding_bias is None
+        )
+        if can_split_rows:
+            # Presence penalties and non-monotonic processors need request
+            # metadata that is not row-aligned, so keep those calls on one
+            # full-vocab path.  The common speculative top-k path has no such
+            # processors and can safely split decode rows from prompt tails.
+            enabled_rows = torch.nonzero(row_mask, as_tuple=True)[0]
+            disabled_rows = torch.nonzero(~row_mask, as_tuple=True)[0]
+            local_vals = torch.empty(
+                (hidden_states.shape[0], local_top_k),
+                dtype=torch.float32,
+                device=hidden_states.device,
+            )
+            local_indices = torch.empty(
+                (hidden_states.shape[0], local_top_k),
+                dtype=torch.int64,
+                device=hidden_states.device,
+            )
+            if enabled_rows.numel() > 0:
+                enabled_vals, enabled_indices, _, _ = self._get_local_topk(
+                    lm_head,
+                    hidden_states[enabled_rows].contiguous(),
+                    top_k=top_k,
+                    temperature=temperature,
+                    embedding_bias=embedding_bias,
+                    _hybrid_enabled=True,
+                )
+                local_vals[enabled_rows] = enabled_vals
+                local_indices[enabled_rows] = enabled_indices
+            disabled_vals, disabled_indices, _, _ = self._get_local_topk(
+                lm_head,
+                hidden_states[disabled_rows].contiguous(),
+                top_k=top_k,
+                temperature=temperature,
+                embedding_bias=embedding_bias,
+                _hybrid_enabled=False,
+            )
+            local_vals[disabled_rows] = disabled_vals
+            local_indices[disabled_rows] = disabled_indices
+            return local_vals, local_indices, vocab_start, None
+
+        hybrid_state = self._get_hybrid_lm_head_state(lm_head)
         if (
             hybrid_state is not None
             and shard_token_ids is None
+            and self.hybrid_lm_head_enabled
+            and _hybrid_enabled is not False
             and hybrid_state.can_use(
                 hidden_states,
                 bf16_weight=lm_head.weight,
@@ -648,7 +805,9 @@ class LogitsProcessor(PluggableLayer):
                 None,
                 active_vocab_size,
             )
-            candidate_indices = hybrid_state.select_candidates(coarse_logits)
+            candidate_indices = self._select_hybrid_candidates(
+                hybrid_state, coarse_logits, top_k=local_top_k
+            )
 
             exact_logits = hybrid_state.refine_logits(
                 hidden_states,

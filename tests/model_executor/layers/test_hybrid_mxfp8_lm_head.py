@@ -39,9 +39,15 @@ class _FakeHybridState:
     ) -> torch.Tensor:
         return self._coarse_logits.expand(hidden_states.shape[0], -1).clone()
 
-    def select_candidates(self, coarse_logits: torch.Tensor) -> torch.Tensor:
+    def select_candidates(
+        self,
+        coarse_logits: torch.Tensor,
+        *,
+        top_k: int | None = None,
+    ) -> torch.Tensor:
         self.selected_dtype = coarse_logits.dtype
-        return torch.topk(coarse_logits, self.candidates, dim=-1, sorted=False).indices
+        candidates = self.candidates if top_k is None else min(top_k, self.candidates)
+        return torch.topk(coarse_logits, candidates, dim=-1, sorted=False).indices
 
     def refine_logits(
         self,

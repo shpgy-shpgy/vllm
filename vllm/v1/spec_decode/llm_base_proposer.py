@@ -1546,6 +1546,25 @@ class SpecDecodeBaseProposer:
 
         if share_lm_head and hasattr(target_language_model, "lm_head"):
             if hasattr(self.model, "lm_head"):
+                draft_lm_head = self.model.lm_head
+                if (
+                    draft_lm_head is not target_language_model.lm_head
+                    and hasattr(draft_lm_head, "_hybrid_mxfp4_lm_head_state")
+                ):
+                    from vllm.model_executor.layers.hybrid_mxfp4_lm_head import (
+                        release_hybrid_mxfp4_lm_head,
+                    )
+
+                    release_hybrid_mxfp4_lm_head(draft_lm_head)
+                if (
+                    draft_lm_head is not target_language_model.lm_head
+                    and hasattr(draft_lm_head, "_hybrid_mxfp8_lm_head_state")
+                ):
+                    from vllm.model_executor.layers.hybrid_mxfp8_lm_head import (
+                        release_hybrid_mxfp8_lm_head,
+                    )
+
+                    release_hybrid_mxfp8_lm_head(draft_lm_head)
                 del self.model.lm_head
             self.model.lm_head = target_language_model.lm_head
 
@@ -1561,6 +1580,21 @@ class SpecDecodeBaseProposer:
                 for layer in items:
                     sh = getattr(layer, "shared_head", None)
                     if sh is not None and hasattr(sh, "head"):
+                        old_head = sh.head
+                        if (
+                            old_head is not target_language_model.lm_head
+                            and hasattr(old_head, "_hybrid_mxfp4_lm_head_state")
+                        ):
+                            from vllm.model_executor.layers import hybrid_mxfp4_lm_head
+
+                            hybrid_mxfp4_lm_head.release_hybrid_mxfp4_lm_head(old_head)
+                        if (
+                            old_head is not target_language_model.lm_head
+                            and hasattr(old_head, "_hybrid_mxfp8_lm_head_state")
+                        ):
+                            from vllm.model_executor.layers import hybrid_mxfp8_lm_head
+
+                            hybrid_mxfp8_lm_head.release_hybrid_mxfp8_lm_head(old_head)
                         del sh.head
                         sh.head = target_language_model.lm_head
                         logger.info(

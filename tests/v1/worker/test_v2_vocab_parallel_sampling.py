@@ -206,8 +206,16 @@ def test_compact_rejection_sampler(
     assert output.num_rejected.tolist() == expected_rejected
 
 
-def test_greedy_speculative_sampling_uses_compact_tokens(monkeypatch) -> None:
-    monkeypatch.setattr(envs, "VLLM_HYBRID_MXFP8_LM_HEAD", True)
+@pytest.mark.parametrize(
+    "hybrid_env",
+    ["VLLM_HYBRID_MXFP4_LM_HEAD", "VLLM_HYBRID_MXFP8_LM_HEAD"],
+)
+def test_greedy_speculative_sampling_uses_compact_tokens(
+    monkeypatch, hybrid_env: str
+) -> None:
+    monkeypatch.setattr(envs, "VLLM_HYBRID_MXFP4_LM_HEAD", False)
+    monkeypatch.setattr(envs, "VLLM_HYBRID_MXFP8_LM_HEAD", False)
+    monkeypatch.setattr(envs, hybrid_env, True)
     runner = object.__new__(GPUModelRunner)
     runner.sampler = SimpleNamespace(
         get_vocab_parallel_sampling_params=lambda _: (
@@ -262,6 +270,7 @@ def test_greedy_speculative_sampling_uses_compact_tokens(monkeypatch) -> None:
 
 
 def test_greedy_speculative_sampling_keeps_bf16_route(monkeypatch) -> None:
+    monkeypatch.setattr(envs, "VLLM_HYBRID_MXFP4_LM_HEAD", False)
     monkeypatch.setattr(envs, "VLLM_HYBRID_MXFP8_LM_HEAD", False)
     runner = object.__new__(GPUModelRunner)
     runner.sampler = SimpleNamespace(

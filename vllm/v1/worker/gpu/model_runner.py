@@ -191,6 +191,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Speculative decoding.
         self.speculator = None
+        # Cached references avoid traversing the full target/draft module tree
+        # on every sampling step when toggling the prefill guard below.
+        self._hybrid_lm_head_processors: tuple[Any, ...] = ()
+        self._target_hybrid_lm_head_processors: tuple[Any, ...] = ()
+        self._draft_hybrid_lm_head_processors: tuple[Any, ...] = ()
         self.use_aux_hidden_state_outputs = False
         self.num_speculative_steps = vllm_config.num_speculative_tokens
         if self.speculative_config is not None:
@@ -318,6 +323,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.model_state = init_model_state(
             self.vllm_config, self.model, self.encoder_cache, self.device
         )
+        self._hybrid_lm_head_processors = self._collect_hybrid_lm_head_processors()
 
         self.decode_query_len = (
             self.num_speculative_steps
@@ -374,6 +380,76 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     def get_model(self) -> nn.Module:
         return self.model
+
+    def _collect_hybrid_lm_head_processors(self) -> tuple[Any, ...]:
+        """Cache target/draft logits processors used by hybrid lm-heads."""
+        def collect(models: list[Any]) -> tuple[Any, ...]:
+            processors: list[Any] = []
+            seen: set[int] = set()
+            for model in models:
+                if not isinstance(model, nn.Module):
+                    continue
+                for module in model.modules():
+                    processor = getattr(module, "logits_processor", None)
+                    if processor is None or not hasattr(
+                        processor, "hybrid_lm_head_enabled"
+                    ):
+                        continue
+                    if id(processor) in seen:
+                        continue
+                    seen.add(id(processor))
+                    processors.append(processor)
+            return tuple(processors)
+
+        target = collect([self.model])
+        draft_model = getattr(self.speculator, "model", None)
+        draft = collect([draft_model]) if draft_model is not None else ()
+        self._target_hybrid_lm_head_processors = target
+        self._draft_hybrid_lm_head_processors = draft
+
+        processors: list[Any] = []
+        seen: set[int] = set()
+        for processor in (*target, *draft):
+            if id(processor) in seen:
+                continue
+            seen.add(id(processor))
+            processors.append(processor)
+        return tuple(processors)
+
+    @staticmethod
+    def _set_hybrid_lm_head_enabled_for(
+        processors: tuple[Any, ...], enabled: bool
+    ) -> None:
+        for processor in processors:
+            processor.hybrid_lm_head_enabled = enabled
+
+    @staticmethod
+    def _set_hybrid_lm_head_row_mask_for(
+        processors: tuple[Any, ...], row_mask: torch.Tensor | None
+    ) -> None:
+        for processor in processors:
+            processor.hybrid_lm_head_row_mask = row_mask
+
+    def _make_hybrid_lm_head_row_mask(
+        self, input_batch: InputBatch
+    ) -> torch.Tensor:
+        """Expand per-request decode eligibility to target logits rows."""
+        num_logits_per_req = np.diff(input_batch.cu_num_logits_np)
+        allow_hybrid = np.logical_not(input_batch.is_prefilling_np)
+        row_mask_np = np.repeat(allow_hybrid, num_logits_per_req)
+        return torch.from_numpy(row_mask_np).to(self.device, non_blocking=True)
+
+    def _set_hybrid_lm_head_enabled(self, enabled: bool) -> None:
+        self._set_hybrid_lm_head_enabled_for(
+            self._hybrid_lm_head_processors, enabled
+        )
+
+    def _set_hybrid_lm_head_row_mask(
+        self, row_mask: torch.Tensor | None
+    ) -> None:
+        self._set_hybrid_lm_head_row_mask_for(
+            self._target_hybrid_lm_head_processors, row_mask
+        )
 
     def reload_weights(self, *args, **kwargs) -> None:
         # TODO(Wentao): Use full version instead of import when fully migrated to v2
@@ -1152,7 +1228,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 )
 
         if (
-            envs.VLLM_HYBRID_MXFP8_LM_HEAD
+            (
+                envs.VLLM_HYBRID_NVFP4_LM_HEAD
+                or envs.VLLM_HYBRID_MXFP4_LM_HEAD
+                or envs.VLLM_HYBRID_MXFP8_LM_HEAD
+            )
             and fast_path_params is not None
             and fast_path_params[0] == "greedy"
             and input_batch.num_draft_tokens > 0
@@ -1569,9 +1649,49 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
             return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
 
+        # FP4's compact path is optimized for steady-state decode, while an
+        # all-prefill step pays the activation-quantization/GEMM setup cost on
+        # the TTFT-critical path.  The old global ``any(prefilling)`` guard
+        # avoided that cost, but also disabled the compact lm-head for decode
+        # rows in the same mixed batch.  The default ``all`` mode now keeps
+        # every row on the hybrid path.  MXFP4 pads dynamic M to a warmed
+        # bucket; NVFP4 b12x handles the dynamic M directly.  ``row_split``
+        # and ``draft_all`` remain diagnostic fallbacks for isolating
+        # prompt-tail and draft-path costs.
+        mixed_batch_mode = envs.VLLM_HYBRID_MXFP4_LM_HEAD_MIXED_BATCH_MODE
+        if mixed_batch_mode not in ("row_split", "draft_all", "all"):
+            mixed_batch_mode = "all"
+        hybrid_prefill_guard = bool(
+            (
+                envs.VLLM_HYBRID_NVFP4_LM_HEAD
+                or envs.VLLM_HYBRID_MXFP4_LM_HEAD
+            )
+            and mixed_batch_mode != "all"
+            and input_batch.is_prefilling_np.size > 0
+            and np.any(input_batch.is_prefilling_np)
+        )
+        self._set_hybrid_lm_head_row_mask(None)
+        self._set_hybrid_lm_head_enabled(True)
+        if hybrid_prefill_guard:
+            self._set_hybrid_lm_head_row_mask(
+                self._make_hybrid_lm_head_row_mask(input_batch)
+            )
+            if mixed_batch_mode != "draft_all":
+                self._set_hybrid_lm_head_enabled_for(
+                    self._draft_hybrid_lm_head_processors, False
+                )
+
         # Last rank: sample tokens
         sampler_output, num_sampled, num_rejected = self.sample(
             hidden_states, input_batch, grammar_output
+        )
+
+        # Prompt logprobs and the draft proposal have different row layouts;
+        # do not let the target sampling mask leak into either call.  Draft
+        # graphs use the conservative global setting for mixed prefills.
+        self._set_hybrid_lm_head_row_mask(None)
+        self._set_hybrid_lm_head_enabled_for(
+            self._target_hybrid_lm_head_processors, True
         )
 
         if self.pp_handler is not None:
@@ -1659,6 +1779,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 mm_inputs=mm_inputs,
             )
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
+
+        self._set_hybrid_lm_head_enabled(True)
 
         if self.num_speculative_steps > 0:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does

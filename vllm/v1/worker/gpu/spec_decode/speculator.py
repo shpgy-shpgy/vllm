@@ -162,13 +162,17 @@ class DraftModelSpeculator(BaseSpeculator):
         self.model = self.load_draft_model(target_model, target_attn_layer_names)
         if (
             not self.use_local_argmax_reduction
-            and envs.VLLM_HYBRID_MXFP8_LM_HEAD
+            and (
+                envs.VLLM_HYBRID_NVFP4_LM_HEAD
+                or envs.VLLM_HYBRID_MXFP4_LM_HEAD
+                or envs.VLLM_HYBRID_MXFP8_LM_HEAD
+            )
             and self.speculative_config.draft_sample_method == "greedy"
             and hasattr(self.model, "get_top_tokens")
         ):
             self.use_local_argmax_reduction = True
             logger.info(
-                "Hybrid MXFP8 lm-head automatically enabled local argmax "
+                "Hybrid MXFP4/MXFP8 lm-head automatically enabled local argmax "
                 "reduction for greedy draft token generation."
             )
         self._validate_local_argmax_reduction()

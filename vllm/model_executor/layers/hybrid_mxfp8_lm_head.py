@@ -35,6 +35,42 @@ _WEIGHT_NAME = "_hybrid_mxfp8_lm_head_weight"
 _SCALE_NAME = "_hybrid_mxfp8_lm_head_scale"
 _STATE_NAME = "_hybrid_mxfp8_lm_head_state"
 _BUFFER_NAMES = (_WEIGHT_NAME, _SCALE_NAME)
+_DEFAULT_AUTOTUNE_MAX_ROWS = 2048
+_TOPK_CANDIDATE_MULTIPLIER = 8
+_MAX_AUTO_CANDIDATES = 1024
+
+
+def _candidate_count_for_topk(
+    configured_candidates: int,
+    top_k: int,
+    *,
+    output_size: int,
+) -> int:
+    """Return a cheap, accuracy-oriented candidate width for ``top_k``.
+
+    The persistent MXFP weight is independent of the candidate width, so a
+    top-k request can afford to refine more coarse candidates without another
+    quantized copy.  Keep the configured width for greedy/MTP and the common
+    small top-k path; for larger top-k requests expand in power-of-two steps.
+    The 1024 cap matches the fast indexed reduction kernels.  Requests above
+    that width are rejected by ``can_use`` and use the original full-logit
+    path instead.
+    """
+    if top_k <= 0 or configured_candidates >= _MAX_AUTO_CANDIDATES:
+        return min(configured_candidates, output_size)
+
+    # Do not penalize the default top-k=20 path when the configured width is
+    # 128.  Expansion starts once the requested top-k is large enough that a
+    # wider candidate set materially improves recall (e.g. top-k=40).
+    desired = max(configured_candidates, top_k * _TOPK_CANDIDATE_MULTIPLIER)
+    if desired <= configured_candidates * 2:
+        return min(configured_candidates, output_size)
+
+    if desired >= _MAX_AUTO_CANDIDATES:
+        expanded = _MAX_AUTO_CANDIDATES
+    else:
+        expanded = 1 << (desired - 1).bit_length()
+    return min(max(configured_candidates, expanded), output_size)
 
 
 def _select_indexed_bf16_candidate_tile(
@@ -211,14 +247,20 @@ def indexed_bf16_dot(
 def select_lm_head_candidates(
     coarse_logits: torch.Tensor,
     candidates: int,
+    *,
+    use_flashinfer_topk: bool | None = None,
+    format_name: str = "MXFP8",
 ) -> torch.Tensor:
     """Select an unsorted exact top-k set with the fastest available backend."""
-    if envs.VLLM_HYBRID_MXFP8_LM_HEAD_USE_FLASHINFER_TOPK and has_flashinfer():
+    if use_flashinfer_topk is None:
+        use_flashinfer_topk = envs.VLLM_HYBRID_MXFP8_LM_HEAD_USE_FLASHINFER_TOPK
+    if use_flashinfer_topk and has_flashinfer():
         from flashinfer import top_k as flashinfer_top_k
 
         logger.info_once(
-            "Hybrid MXFP8 lm-head is using FlashInfer exact unsorted top-k "
-            "candidate selection; FlashInfer auto-dispatches its backend."
+            "Hybrid %s lm-head is using FlashInfer exact unsorted top-k "
+            "candidate selection; FlashInfer auto-dispatches its backend.",
+            format_name,
         )
         _, candidate_indices = flashinfer_top_k(
             coarse_logits,
@@ -245,6 +287,18 @@ class HybridMxfp8LmHead:
     candidates: int
     max_rows: int
 
+    def candidate_count_for_topk(self, top_k: int) -> int:
+        """Choose the refinement width for a top-k request.
+
+        This changes only the transient candidate-index/logit tensors; the
+        persistent MXFP8 copy remains exactly the configured size.
+        """
+        return _candidate_count_for_topk(
+            self.candidates,
+            top_k,
+            output_size=self.output_size,
+        )
+
     def can_use(
         self,
         hidden_states: torch.Tensor,
@@ -264,9 +318,12 @@ class HybridMxfp8LmHead:
             or not bf16_weight.is_contiguous()
             or bf16_weight.shape != (self.output_size, self.input_size)
             or active_vocab_size > self.output_size
-            or top_k > self.candidates
-            or active_vocab_size < self.candidates
-            or hidden_states.shape[0] > self.max_rows
+            or top_k > self.candidate_count_for_topk(top_k)
+            or active_vocab_size < self.candidate_count_for_topk(top_k)
+            or (
+                self.max_rows > 0
+                and hidden_states.shape[0] > self.max_rows
+            )
         )
 
     def coarse_logits(
@@ -292,8 +349,29 @@ class HybridMxfp8LmHead:
             logits += bias
         return logits
 
-    def select_candidates(self, coarse_logits: torch.Tensor) -> torch.Tensor:
-        return select_lm_head_candidates(coarse_logits, self.candidates)
+    def select_candidates(
+        self,
+        coarse_logits: torch.Tensor,
+        *,
+        top_k: int | None = None,
+    ) -> torch.Tensor:
+        candidates = (
+            self.candidates
+            if top_k is None
+            else self.candidate_count_for_topk(top_k)
+        )
+        candidates = min(candidates, coarse_logits.shape[-1])
+        if top_k is not None and candidates > self.candidates:
+            logger.info_once(
+                "Hybrid MXFP8 lm-head expands transient candidates from %d "
+                "to %d for top-k=%d; persistent copy remains at configured "
+                "width %d.",
+                self.candidates,
+                candidates,
+                top_k,
+                self.candidates,
+            )
+        return select_lm_head_candidates(coarse_logits, candidates)
 
     @staticmethod
     def refine_logits(
@@ -325,24 +403,41 @@ def warmup_hybrid_mxfp8_lm_head_kernels(
         device=state.weight.device,
     )
     coarse_logits = state.coarse_logits(hidden_states, None)
-    candidate_indices = state.select_candidates(coarse_logits)
-    exact_logits = state.refine_logits(
-        hidden_states,
-        bf16_weight,
-        candidate_indices,
-        None,
-    )
-    indexed_argmax_triton(exact_logits, candidate_indices)
-    if state.max_rows >= 16:
-        tiled_rows = min(state.max_rows, 16)
-        tiled_hidden_states = hidden_states.expand(tiled_rows, -1).contiguous()
-        tiled_candidate_indices = candidate_indices.expand(tiled_rows, -1).contiguous()
-        state.refine_logits(
-            tiled_hidden_states,
+    candidate_sets = [state.select_candidates(coarse_logits)]
+    # Also warm the widest accuracy-sensitive sampling path.  This keeps
+    # candidate-width JIT work out of the first top-k=40 request while the
+    # configured greedy/MTP width remains warmed independently.
+    if hasattr(state, "candidate_count_for_topk"):
+        wide_candidates = state.select_candidates(coarse_logits, top_k=40)
+        if wide_candidates.shape[-1] != candidate_sets[0].shape[-1]:
+            candidate_sets.append(wide_candidates)
+
+    # The Triton indexed-argmax kernel is intentionally limited to 1024
+    # candidates.  Larger configured candidate sets still work through the
+    # regular torch reduction in the logits processor; only skip this warmup
+    # call for those shapes.
+    for candidate_indices in candidate_sets:
+        exact_logits = state.refine_logits(
+            hidden_states,
             bf16_weight,
-            tiled_candidate_indices,
+            candidate_indices,
             None,
         )
+        if exact_logits.shape[-1] <= 1024:
+            indexed_argmax_triton(exact_logits, candidate_indices)
+    if state.max_rows == 0 or state.max_rows >= 16:
+        tiled_rows = 16 if state.max_rows == 0 else min(state.max_rows, 16)
+        tiled_hidden_states = hidden_states.expand(tiled_rows, -1).contiguous()
+        for candidate_indices in candidate_sets:
+            tiled_candidate_indices = candidate_indices.expand(
+                tiled_rows, -1
+            ).contiguous()
+            state.refine_logits(
+                tiled_hidden_states,
+                bf16_weight,
+                tiled_candidate_indices,
+                None,
+            )
     if tp_size > 1:
         gathered_pairs = torch.zeros(
             (1, tp_size * 2),
@@ -361,6 +456,8 @@ def autotune_row_buckets(max_rows: int) -> tuple[int, ...]:
     live autotune pass, so mirror FlashInfer's bucket list here and tune all
     of them during loading instead.
     """
+    if max_rows <= 0:
+        max_rows = _DEFAULT_AUTOTUNE_MAX_ROWS
     try:
         from flashinfer.fused_moe.utils import get_hybrid_num_tokens_buckets
 
@@ -450,10 +547,11 @@ def prepare_hybrid_mxfp8_lm_head(
         )
         return False
     max_rows = envs.VLLM_HYBRID_MXFP8_LM_HEAD_MAX_ROWS
-    if max_rows < 1:
+    if max_rows < 0:
         logger.warning_once(
-            "Hybrid MXFP8 lm-head max rows must be positive, got %d; "
-            "falling back to the original lm-head implementation.",
+            "Hybrid MXFP8 lm-head max rows must be non-negative, got %d; "
+            "use 0 for no limit. Falling back to the original lm-head "
+            "implementation.",
             max_rows,
         )
         return False
@@ -488,11 +586,11 @@ def prepare_hybrid_mxfp8_lm_head(
     )
     logger.info_once(
         "Prepared shape-generic hybrid MXFP8 lm-head for weight %s with %d "
-        "candidates and M<=%d (%.2f MiB persistent overhead; FlashInfer "
+        "candidates and M<=%s (%.2f MiB persistent overhead; FlashInfer "
         "tactic autotune and kernel warmup run in the startup warmup stage).",
         tuple(weight.shape),
         candidates,
-        max_rows,
+        "unlimited" if max_rows == 0 else str(max_rows),
         extra_mib,
     )
     return True

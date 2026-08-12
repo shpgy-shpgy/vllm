@@ -371,9 +371,17 @@ def warmup_kernels(
             worker_execute_model(cleanup)
 
         if hasattr(model_runner.model, "get_top_tokens"):
+            # The compact greedy speculative sampler has its own Triton
+            # rejection kernel.  The generic sampler warmup above exercises
+            # speculative decoding with processed logits, so explicitly run
+            # the greedy+MTP path before the JIT monitor is enabled.
             _run_vocab_parallel_sampling_warmup(
-                SamplingParams(max_tokens=2, temperature=0.0),
+                SamplingParams(
+                    max_tokens=max(2, decode_query_len + 1),
+                    temperature=0.0,
+                ),
                 "greedy",
+                warm_spec_decode=num_spec_steps > 0,
             )
         if hasattr(model_runner.model, "sample_full_tokens"):
             _run_vocab_parallel_sampling_warmup(
