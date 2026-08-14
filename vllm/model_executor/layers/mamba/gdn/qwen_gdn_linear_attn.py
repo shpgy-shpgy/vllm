@@ -248,6 +248,7 @@ def fi_chunk_gated_delta_rule(
     output_final_state: bool,
     cu_seqlens: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = True,
+    output: torch.Tensor | None = None,
 ):
     from flashinfer.gdn_prefill import (
         chunk_gated_delta_rule as chunk_gated_delta_rule_fi,
@@ -276,13 +277,14 @@ def fi_chunk_gated_delta_rule(
         initial_state=fi_state,
         output_final_state=output_final_state,
         cu_seqlens=cu_seqlens,
+        output=output,
     )
     # FlashInfer returns (output, state) when output_final_state=True,
     # or just output when output_final_state=False.
     # Unsqueeze back to 4D (1, L, H, D) to match fla output format
     if output_final_state:
-        output, final_state = result
-        return output.unsqueeze(0), final_state
+        result_output, final_state = result
+        return result_output.unsqueeze(0), final_state
     else:
         return result.unsqueeze(0), None
 
@@ -325,6 +327,10 @@ class ChunkGatedDeltaRule(CustomOp):
         use_qk_l2norm_in_kernel: bool = True,
         core_attn_out: torch.Tensor | None = None,
     ):
+        # FlashInfer's public GDN API supports caller-provided output/state
+        # buffers.  Keep the output argument optional for the custom-op ABI,
+        # while allowing the mixed-prefill path to reuse the model runner's
+        # output allocation.
         o, final_state = fi_chunk_gated_delta_rule(
             q=q,
             k=k,
@@ -335,11 +341,8 @@ class ChunkGatedDeltaRule(CustomOp):
             output_final_state=output_final_state,
             cu_seqlens=cu_seqlens,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            output=core_attn_out,
         )
-        if core_attn_out is not None:
-            o_flat = o.squeeze(0).reshape(-1)
-            co_flat = core_attn_out.reshape(-1)
-            co_flat[: o_flat.numel()].copy_(o_flat)
         return o, final_state
 
     def forward_native(
@@ -1512,6 +1515,21 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             assert prefill_has_initial_state is not None
             initial_state = ssm_state[prefill_state_indices]
             initial_state[~prefill_has_initial_state, ...] = 0
+
+            # For a non-speculative batch the prefill rows are contiguous in
+            # the caller-owned output.  Let the chunk kernel write there
+            # directly; this avoids an intermediate output tensor and a
+            # follow-up device copy on every layer.  Speculative batches need
+            # index-based stitching below, so they retain the compact result.
+            prefill_output = None
+            direct_prefill_output = spec_sequence_masks is None
+            if direct_prefill_output:
+                prefill_start = num_decode_tokens if split_non_spec else 0
+                prefill_output = core_attn_out[
+                    prefill_start:num_actual_tokens
+                ]
+            else:
+                prefill_output = None
             (
                 core_attn_out_non_spec,
                 last_recurrent_state,
@@ -1527,16 +1545,21 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 chunk_indices=attn_metadata.chunk_indices,
                 chunk_offsets=attn_metadata.chunk_offsets,
                 use_qk_l2norm_in_kernel=False,
+                core_attn_out=prefill_output,
             )
             # Init cache
             ssm_state[prefill_state_indices] = last_recurrent_state.to(ssm_state.dtype)
 
             if split_non_spec:
-                # Stitch the peeled decode outputs in front of the prefill
-                # outputs (decode-first order).
-                core_attn_out_non_spec = torch.cat(
-                    [core_attn_out_decode, core_attn_out_non_spec], dim=1
-                )
+                # The runner already keeps non-spec requests decode-first.  Write
+                # each result directly into the caller-owned output buffer instead
+                # of materializing a concatenated [1, T, H, D] tensor per layer.
+                # Besides the copy itself, ``torch.cat`` used to create a sizable
+                # transient allocation on every mixed iteration; this is especially
+                # costly for long prefill chunks and can compete with KV-cache
+                # headroom even though it is not part of the KV cache.
+                core_attn_out[:num_decode_tokens] = core_attn_out_decode.squeeze(0)
+                core_attn_out_non_spec = None
         elif attn_metadata.num_decodes > 0:
             core_attn_out_non_spec, last_recurrent_state = (
                 fused_sigmoid_gating_delta_rule_update(
@@ -1562,17 +1585,20 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         # 3. Merge core attention output
         if spec_sequence_masks is not None and core_attn_out_non_spec is not None:
-            merged_out = torch.empty(
-                (1, num_actual_tokens, *core_attn_out_spec.shape[2:]),
-                dtype=core_attn_out_non_spec.dtype,
-                device=core_attn_out_non_spec.device,
+            # Both index tensors address the first dimension of the flattened
+            # caller-owned output.  Avoid the temporary merged_out buffer and its
+            # extra device-to-device copy.
+            core_attn_out.index_copy_(
+                0, spec_token_indx, core_attn_out_spec.squeeze(0)
             )
-            merged_out.index_copy_(1, spec_token_indx, core_attn_out_spec)
-            merged_out.index_copy_(1, non_spec_token_indx, core_attn_out_non_spec)
-            core_attn_out[:num_actual_tokens] = merged_out.squeeze(0)
+            core_attn_out.index_copy_(
+                0, non_spec_token_indx, core_attn_out_non_spec.squeeze(0)
+            )
         elif spec_sequence_masks is not None:
             core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
-        else:
+        elif core_attn_out_non_spec is not None and not (
+            spec_sequence_masks is None and attn_metadata.num_prefills > 0
+        ):
             core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)
 
     def _forward_core_decode_aiter(

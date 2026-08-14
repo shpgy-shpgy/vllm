@@ -78,13 +78,29 @@ def _select_indexed_bf16_candidate_tile(
     num_candidates: int,
     input_size: int,
 ) -> int:
-    # Tiling changes the floating-point reduction order. At larger row counts,
-    # a handful of near-tied logits can therefore change greedy continuations
-    # and downstream MoE routing for much more than the few microseconds saved
-    # by the refinement kernel. Keep the original scalar reduction there.
-    if num_rows < 16 or num_rows >= 64 or num_candidates < 64 or input_size > 2048:
+    # The tiled kernel keeps the same FP32 reduction order for each candidate;
+    # it only shares the hidden load across a small group of candidates.  The
+    # old large-hidden guard forced the 27B (K=5120) lm-head through one
+    # program per candidate, even though small candidate tiles are consistently
+    # faster for mixed/decode row counts and produce bit-identical BF16 results.
+    if num_rows < 8 or num_candidates < 64:
         return 1
-    return 4
+    if input_size <= 2048:
+        # 35B (K=2048) has enough occupancy for tile=4 even for the larger
+        # prefill buckets.  The tiled kernel keeps the same per-candidate
+        # reduction order, so this is both faster and numerically stable.
+        return 4
+    if num_rows < 20:
+        return 4
+    if num_rows < 48:
+        # K=5120 reaches the best occupancy with a wider tile for the common
+        # BS16/32 mixed/decode shapes.
+        return 8
+    if num_rows < 80:
+        return 4
+    # At larger M, tile=8 becomes register-bound for the dense 27B head;
+    # tile=2 is the stable low-register choice.
+    return 2
 
 
 @triton.jit

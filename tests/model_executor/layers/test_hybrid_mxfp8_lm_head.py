@@ -82,12 +82,16 @@ def _make_lm_head(hybrid_state: _FakeHybridState) -> SimpleNamespace:
         (1, 128, 2048, 1),
         (16, 128, 2048, 4),
         (63, 128, 2048, 4),
-        (64, 128, 2048, 1),
-        (96, 128, 2048, 1),
-        (192, 128, 2048, 1),
-        (288, 128, 2048, 1),
+        (64, 128, 2048, 4),
+        (8, 128, 2048, 4),
+        (96, 128, 2048, 4),
+        (192, 128, 2048, 4),
+        (288, 128, 2048, 4),
         (96, 32, 2048, 1),
-        (96, 128, 4096, 1),
+        (16, 128, 4096, 4),
+        (32, 128, 4096, 8),
+        (63, 128, 4096, 4),
+        (96, 128, 4096, 2),
     ],
 )
 def test_indexed_bf16_candidate_tile_dispatch(
@@ -238,17 +242,20 @@ def test_sparse_presence_penalty_matches_dense_counts() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("rows", [3, 32, 192])
-def test_indexed_bf16_dot_matches_gathered_bmm(rows: int) -> None:
+@pytest.mark.parametrize(
+    ("rows", "input_size"),
+    [(3, 2048), (32, 2048), (192, 2048), (32, 5120)],
+)
+def test_indexed_bf16_dot_matches_gathered_bmm(rows: int, input_size: int) -> None:
     generator = torch.Generator(device="cuda").manual_seed(20260805)
     hidden = torch.randn(
-        (rows, 2048),
+        (rows, input_size),
         dtype=torch.bfloat16,
         device="cuda",
         generator=generator,
     )
     weight = torch.randn(
-        (1024, 2048),
+        (1024, input_size),
         dtype=torch.bfloat16,
         device="cuda",
         generator=generator,
