@@ -49,6 +49,42 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _get_mxfp6_sm120_models(worker: "Worker") -> list[torch.nn.Module]:
+    models = [worker.get_model()]
+    speculator = getattr(worker.model_runner, "speculator", None)
+    draft_model = getattr(speculator, "model", None)
+    if isinstance(draft_model, torch.nn.Module) and all(
+        draft_model is not model for model in models
+    ):
+        models.append(draft_model)
+    return models
+
+
+def _get_mxfp6_sm120_warmup_sizes(worker: "Worker") -> list[int]:
+    model_runner = worker.model_runner
+    capture_sizes = list(
+        worker.vllm_config.compilation_config.cudagraph_capture_sizes or []
+    )
+
+    cudagraph_manager = getattr(model_runner, "cudagraph_manager", None)
+    if cudagraph_manager is not None:
+        capture_sizes.extend(cudagraph_manager.get_capture_sizes())
+    else:
+        cudagraph_dispatcher = getattr(model_runner, "cudagraph_dispatcher", None)
+        if cudagraph_dispatcher is not None:
+            capture_sizes.extend(
+                desc.num_tokens
+                for _, descs in cudagraph_dispatcher.get_capture_descs()
+                for desc in descs
+            )
+
+    return [
+        1,
+        worker.scheduler_config.max_num_batched_tokens,
+        *capture_sizes,
+    ]
+
+
 def kernel_warmup(worker: "Worker"):
     from vllm.model_executor.warmup.minimax_m3_msa_warmup import (
         minimax_m3_msa_warmup,
@@ -94,10 +130,9 @@ def kernel_warmup(worker: "Worker"):
         max_tokens = worker.scheduler_config.max_num_batched_tokens
         deep_gemm_warmup(model, max_tokens)
 
-    capture_sizes = worker.vllm_config.compilation_config.cudagraph_capture_sizes or []
     warmup_mxfp6_sm120(
-        worker.get_model(),
-        [1, worker.scheduler_config.max_num_batched_tokens, *capture_sizes],
+        _get_mxfp6_sm120_models(worker),
+        _get_mxfp6_sm120_warmup_sizes(worker),
         worker.model_config.dtype,
     )
 

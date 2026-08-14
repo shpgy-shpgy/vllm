@@ -325,6 +325,17 @@ class CudaGraphManager:
     def needs_capture(self) -> bool:
         return len(self._capture_descs) > 0
 
+    def get_capture_sizes(self) -> list[int]:
+        """Return the distinct token counts that will be captured."""
+        return sorted(
+            {
+                desc.num_tokens
+                for descs in self._capture_descs.values()
+                for desc in descs
+            },
+            reverse=True,
+        )
+
     @torch.inference_mode()
     def capture(
         self,
@@ -618,9 +629,7 @@ class ModelCudaGraphManager(CudaGraphManager):
 
             return forward_fn, AttentionState(attn_metadata, slot_mappings)
 
-        capture_sizes = [
-            desc.num_tokens for descs in self._capture_descs.values() for desc in descs
-        ]
+        capture_sizes = self.get_capture_sizes()
 
         def warmup_capture_stream() -> None:
             from vllm.model_executor.layers.quantization.utils import (

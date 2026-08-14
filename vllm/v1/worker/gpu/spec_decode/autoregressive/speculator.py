@@ -14,6 +14,7 @@ from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.cudagraph_utils import (
     AttentionStatePair,
     BatchExecutionDescriptor,
+    CudaGraphManager,
     get_uniform_token_count,
 )
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
@@ -97,13 +98,27 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         # For FULL graphs, the entire routine is recorded as one graph.
         # For PIECEWISE, only the model's compiled regions are captured
         # and the rest (compute_logits, gumbel_sample) runs eagerly.
-        assert self.prefill_cudagraph_manager is not None
-        if self.prefill_cudagraph_manager.use_breakable_cg:
-            self.prefill_cudagraph_manager.init_breakable_cg_runner(self.model)
-        self.prefill_cudagraph_manager.capture(
+        prefill_manager = self.prefill_cudagraph_manager
+        assert prefill_manager is not None
+        if prefill_manager.use_breakable_cg:
+            prefill_manager.init_breakable_cg_runner(self.model)
+
+        def warmup_capture_stream(manager: CudaGraphManager) -> None:
+            from vllm.model_executor.layers.quantization.utils import (
+                mxfp6_sm120_utils,
+            )
+
+            mxfp6_sm120_utils.warmup_mxfp6_sm120_stream(
+                self.model,
+                manager.get_capture_sizes(),
+                self.dtype,
+            )
+
+        prefill_manager.capture(
             self._prefill,
             attn_states,
             progress_bar_desc="Capturing prefill CUDA graphs",
+            capture_stream_warmup=lambda: warmup_capture_stream(prefill_manager),
         )
 
         if self.num_speculative_steps == 1:
@@ -112,8 +127,9 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         # Capture the decode draft generation routine (model forward +
         # sample + update_draft_inputs) for a single
         # step.
-        assert self.decode_cudagraph_manager is not None
-        self.decode_cudagraph_manager.capture(
+        decode_manager = self.decode_cudagraph_manager
+        assert decode_manager is not None
+        decode_manager.capture(
             self._generate_draft,
             self.model_state,
             self.input_buffers,
@@ -121,6 +137,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             self.attn_groups,
             self.kv_cache_config,
             progress_bar_desc="Capturing decode CUDA graphs",
+            capture_stream_warmup=lambda: warmup_capture_stream(decode_manager),
         )
 
     @torch.inference_mode()

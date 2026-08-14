@@ -121,6 +121,23 @@ def _compact_greedy_rejection_sample_kernel(
         )
 
 
+@triton.jit
+def _prepare_compact_rejection_indices_kernel(
+    cu_num_logits_ptr,
+    target_indices_ptr,
+    bonus_indices_ptr,
+):
+    req_idx = tl.program_id(0)
+    start_idx = tl.load(cu_num_logits_ptr + req_idx)
+    end_idx = tl.load(cu_num_logits_ptr + req_idx + 1)
+    num_draft_tokens = end_idx - start_idx - 1
+    target_start_idx = start_idx - req_idx
+
+    for pos in range(num_draft_tokens):
+        tl.store(target_indices_ptr + target_start_idx + pos, start_idx + pos)
+    tl.store(bonus_indices_ptr + req_idx, end_idx - 1)
+
+
 class RejectionSampler:
     def __init__(
         self,
@@ -173,15 +190,15 @@ class RejectionSampler:
 
         num_reqs = input_batch.num_reqs
         device = candidate_logits.device
-        bonus_indices = input_batch.cu_num_logits[1:].to(torch.int64) - 1
-        is_bonus = torch.zeros(
-            candidate_logits.shape[0], dtype=torch.bool, device=device
+        target_indices = torch.empty(
+            (input_batch.num_draft_tokens,), dtype=torch.int64, device=device
         )
-        is_bonus[bonus_indices] = True
-        target_indices = torch.arange(
-            candidate_logits.shape[0], dtype=torch.int64, device=device
-        )[~is_bonus]
-        assert target_indices.shape[0] == input_batch.num_draft_tokens
+        bonus_indices = torch.empty((num_reqs,), dtype=torch.int64, device=device)
+        _prepare_compact_rejection_indices_kernel[(num_reqs,)](
+            input_batch.cu_num_logits,
+            target_indices,
+            bonus_indices,
+        )
 
         draft_sampled = input_batch.input_ids[input_batch.logits_indices]
         draft_token_ids = draft_sampled[target_indices + 1]

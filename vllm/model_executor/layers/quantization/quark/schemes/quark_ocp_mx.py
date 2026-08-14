@@ -18,14 +18,12 @@ from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
 from vllm.model_executor.layers.quantization.utils.mxfp6_sm120_utils import (
     is_mxfp6_sm120_available,
     mxfp6_sm120_gemm,
+    mxfp6_sm120_quantize_mxfp8_packed,
     pack_mxfp6_sm120_scales,
 )
 from vllm.model_executor.layers.quantization.utils.mxfp6_utils import (
     dequant_mxfp6,
     quant_dequant_mxfp6,
-)
-from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
-    mxfp8_e4m3_quantize,
 )
 from vllm.model_executor.layers.quantization.utils.ocp_mx_utils import (
     OCP_MX_BLOCK_SIZE,
@@ -214,6 +212,8 @@ class QuarkOCP_MX(QuarkScheme):
             self._is_mxfp6_sm120_config() and is_mxfp6_sm120_available()
         )
         self.output_size_per_partition: int | None = None
+        self.input_size_per_partition: int | None = None
+        self.padded_input_size_per_partition: int | None = None
         self.emulate = not self.use_mxfp6_sm120 and (
             not current_platform.supports_mx()
             or self.input_dtype != "mxfp4"
@@ -328,6 +328,31 @@ class QuarkOCP_MX(QuarkScheme):
         layer.weight = torch.nn.Parameter(layer.weight.data, requires_grad=False)
 
         if self.use_mxfp6_sm120:
+            assert self.input_size_per_partition is not None
+            assert self.padded_input_size_per_partition is not None
+            if self.padded_input_size_per_partition != self.input_size_per_partition:
+                packed_features = self.padded_input_size_per_partition * 3 // 4
+                padded_weight = torch.zeros(
+                    (layer.weight.shape[0], packed_features),
+                    dtype=layer.weight.dtype,
+                    device=layer.weight.device,
+                )
+                padded_weight[:, : layer.weight.shape[1]] = layer.weight.data
+                layer.weight = torch.nn.Parameter(padded_weight, requires_grad=False)
+
+                padded_scale = torch.full(
+                    (
+                        layer.weight_scale.shape[0],
+                        self.padded_input_size_per_partition // OCP_MX_BLOCK_SIZE,
+                    ),
+                    127,
+                    dtype=layer.weight_scale.dtype,
+                    device=layer.weight_scale.device,
+                )
+                padded_scale[:, : layer.weight_scale.shape[1]] = layer.weight_scale.data
+                layer.weight_scale = torch.nn.Parameter(
+                    padded_scale, requires_grad=False
+                )
             layer.weight_scale = torch.nn.Parameter(
                 pack_mxfp6_sm120_scales(layer.weight_scale.data),
                 requires_grad=False,
@@ -393,19 +418,35 @@ class QuarkOCP_MX(QuarkScheme):
             output_size_per_partition = sum(output_partition_sizes)
             layer.logical_widths = output_partition_sizes
             self.output_size_per_partition = output_size_per_partition
+            self.input_size_per_partition = input_size_per_partition
+            self.padded_input_size_per_partition = input_size_per_partition
 
             if self.use_mxfp6_sm120 and not self._is_mxfp6_sm120_problem_supported(
                 output_size_per_partition, input_size_per_partition
             ):
-                self.use_mxfp6_sm120 = False
-                self.emulate = True
-                logger.warning_once(
-                    "mxfp6-sm120 requires N to be divisible by 8 and K by "
-                    "128, but a partition has N=%d and K=%d. Falling back "
-                    "to MXFP6 emulation for that layer.",
-                    output_size_per_partition,
-                    input_size_per_partition,
-                )
+                if (
+                    output_size_per_partition % 8 == 0
+                    and input_size_per_partition % OCP_MX_BLOCK_SIZE == 0
+                ):
+                    self.padded_input_size_per_partition = (
+                        (input_size_per_partition + 127) // 128 * 128
+                    )
+                    logger.info_once(
+                        "Padding an mxfp6-sm120 dense partition from K=%d "
+                        "to K=%d for native W6A8 execution.",
+                        input_size_per_partition,
+                        self.padded_input_size_per_partition,
+                    )
+                else:
+                    self.use_mxfp6_sm120 = False
+                    self.emulate = True
+                    logger.warning_once(
+                        "mxfp6-sm120 requires N to be divisible by 8 and K "
+                        "to be divisible by 32, but a partition has N=%d and "
+                        "K=%d. Falling back to MXFP6 emulation for that layer.",
+                        output_size_per_partition,
+                        input_size_per_partition,
+                    )
 
             # WEIGHT
             weight = PackedvLLMParameter(
@@ -443,11 +484,20 @@ class QuarkOCP_MX(QuarkScheme):
     ) -> torch.Tensor:
         if self.use_mxfp6_sm120:
             assert self.output_size_per_partition is not None
+            assert self.input_size_per_partition is not None
+            assert self.padded_input_size_per_partition is not None
             output_shape = (*x.shape[:-1], self.output_size_per_partition)
             x_2d = x.reshape(-1, x.shape[-1]).contiguous()
-            quantized_x, input_scale = mxfp8_e4m3_quantize(
-                x_2d, is_sf_swizzled_layout=True
-            )
+            if self.padded_input_size_per_partition != self.input_size_per_partition:
+                x_2d = F.pad(
+                    x_2d,
+                    (
+                        0,
+                        self.padded_input_size_per_partition
+                        - self.input_size_per_partition,
+                    ),
+                )
+            quantized_x, input_scale = mxfp6_sm120_quantize_mxfp8_packed(x_2d)
             y = mxfp6_sm120_gemm(
                 quantized_x,
                 input_scale,

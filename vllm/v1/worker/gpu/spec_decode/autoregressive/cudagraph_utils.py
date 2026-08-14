@@ -28,6 +28,7 @@ class PrefillSpeculatorCudaGraphManager(CudaGraphManager):
         forward_fn: Callable,
         attn_states: dict[BatchExecutionDescriptor, AttentionStatePair],
         progress_bar_desc: str = "Capturing CUDA graphs",
+        capture_stream_warmup: Callable[[], None] | None = None,
     ) -> None:
         def create_forward_fn(
             desc: BatchExecutionDescriptor,
@@ -53,7 +54,11 @@ class PrefillSpeculatorCudaGraphManager(CudaGraphManager):
             )
             return fwd, attn_state
 
-        super().capture(create_forward_fn, progress_bar_desc)
+        super().capture(
+            create_forward_fn,
+            progress_bar_desc,
+            capture_stream_warmup=capture_stream_warmup,
+        )
 
 
 class DecodeSpeculatorCudaGraphManager(CudaGraphManager):
@@ -68,6 +73,7 @@ class DecodeSpeculatorCudaGraphManager(CudaGraphManager):
         attn_groups: list[list[AttentionGroup]],
         kv_cache_config: KVCacheConfig,
         progress_bar_desc: str = "Capturing CUDA graphs",
+        capture_stream_warmup: Callable[[], None] | None = None,
     ) -> None:
         def create_forward_fn(
             desc: BatchExecutionDescriptor,
@@ -102,4 +108,8 @@ class DecodeSpeculatorCudaGraphManager(CudaGraphManager):
             )
             return fwd, attn_state
 
-        super().capture(create_forward_fn, progress_bar_desc)
+        super().capture(
+            create_forward_fn,
+            progress_bar_desc,
+            capture_stream_warmup=capture_stream_warmup,
+        )

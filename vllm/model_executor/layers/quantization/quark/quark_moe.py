@@ -49,6 +49,11 @@ from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
     make_nvfp4_moe_quant_config,
     select_nvfp4_moe_backend,
 )
+from vllm.model_executor.layers.quantization.utils.mxfp6_sm120_utils import (
+    is_mxfp6_sm120_moe_available,
+    pack_mxfp6_sm120_k64_weight,
+    pack_mxfp6_sm120_scales,
+)
 from vllm.model_executor.layers.quantization.utils.ocp_mx_utils import (
     OCP_MX_BLOCK_SIZE,
     OCP_MX_Scheme,
@@ -1003,6 +1008,28 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
         else:
             self.static_input_scales = False
 
+        self.use_mxfp6_sm120_moe = (
+            self.ocp_mx_scheme == "w_mxfp6_e3m2_a_fp8"
+            and not self.static_input_scales
+            and is_mxfp6_sm120_moe_available()
+        )
+        if self.use_mxfp6_sm120_moe:
+            from vllm.model_executor.layers.fused_moe.experts.mxfp6_sm120_moe import (
+                Mxfp6Sm120Experts,
+            )
+
+            self.experts_cls = Mxfp6Sm120Experts
+            self.model_type = getattr(
+                get_current_vllm_config().model_config.hf_config,
+                "model_type",
+                None,
+            )
+            logger.info_once(
+                "Using native mxfp6-sm120 grouped MoE backend for %s",
+                self.ocp_mx_scheme,
+            )
+            return
+
         # Select backend based on OCP MX scheme
         if self.ocp_mx_scheme == "w_mxfp4":
             # W4A16: weight-only MXFP4
@@ -1063,6 +1090,11 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
             act_dtype=act_dtype,
             moe_parallel_config=moe_parallel_config,
         )
+        if self.use_mxfp6_sm120_moe:
+            return (
+                (hidden_size + 127) // 128 * 128,
+                (intermediate_size_per_partition + 31) // 32 * 32,
+            )
         # In case quantization emulation backend is used, there is no need to apply
         # MXFP4-specific padding logic as the compute happens in higher precision.
         if (
@@ -1197,6 +1229,40 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
 
     def _setup_kernel(self, layer: RoutedExperts):
         """Setup kernel using oracle functions for MXFP4 schemes (W4A16, W4A8)."""
+        if self.use_mxfp6_sm120_moe:
+            from vllm.model_executor.layers.fused_moe.experts.mxfp6_sm120_moe import (
+                make_mxfp6_sm120_moe_kernel,
+                try_enable_qwen35_moe_small_batch,
+            )
+
+            num_experts = layer.w13_weight.shape[0]
+            if layer.w2_weight.shape[2] == 48 and not getattr(
+                layer, "_mxfp6_sm120_k64_weight_ready", False
+            ):
+                replace_parameter(
+                    layer,
+                    "w2_weight",
+                    pack_mxfp6_sm120_k64_weight(layer.w2_weight),
+                )
+                layer._mxfp6_sm120_k64_weight_ready = True
+            w13_scales = pack_mxfp6_sm120_scales(
+                layer.w13_weight_scale.flatten(0, 1).contiguous()
+            ).view(num_experts, -1)
+            w2_scales = pack_mxfp6_sm120_scales(
+                layer.w2_weight_scale.flatten(0, 1).contiguous()
+            ).view(num_experts, -1)
+            replace_parameter(layer, "w13_weight_scale", w13_scales)
+            replace_parameter(layer, "w2_weight_scale", w2_scales)
+            try_enable_qwen35_moe_small_batch(layer)
+            self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+            assert self.moe_quant_config is not None
+            self.moe_kernel = make_mxfp6_sm120_moe_kernel(
+                self.moe_quant_config,
+                self.moe,
+                layer._expert_routing_tables(),
+            )
+            return
+
         w13_bias = getattr(layer, "w13_bias", None)
         w2_bias = getattr(layer, "w2_bias", None)
 
@@ -1257,6 +1323,17 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
     def get_fused_moe_quant_config(
         self, layer: RoutedExperts
     ) -> FusedMoEQuantConfig | None:
+        if self.use_mxfp6_sm120_moe:
+            return FusedMoEQuantConfig.make(
+                quant_dtype=None,
+                weight_dtype="mxfp6_e3m2",
+                w1_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                w1_bias=layer.w13_bias,
+                w2_bias=layer.w2_bias,
+                gemm1_clamp_limit=getattr(layer, "swiglu_limit", None),
+            )
+
         # For oracle-based backends (W4A16, W4A8), use make_mxfp4_moe_quant_config
         if self.mxfp4_backend not in (Mxfp4MoeBackend.NONE, Mxfp4MoeBackend.EMULATION):
             # Determine scale source based on backend type
@@ -1354,6 +1431,7 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
             apply_router_weight_on_input=layer.apply_router_weight_on_input,
             expert_map=layer.expert_map,
             shared_experts_input=shared_experts_input,
+            shared_experts=shared_experts,
         )
 
     def apply_monolithic(
