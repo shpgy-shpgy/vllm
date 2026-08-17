@@ -52,6 +52,44 @@ class Sampler:
         self.logprob_token_ids_state = LogprobTokenIdsState(max_num_reqs, device)
         self.num_speculative_tokens = num_speculative_tokens
         self.use_flashinfer = flashinfer_sampler_supported()
+        self.device = device
+
+    @torch.inference_mode()
+    def warmup_top_k_top_p_buffer(self, num_rows: int) -> None:
+        """Materialize the Triton top-k/top-p workspace for profiling.
+
+        The rejection sampler applies top-k/top-p to the flattened target
+        logits for every speculative token.  During the initial memory
+        profile, the regular dummy sampler has only one row per request and
+        therefore does not reserve the larger Triton workspace needed by an
+        MTP step.  The first real warmup then allocates that workspace after
+        KV cache/CUDA graph memory has already been committed and can OOM.
+
+        Keep this helper deliberately independent of request state: it only
+        warms the shape-dependent kernel workspace.  The cached workspace is
+        retained by the Triton sampler and reused by subsequent requests.
+        """
+        if num_rows < 8:
+            # The top-k/top-p dispatcher uses the PyTorch path below this
+            # threshold, so no Triton workspace is needed.
+            return
+
+        vocab_size = self.sampling_states.vocab_size
+        logits = torch.zeros(
+            (num_rows, vocab_size), dtype=torch.float32, device=self.device
+        )
+        top_k = torch.full(
+            (num_rows,), 20, dtype=torch.int32, device=self.device
+        )
+        top_p = torch.full(
+            (num_rows,), 0.95, dtype=torch.float32, device=self.device
+        )
+        # Use the same FP32/filter combination as RejectionSampler.  The
+        # returned tensor aliases logits for the Triton implementation; the
+        # cached auxiliary workspace survives these temporaries.
+        apply_top_k_top_p(logits, top_k, top_p)
+        torch.accelerator.synchronize()
+        del logits, top_k, top_p
 
     def add_request(
         self, req_idx: int, prompt_len: int, sampling_params: SamplingParams

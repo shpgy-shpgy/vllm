@@ -706,7 +706,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         return hidden_states, sample_hidden_states
 
     @torch.inference_mode()
-    def _dummy_sampler_run(self, hidden_states: torch.Tensor) -> None:
+    def _dummy_sampler_run(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        warmup_top_k_top_p_rows: int | None = None,
+    ) -> None:
         num_reqs = hidden_states.shape[0]
         logits = self.model.compute_logits(hidden_states)
         dummy_input_batch = InputBatch.make_dummy(
@@ -717,6 +722,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # top_k, top_p, and logprobs, using less GPU memory than what is possible
         # during actual execution.
         assert self.sampler is not None
+        if warmup_top_k_top_p_rows is not None:
+            self.sampler.warmup_top_k_top_p_buffer(warmup_top_k_top_p_rows)
         self.sampler(logits, dummy_input_batch)
 
     @torch.inference_mode()
@@ -748,7 +755,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.is_last_pp_rank:
             assert sample_hidden_states is not None
             if self.pooling_runner is None:
-                self._dummy_sampler_run(sample_hidden_states)
+                # MTP rejection sampling flattens one target row plus the
+                # speculative rows for every request.  Profile that larger
+                # top-k/top-p shape before KV cache allocation so its Triton
+                # workspace is accounted for and reused during warmup.
+                warmup_rows = None
+                if self.num_speculative_steps > 0:
+                    warmup_rows = self.max_num_reqs * max(1, self.decode_query_len)
+                self._dummy_sampler_run(
+                    sample_hidden_states,
+                    warmup_top_k_top_p_rows=warmup_rows,
+                )
                 assert hidden_states is not None
                 self._dummy_prompt_logprobs_run(hidden_states)
             else:
