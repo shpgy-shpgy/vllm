@@ -83,6 +83,34 @@ if GDN_AITER_TRITON_AVAILABLE:
 logger = init_logger(__name__)
 
 
+@functools.cache
+def _get_flashinfer_gdn_decode_ops():
+    """Return FlashInfer's fused GDN decode entry points when available.
+
+    Keep this import lazy: FlashInfer is optional for vLLM, and importing its
+    experimental GDN package at module import time would make the regular FLA
+    path depend on the optional CUDA installation.
+    """
+    try:
+        from flashinfer import (
+            gdn_fused_decode_step,
+            gdn_fused_decode_step_supported,
+        )
+    except Exception:
+        return None, None
+    return gdn_fused_decode_step, gdn_fused_decode_step_supported
+
+
+@functools.cache
+def _get_flashinfer_gdn_mtp_op():
+    """Return FlashInfer's optimized GDN MTP entry point when available."""
+    try:
+        from flashinfer.gdn_decode import gated_delta_rule_mtp
+    except Exception:
+        return None
+    return gated_delta_rule_mtp
+
+
 # TODO(arpera): remove ``_is_libs_cu13_install_intact`` and its caller in
 # ``_resolve_gdn_prefill_backend`` once the upstream packaging bug is
 # fixed and the broken wheels are yanked / superseded on PyPI:
@@ -157,7 +185,8 @@ def _resolve_gdn_prefill_backend(
     * ``platform == cuda``;
     * one of the following:
       - Hopper (SM90) — no further constraints;
-      - Blackwell (SM10.x) with ``head_k_dim == 128``, ``cuda_runtime >= 13``,
+      - Blackwell (SM10.x/SM12.x) with ``head_k_dim == 128``,
+        ``cuda_runtime >= 13``,
         and an intact ``nvidia-cutlass-dsl-libs-cu13`` install on disk
         (see :func:`_is_libs_cu13_install_intact`).
 
@@ -187,11 +216,10 @@ def _resolve_gdn_prefill_backend(
         supports_flashinfer = True
     elif (
         current_platform.is_device_capability_family(100)
-        and head_k_dim == 128
-        and current_platform.get_cuda_runtime_major() >= 13
-    ):
+        or current_platform.is_device_capability_family(120)
+    ) and head_k_dim == 128 and current_platform.get_cuda_runtime_major() >= 13:
         supports_flashinfer = _is_libs_cu13_install_intact()
-        supports_cutedsl = True
+        supports_cutedsl = current_platform.is_device_capability_family(100)
         if not supports_flashinfer:
             logger.warning_once(
                 "FlashInfer Blackwell GDN requires an intact nvidia-cutlass-dsl"
@@ -560,6 +588,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self.enable_packed_recurrent_decode = (
             envs.VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE
         )
+        # FlashInfer's fused decode API requires the b/a projection in a
+        # transposed dense layout and a zero vector when conv1d has no bias.
+        # These are built lazily after model weights and KV-cache tensors exist.
+        self._flashinfer_gdn_w_ba: torch.Tensor | None = None
+        self._flashinfer_gdn_w_ba_key: tuple | None = None
+        self._flashinfer_gdn_conv_bias: torch.Tensor | None = None
+        self._flashinfer_gdn_conv_bias_key: tuple | None = None
 
         compilation_config = get_current_vllm_config().compilation_config
         if prefix in compilation_config.static_forward_context:
@@ -900,6 +935,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 projected_states_ba,
                 z,
                 core_attn_out,
+                hidden_states,
                 layer_name=_encode_layer_name(self.prefix),
                 use_aiter=True,
             )
@@ -961,6 +997,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             b,
             a,
             core_attn_out,
+            hidden_states,
             layer_name=_encode_layer_name(self.prefix),
         )
 
@@ -1266,6 +1303,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         b: torch.Tensor,
         a: torch.Tensor,
         core_attn_out: torch.Tensor,
+        hidden_states: torch.Tensor | None = None,
     ):
         """Core conv1d + recurrent attention (standard path).
 
@@ -1292,6 +1330,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and attn_metadata.num_prefills == 0
             and attn_metadata.num_decodes > 0
         ):
+            if hidden_states is not None and self._try_flashinfer_gdn_decode(
+                hidden_states=hidden_states,
+                mixed_qkv=mixed_qkv,
+                core_attn_out=core_attn_out,
+                attn_metadata=attn_metadata,
+            ):
+                return
             return self._forward_core_decode_non_spec(
                 mixed_qkv=mixed_qkv,
                 b=b,
@@ -1299,6 +1344,21 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 core_attn_out=core_attn_out,
                 attn_metadata=attn_metadata,
             )
+
+        if (
+            attn_metadata.spec_sequence_masks is not None
+            and attn_metadata.num_prefills == 0
+            and attn_metadata.num_decodes == 0
+            and attn_metadata.num_spec_decodes > 0
+            and self._try_flashinfer_gdn_mtp_decode(
+                mixed_qkv=mixed_qkv,
+                b=b,
+                a=a,
+                core_attn_out=core_attn_out,
+                attn_metadata=attn_metadata,
+            )
+        ):
+            return
 
         has_initial_state = attn_metadata.has_initial_state
         spec_query_start_loc = attn_metadata.spec_query_start_loc
@@ -1601,6 +1661,395 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         ):
             core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)
 
+    def _get_flashinfer_gdn_w_ba(self) -> torch.Tensor | None:
+        """Build the dense ``[hidden, 2 * local_v_heads]`` b/a weight view."""
+        if self.gqa_interleaved_layout:
+            # Qwen3-Next stores b/a interleaved by GQA group.  The fused API
+            # consumes all beta columns followed by all decay columns; keep
+            # the existing path for that layout until a matching reorder is
+            # added.
+            return None
+
+        weight = self.in_proj_ba.weight
+        if weight.ndim != 2 or weight.dtype != torch.bfloat16:
+            return None
+
+        local_heads = self.num_v_heads // self.tp_size
+        source_key = (
+            weight.data_ptr(),
+            tuple(weight.shape),
+            tuple(weight.stride()),
+            str(weight.device),
+            weight.dtype,
+            self.tp_rank,
+            self.disable_tp_for_ba_proj,
+        )
+        if self._flashinfer_gdn_w_ba_key == source_key:
+            return self._flashinfer_gdn_w_ba
+
+        source_weight = weight.detach()
+        if self.disable_tp_for_ba_proj:
+            if weight.shape != (2 * self.num_v_heads, self.hidden_size):
+                return None
+            start = self.tp_rank * local_heads
+            with torch.no_grad():
+                source_weight = torch.cat(
+                    (
+                        source_weight[start : start + local_heads],
+                        source_weight[
+                            self.num_v_heads
+                            + start : self.num_v_heads
+                            + start
+                            + local_heads
+                        ],
+                    ),
+                    dim=0,
+                )
+        elif weight.shape != (2 * local_heads, self.hidden_size):
+            return None
+
+        with torch.no_grad():
+            self._flashinfer_gdn_w_ba = source_weight.t().contiguous()
+        self._flashinfer_gdn_w_ba_key = source_key
+        return self._flashinfer_gdn_w_ba
+
+    def _get_flashinfer_gdn_conv_bias(
+        self, conv_weight: torch.Tensor
+    ) -> torch.Tensor | None:
+        """Return a dense BF16 conv bias, materializing zero for bias-free GDN."""
+        bias = self.conv1d.bias
+        if bias is None:
+            bias_key = (
+                str(conv_weight.device),
+                conv_weight.dtype,
+                conv_weight.size(0),
+            )
+            if self._flashinfer_gdn_conv_bias_key != bias_key:
+                self._flashinfer_gdn_conv_bias = torch.zeros(
+                    conv_weight.size(0),
+                    dtype=conv_weight.dtype,
+                    device=conv_weight.device,
+                )
+                self._flashinfer_gdn_conv_bias_key = bias_key
+            return self._flashinfer_gdn_conv_bias
+
+        if bias.dtype != torch.bfloat16 or bias.numel() != conv_weight.size(0):
+            return None
+        return bias.detach().reshape(-1).contiguous()
+
+    def _try_flashinfer_gdn_decode(
+        self,
+        hidden_states: torch.Tensor,
+        mixed_qkv: torch.Tensor,
+        core_attn_out: torch.Tensor,
+        attn_metadata: GDNAttentionMetadata,
+    ) -> bool:
+        """Run FlashInfer's specialized Qwen GDN decode when its contract fits."""
+        if not (
+            current_platform.is_cuda()
+            and current_platform.is_device_capability_family(120)
+            and not self.gqa_interleaved_layout
+            and self.head_k_dim == self.head_v_dim == 128
+        ):
+            return False
+
+        # The specialized SM120 implementation currently consumes an FP32
+        # recurrent-state pool.  BF16 cache mode remains on the existing FLA
+        # path; converting a paged state pool for every layer would erase the
+        # launch-fusion win and would change the cache's numerical contract.
+        ssm_state = self.kv_cache[1]
+        if ssm_state.dtype != torch.float32:
+            logger.info_once(
+                "FlashInfer fused GDN decode is available on SM120 but is "
+                "disabled because the Mamba SSM cache is %s; use "
+                "--mamba-ssm-cache-dtype float32 to enable it.",
+                ssm_state.dtype,
+            )
+            return False
+
+        fused_decode, fused_decode_supported = _get_flashinfer_gdn_decode_ops()
+        if fused_decode is None or fused_decode_supported is None:
+            return False
+
+        num_actual_tokens = attn_metadata.num_actual_tokens
+        state_indices = attn_metadata.non_spec_state_indices_tensor
+        if (
+            num_actual_tokens <= 0
+            or hidden_states.ndim != 2
+            or hidden_states.shape[0] < num_actual_tokens
+            or mixed_qkv.shape[0] < num_actual_tokens
+            or state_indices is None
+            or state_indices.shape[0] < num_actual_tokens
+        ):
+            return False
+
+        conv_state = (
+            self.kv_cache[0]
+            if is_conv_state_dim_first()
+            else self.kv_cache[0].transpose(-1, -2)
+        )
+        conv_state_len = self.conv_kernel_size - 1
+        if conv_state.shape[1] != self.conv_dim or conv_state.shape[2] < conv_state_len:
+            return False
+        # Speculative decoding reserves extra rolling-state columns.  The
+        # non-spec one-token update uses only the ordinary width-1 prefix, and
+        # this view preserves the extra columns for a later spec step.
+        conv_state = conv_state[..., :conv_state_len]
+        if is_conv_state_dim_first() and conv_state.stride(1) != conv_state_len:
+            # A DS pool with speculative columns is strided by the full
+            # reserved width and is not one of FlashInfer's dense layouts.
+            return False
+
+        conv_weight = self.conv1d.weight.detach().view(
+            self.conv1d.weight.size(0), self.conv1d.weight.size(2)
+        )
+        if conv_weight.dtype != torch.bfloat16:
+            return False
+        conv_weight = conv_weight.contiguous()
+        conv_bias = self._get_flashinfer_gdn_conv_bias(conv_weight)
+        w_ba = self._get_flashinfer_gdn_w_ba()
+        if conv_bias is None or w_ba is None:
+            return False
+        if self.A_log.dtype != torch.float32 or self.dt_bias.dtype != torch.bfloat16:
+            return False
+        if (
+            hidden_states.dtype != torch.bfloat16
+            or mixed_qkv.dtype != torch.bfloat16
+            or conv_state.dtype != torch.bfloat16
+            or state_indices.dtype != torch.int32
+            or core_attn_out.dtype != torch.bfloat16
+        ):
+            return False
+
+        batch_size = num_actual_tokens
+        conv_layout = "DS" if is_conv_state_dim_first() else "SD"
+        try:
+            supported = fused_decode_supported(
+                batch_size=batch_size,
+                hidden_size=self.hidden_size,
+                n_ba=w_ba.shape[1],
+                qkv_dim=mixed_qkv.shape[1],
+                num_qk_heads=self.num_k_heads // self.tp_size,
+                num_v_heads=self.num_v_heads // self.tp_size,
+                head_dim=self.head_k_dim,
+                conv_width=self.conv_kernel_size,
+                conv_state_len=conv_state_len,
+                device=hidden_states.device,
+                conv_state_layout=conv_layout,
+            )
+        except Exception:
+            logger.warning_once(
+                "FlashInfer fused GDN decode capability probing failed; "
+                "falling back to the vLLM FLA decode path.",
+            )
+            return False
+        if not supported:
+            return False
+
+        try:
+            fused_decode(
+                hidden_states=hidden_states[:num_actual_tokens],
+                w_ba=w_ba,
+                mixed_qkv=mixed_qkv[:num_actual_tokens],
+                conv_weight=conv_weight,
+                conv_bias=conv_bias,
+                conv_state=conv_state,
+                A_log=self.A_log.detach(),
+                dt_bias=self.dt_bias.detach(),
+                scale=self.head_k_dim**-0.5,
+                ssm_state=ssm_state,
+                state_indices=state_indices[:num_actual_tokens],
+                use_qk_l2norm=True,
+                out=core_attn_out[:num_actual_tokens].unsqueeze(1),
+            )
+        except Exception:
+            logger.warning_once(
+                "FlashInfer fused GDN decode execution failed; falling back "
+                "to the vLLM FLA decode path.",
+            )
+            return False
+
+        logger.info_once(
+            "Using FlashInfer fused GDN decode kernel on SM120 "
+            "(hidden=%d, n_ba=%d, qkv_dim=%d, batch=%d).",
+            self.hidden_size,
+            w_ba.shape[1],
+            mixed_qkv.shape[1],
+            batch_size,
+        )
+        return True
+
+    def _try_flashinfer_gdn_mtp_decode(
+        self,
+        mixed_qkv: torch.Tensor,
+        b: torch.Tensor,
+        a: torch.Tensor,
+        core_attn_out: torch.Tensor,
+        attn_metadata: GDNAttentionMetadata,
+    ) -> bool:
+        """Use FlashInfer's optimized recurrence for uniform spec decode.
+
+        FlashInfer's fused decode-step API is intentionally single-token.  A
+        speculative verification batch must first run the causal convolution,
+        then process all draft tokens from the same request in order.  The
+        FlashInfer MTP kernel is the matching optimized recurrence for that
+        phase; irregular or padded batches stay on vLLM's FLA implementation.
+        """
+        if not (
+            current_platform.is_cuda()
+            and current_platform.is_device_capability_family(120)
+            and not self.gqa_interleaved_layout
+            and self.head_k_dim == self.head_v_dim == 128
+            and self.kv_cache[1].dtype == torch.float32
+        ):
+            return False
+
+        mtp_decode = _get_flashinfer_gdn_mtp_op()
+        if mtp_decode is None:
+            return False
+
+        state_indices = attn_metadata.spec_state_indices_tensor
+        cu_seqlens = attn_metadata.spec_query_start_loc
+        num_accepted_tokens = attn_metadata.num_accepted_tokens
+        batch_size = attn_metadata.num_spec_decodes
+        if (
+            state_indices is None
+            or cu_seqlens is None
+            or num_accepted_tokens is None
+            or batch_size <= 0
+        ):
+            return False
+
+        # The FlashInfer MTP kernel has a fixed T interface.  Only use it when
+        # every active speculative request contributes the full draft window;
+        # the existing FLA path handles variable-length/padded captures.
+        seq_len = state_indices.shape[1]
+        num_tokens = batch_size * seq_len
+        if (
+            seq_len <= 1
+            or attn_metadata.num_spec_decode_tokens != num_tokens
+            or mixed_qkv.shape[0] < num_tokens
+            or b.shape[0] < num_tokens
+            or a.shape[0] < num_tokens
+            or core_attn_out.shape[0] < num_tokens
+            or state_indices.shape[0] < batch_size
+            or cu_seqlens.shape[0] < batch_size + 1
+        ):
+            return False
+
+        # Keep the convolution semantics identical to the existing MTP path.
+        # It updates the rolling conv state once per request and returns the
+        # activated q/k/v stream consumed by the recurrent kernel.
+        conv_state = (
+            self.kv_cache[0]
+            if is_conv_state_dim_first()
+            else self.kv_cache[0].transpose(-1, -2)
+        )
+        conv_weights = self.conv1d.weight.detach().view(
+            self.conv1d.weight.size(0), self.conv1d.weight.size(2)
+        )
+        conv_bias = (
+            None if self.conv1d.bias is None else self.conv1d.bias.detach()
+        )
+        active_state_indices = state_indices[:batch_size, :seq_len]
+        active_cu_seqlens = cu_seqlens[: batch_size + 1]
+        active_num_accepted = num_accepted_tokens[:batch_size]
+        conv_output = causal_conv1d_update(
+            mixed_qkv[:num_tokens],
+            conv_state,
+            conv_weights,
+            conv_bias,
+            self.activation,
+            conv_state_indices=active_state_indices[:, 0],
+            num_accepted_tokens=active_num_accepted,
+            query_start_loc=active_cu_seqlens,
+            max_query_len=seq_len,
+            validate_data=False,
+        )
+        query, key, value = self.rearrange_mixed_qkv(conv_output)
+        query = query.reshape(
+            batch_size, seq_len, self.num_k_heads // self.tp_size, self.head_k_dim
+        )
+        key = key.reshape(
+            batch_size, seq_len, self.num_k_heads // self.tp_size, self.head_k_dim
+        )
+        value = value.reshape(
+            batch_size,
+            seq_len,
+            self.num_v_heads // self.tp_size,
+            self.head_v_dim,
+        )
+        a = a[:num_tokens].reshape(
+            batch_size, seq_len, self.num_v_heads // self.tp_size
+        )
+        b = b[:num_tokens].reshape(
+            batch_size, seq_len, self.num_v_heads // self.tp_size
+        )
+
+        # vLLM's FLA kernel selects the state after the already-accepted
+        # prefix, i.e. state_indices[i, num_accepted_tokens[i] - 1].
+        initial_token = (active_num_accepted - 1).clamp(0, seq_len - 1).view(-1, 1)
+        initial_state_indices = active_state_indices.gather(1, initial_token).view(-1)
+        output = core_attn_out[:num_tokens].reshape(
+            batch_size,
+            seq_len,
+            self.num_v_heads // self.tp_size,
+            self.head_v_dim,
+        )
+        used_flashinfer = True
+        try:
+            mtp_decode(
+                q=query,
+                k=key,
+                v=value,
+                initial_state=self.kv_cache[1],
+                initial_state_indices=initial_state_indices,
+                A_log=self.A_log.detach(),
+                a=a,
+                dt_bias=self.dt_bias.detach(),
+                b=b,
+                scale=self.head_k_dim**-0.5,
+                output=output,
+                ssm_state_indices=active_state_indices,
+                disable_state_update=False,
+                use_qk_l2norm=True,
+            )
+        except Exception:
+            # The conv state has already been advanced.  Fall back only to
+            # the recurrent FLA kernel over the post-conv tensors; re-running
+            # the general path would advance the conv state twice.
+            logger.warning_once(
+                "FlashInfer GDN MTP decode execution failed; falling back "
+                "to the vLLM FLA MTP recurrence.",
+            )
+            used_flashinfer = False
+            fallback_out, _ = fused_sigmoid_gating_delta_rule_update(
+                A_log=self.A_log,
+                a=a.reshape(num_tokens, -1),
+                b=b.reshape(num_tokens, -1),
+                dt_bias=self.dt_bias,
+                q=query.reshape(1, num_tokens, query.shape[2], query.shape[3]),
+                k=key.reshape(1, num_tokens, key.shape[2], key.shape[3]),
+                v=value.reshape(1, num_tokens, value.shape[2], value.shape[3]),
+                initial_state=self.kv_cache[1],
+                inplace_final_state=True,
+                cu_seqlens=active_cu_seqlens,
+                ssm_state_indices=active_state_indices,
+                num_accepted_tokens=active_num_accepted,
+                use_qk_l2norm_in_kernel=True,
+            )
+            core_attn_out[:num_tokens] = fallback_out.squeeze(0)
+
+        if used_flashinfer:
+            logger.info_once(
+                "Using FlashInfer GDN MTP decode kernel on SM120 "
+                "(hidden=%d, batch=%d, tokens/request=%d).",
+                self.hidden_size,
+                batch_size,
+                seq_len,
+            )
+        return True
+
     def _forward_core_decode_aiter(
         self,
         qkvz: torch.Tensor,
@@ -1727,6 +2176,7 @@ def qwen_gdn_attention_core(
     b_or_ba: torch.Tensor,
     a_or_z_out: torch.Tensor,
     core_attn_out: torch.Tensor,
+    hidden_states: torch.Tensor,
     layer_name: LayerNameType,
     use_aiter: bool = False,
 ) -> None:
@@ -1759,6 +2209,7 @@ def qwen_gdn_attention_core(
             b=b_or_ba,
             a=a_or_z_out,
             core_attn_out=core_attn_out,
+            hidden_states=hidden_states,
         )
 
 
@@ -1767,6 +2218,7 @@ def gdn_attention_core_fake(
     b_or_ba: torch.Tensor,
     a_or_z_out: torch.Tensor,
     core_attn_out: torch.Tensor,
+    hidden_states: torch.Tensor,
     layer_name: LayerNameType,
     use_aiter: bool = False,
 ) -> None:
