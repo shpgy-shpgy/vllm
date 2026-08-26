@@ -26,7 +26,9 @@ pytestmark = pytest.mark.skipif(
     [
         (0, "generic"),
         (1, "small_batch"),
-        (8, "small_batch"),
+        (4, "small_batch"),
+        (5, "grouped"),
+        (8, "grouped"),
         (9, "grouped"),
         (12, "grouped"),
         (96, "grouped"),

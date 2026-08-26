@@ -48,9 +48,9 @@ from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
 
-_QWEN35_MOE_GRAPH_CACHE_VERSION = "qwen35_batch_dispatch_v3"
-_QWEN35_SMALL_BATCH_MAX_TOKENS = 8
-_QWEN35_GROUPED_MIN_TOKENS = 9
+_QWEN35_MOE_GRAPH_CACHE_VERSION = "qwen35_batch_dispatch_v4_b4_vector_cluster_gate"
+_QWEN35_SMALL_BATCH_MAX_TOKENS = 4
+_QWEN35_GROUPED_MIN_TOKENS = 5
 _QWEN35_GROUPED_MAX_TOKENS = 96
 
 
@@ -158,6 +158,7 @@ def _qwen35_moe_small_batch(
             workspace.topk_ids,
             workspace.topk_weights,
             workspace.shared_gate,
+            use_packed_vector_loads=padded_tokens == 4,
         )
     return workspace.output[:tokens]
 
