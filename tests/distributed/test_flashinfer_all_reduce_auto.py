@@ -37,6 +37,7 @@ def test_auto_enable_requires_sm120_tp2_and_validated_package(
 ) -> None:
     monkeypatch.setattr(fi_ar, "current_platform", _sm120_platform())
     monkeypatch.setattr(fi_ar, "has_validated_sm120_flashinfer", lambda: True)
+    monkeypatch.setattr(fi_ar, "get_node_count", lambda: 1)
 
     assert fi_ar.should_auto_enable_flashinfer_allreduce(2, torch.device("cuda:0"))
     assert fi_ar._standalone_max_workspace_size_mb(2, torch.device("cuda:0")) == 64
@@ -58,9 +59,26 @@ def test_validated_sm120_auto_backend_is_trtllm(
 ) -> None:
     monkeypatch.setattr(fi_ar, "current_platform", _sm120_platform())
     monkeypatch.setattr(fi_ar, "has_validated_sm120_flashinfer", lambda: True)
+    monkeypatch.setattr(fi_ar, "get_node_count", lambda: 1)
     monkeypatch.delenv("VLLM_FLASHINFER_ALLREDUCE_BACKEND", raising=False)
 
-    assert fi_ar._resolve_fi_ar_backend(2) == ("trtllm", False)
+    assert fi_ar._resolve_fi_ar_backend(2, torch.device("cuda:0")) == (
+        "trtllm",
+        False,
+    )
+
+
+def test_sm120_tp2_auto_path_is_disabled_for_multi_node(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(fi_ar, "current_platform", _sm120_platform())
+    monkeypatch.setattr(fi_ar, "has_validated_sm120_flashinfer", lambda: True)
+    monkeypatch.setattr(fi_ar, "get_node_count", lambda: 2)
+    monkeypatch.delenv("VLLM_FLASHINFER_ALLREDUCE_BACKEND", raising=False)
+
+    device = torch.device("cuda:1")
+    assert not fi_ar.should_auto_enable_flashinfer_allreduce(2, device)
+    assert fi_ar._resolve_fi_ar_backend(2, device) == ("mnnvl", False)
 
 
 def test_validated_trtllm_fast_path_forwards_prevalidated_arguments() -> None:

@@ -105,6 +105,9 @@ FI_ALLREDUCE_FUSION_MAX_SIZE_MB: dict[int, dict[int, float]] = {
         8: 2,  # 2MB
         16: 64,  # 64MB (mnnvl multi-node)
     },
+    120: {
+        2: 64,  # 64MB (SM120 TP2)
+    },
 }
 
 # Max size of the input tensor per world size per device capability
@@ -125,6 +128,9 @@ _FI_ALLREDUCE_ONE_SHOT_MAX_SIZES_MB: dict[int, dict[int, float]] = {
         2: 32,  # 32MB
         4: 4,  # 4MB
         8: 2,  # 2MB
+    },
+    120: {
+        2: 32,  # 32MB (SM120 TP2)
     },
 }
 
@@ -205,14 +211,21 @@ if flashinfer_comm is not None:
         get_workspace_fn = (
             get_fi_ar_quant_workspace if is_quant_pattern else get_fi_ar_workspace
         )
-        workspace = get_workspace_fn(
+        workspace_kwargs = dict(
             world_size=world_size,
             rank=get_tensor_model_parallel_rank(),
             max_token_num=max_token_num,
             hidden_dim=hidden_size,
             dtype=allreduce_in.dtype,
-            group=get_tp_group().device_group,
+            group=get_tp_group().cpu_group,
         )
+        if is_quant_pattern:
+            workspace = get_workspace_fn(**workspace_kwargs)
+        else:
+            workspace = get_workspace_fn(
+                **workspace_kwargs,
+                device=allreduce_in.device,
+            )
         assert workspace is not None, (
             "Flashinfer allreduce workspace must be initialized when using flashinfer"
         )
@@ -972,7 +985,7 @@ class AllReduceFusionPass(VllmPatternMatcherPass):
             )
             return
         self.hidden_dim = config.model_config.get_hidden_size()
-        self.group = get_tp_group().device_group
+        self.group = get_tp_group().cpu_group
         rank = get_tensor_model_parallel_rank()
         if flashinfer_comm is None:
             logger.warning(
@@ -1013,7 +1026,10 @@ class AllReduceFusionPass(VllmPatternMatcherPass):
             dtype=self.model_dtype,
             group=self.group,
         )
-        if get_fi_ar_workspace(**workspace_kwargs) is None:
+        device = (
+            current_platform.current_device() if current_platform.is_cuda() else None
+        )
+        if get_fi_ar_workspace(**workspace_kwargs, device=device) is None:
             logger.warning_once(
                 "Failed to initialize Flashinfer allreduce workspace. "
                 "Flashinfer allreduce-norm fusion will be disabled."

@@ -104,12 +104,13 @@ def should_auto_enable_flashinfer_allreduce(
     """Select the measured safe default without weakening explicit overrides."""
     enabled = (
         world_size == 2
+        and get_node_count() == 1
         and _is_sm120_device(device)
         and has_validated_sm120_flashinfer()
     )
     if enabled:
         logger.info_once(
-            "Auto-enabled validated FlashInfer 0.6.15.post1 SM120 TP2 all-reduce."
+            "Auto-enabled validated FlashInfer 0.6.18 SM120 TP2 all-reduce."
         )
     return enabled
 
@@ -176,7 +177,10 @@ def _create_workspace(
     return workspace
 
 
-def _resolve_fi_ar_backend(world_size: int) -> tuple[str, bool]:
+def _resolve_fi_ar_backend(
+    world_size: int,
+    device: int | str | torch.device | None = None,
+) -> tuple[str, bool]:
     """Resolve the flashinfer allreduce backend for the current setup.
 
     Returns:
@@ -190,7 +194,12 @@ def _resolve_fi_ar_backend(world_size: int) -> tuple[str, bool]:
         logger.info_once(f"Using flashinfer allreduce backend: {backend}")
         return backend, False
 
-    if world_size == 2 and _is_sm120_device() and has_validated_sm120_flashinfer():
+    if (
+        world_size == 2
+        and get_node_count() == 1
+        and _is_sm120_device(device)
+        and has_validated_sm120_flashinfer()
+    ):
         logger.info_once(
             "Auto-selected flashinfer allreduce backend: trtllm "
             "(validated SM120 TP2 path)"
@@ -218,6 +227,7 @@ def get_fi_ar_workspace(
     hidden_dim: int,
     dtype: torch.dtype,
     group: ProcessGroup,
+    device: int | str | torch.device | None = None,
 ):
     """
     Return the allreduce workspace for non-quant patterns, initializing if needed.
@@ -230,7 +240,7 @@ def get_fi_ar_workspace(
     if _fi_ar_workspace is not None:
         return _fi_ar_workspace
 
-    backend, allow_trtllm_fallback = _resolve_fi_ar_backend(world_size)
+    backend, allow_trtllm_fallback = _resolve_fi_ar_backend(world_size, device)
 
     if get_node_count() > 1 and backend == "trtllm":
         raise ValueError(
@@ -385,6 +395,7 @@ class FlashInferAllReduce:
         self._trtllm_allreduce_op = None
         self._can_use_trtllm_fast_path = (
             self.world_size == 2
+            and get_node_count() == 1
             and _is_sm120_device(self.device)
             and has_validated_sm120_flashinfer()
         )
@@ -407,6 +418,7 @@ class FlashInferAllReduce:
             hidden_dim=hidden_dim,
             dtype=dtype,
             group=self.group,
+            device=self.device,
         )
         if workspace is None:
             self.disabled = True
