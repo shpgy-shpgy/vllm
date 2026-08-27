@@ -8,6 +8,11 @@ import torch.nn as nn
 
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.multimodal.encoder_budget import (
+    MultiModalBudget,
+    get_dummy_encoder_profile_inputs,
+)
 from vllm.tasks import GenerationTask
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -127,6 +132,30 @@ class ModelState(ABC):
     def dummy_inputs_embeds(self, num_tokens: int) -> torch.Tensor | None:
         """Pre-allocated inputs_embeds buffer for dummy runs (contents unused)."""
         return None
+
+    @torch.inference_mode()
+    def profile_encoder_cache(self) -> None:
+        """Profile the worst-case multimodal encoder during startup.
+
+        The V2 runner performs this before KV-cache allocation. Besides
+        accounting for encoder/cache memory in the peak-memory estimate, the
+        pass JIT-compiles vision-tower kernels so the first multimodal request
+        does not pay their compilation latency.
+        """
+        multimodal_config = self.model_config.multimodal_config
+        if not multimodal_config or multimodal_config.skip_mm_profiling:
+            return
+
+        mm_budget = MultiModalBudget(
+            self.vllm_config,
+            MULTIMODAL_REGISTRY,
+            enable_cache=False,
+        )
+        dummy_mm_inputs = get_dummy_encoder_profile_inputs(
+            MULTIMODAL_REGISTRY,
+            mm_budget,
+        )
+        self.encoder_runner.profile_encoder_cache(dummy_mm_inputs, mm_budget)
 
     def gather_mm_embeddings(
         self, input_batch: InputBatch, draft_lookahead: int = 0

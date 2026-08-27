@@ -747,6 +747,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     @torch.inference_mode()
     def profile_run(self) -> None:
+        # Profile the worst-case multimodal encoder before KV-cache allocation.
+        # This also JIT-compiles vision-tower kernels so the first real image
+        # request does not incur a multi-second compilation pause. Keep the
+        # temporary encoder outputs until the end of this profile so their
+        # memory is included in the measured peak; reset_encoder_cache() then
+        # releases them before the KV cache is allocated.
+        if self.supports_mm_inputs and self.is_first_pp_rank:
+            self.model_state.profile_encoder_cache()
+
         hidden_states, sample_hidden_states = self._dummy_run(
             self.max_num_tokens, skip_attn=True, is_profile=True
         )
