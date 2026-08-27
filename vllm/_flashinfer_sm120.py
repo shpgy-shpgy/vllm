@@ -43,6 +43,7 @@ def _read_flashinfer_metadata(package_root: Path) -> str | None:
 def is_validated_flashinfer_root(package_root: Path) -> bool:
     comm_source = package_root / "flashinfer" / "jit" / "comm.py"
     mnnvl_source = package_root / "flashinfer" / "comm" / "mnnvl.py"
+    trtllm_ar_source = package_root / "flashinfer" / "comm" / "trtllm_ar.py"
     trtllm_binding = (
         package_root / "flashinfer" / "data" / "csrc" / "trtllm_allreduce_fusion.cu"
     )
@@ -61,6 +62,7 @@ def is_validated_flashinfer_root(package_root: Path) -> bool:
             return False
         comm_text = comm_source.read_text(encoding="utf-8")
         mnnvl_text = mnnvl_source.read_text(encoding="utf-8")
+        trtllm_ar_text = trtllm_ar_source.read_text(encoding="utf-8")
         binding_text = trtllm_binding.read_text(encoding="utf-8")
         header_text = trtllm_header.read_text(encoding="utf-8")
     except OSError:
@@ -70,6 +72,7 @@ def is_validated_flashinfer_root(package_root: Path) -> bool:
         and "supported_major_versions=[9, 10, 12]" in comm_text
         and "gpuDirectRDMACapable = int(" in mnnvl_text
         and "self._gpu_direct_rdma_capable" in mnnvl_text
+        and "gpu_direct_rdma_capable=False" in trtllm_ar_text
         and "params.launch_with_pdl = launch_with_pdl;" in binding_text
         and "bool launch_with_pdl = false;" in header_text
         and header_text.count("if (params.launch_with_pdl)") == 5

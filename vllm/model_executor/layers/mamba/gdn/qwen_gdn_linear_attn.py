@@ -1789,7 +1789,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             else self.kv_cache[0].transpose(-1, -2)
         )
         conv_state_len = self.conv_kernel_size - 1
-        if conv_state.shape[1] != self.conv_dim or conv_state.shape[2] < conv_state_len:
+        local_conv_dim = self.conv1d.weight.size(0)
+        if (
+            conv_state.shape[1] != local_conv_dim
+            or conv_state.shape[2] < conv_state_len
+        ):
             return False
         # Speculative decoding reserves extra rolling-state columns.  The
         # non-spec one-token update uses only the ordinary width-1 prefix, and
