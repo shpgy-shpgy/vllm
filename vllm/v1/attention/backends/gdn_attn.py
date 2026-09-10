@@ -110,6 +110,14 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             self.num_spec = 0
         self.use_spec_decode: bool = self.num_spec > 0
         self._init_reorder_batch_threshold(1, self.use_spec_decode)
+        # Autoregressive draft steps use the ordinary one-token decode path.
+        # With no prefix cache and no ReplaySSM, all GDN metadata consumed by
+        # that path is either a live runner buffer view or a stable state-index
+        # buffer, so it can be reused while draft positions advance.
+        self.supports_draft_decode_metadata_update = (
+            vllm_config.cache_config.mamba_cache_mode == "none"
+            and not vllm_config.cache_config.use_replayssm
+        )
 
         self.use_full_cuda_graph: bool = (
             self.compilation_config.cudagraph_mode.has_full_cudagraphs()
@@ -526,6 +534,13 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             token_chunk_offset_ptr=token_chunk_offset_ptr,
         )
         return attn_metadata
+
+    def update_draft_decode_metadata(self, metadata: GDNAttentionMetadata) -> None:
+        """Keep ordinary one-token draft metadata live across MTP steps."""
+        if not self.supports_draft_decode_metadata_update:
+            raise NotImplementedError(
+                "GDN draft metadata update requires mamba cache mode 'none'"
+            )
 
     def build_for_cudagraph_capture(
         self, common_attn_metadata: CommonAttentionMetadata

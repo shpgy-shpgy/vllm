@@ -887,6 +887,17 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             == FlashInferDecodeKernel.TRTLLM_GEN
             and not self.use_dcp
         )
+        # During autoregressive MTP drafting on SM120, XQA metadata keeps
+        # references to the runner's persistent block-table and seq-lens
+        # buffers.  The draft loop updates those buffers in place, so the
+        # metadata can be reused without rebuilding the FlashInfer wrapper.
+        # Keep this disabled for DCP and adaptive varlen paths, whose decode
+        # metadata has additional step-dependent state.
+        self.supports_draft_decode_metadata_update = (
+            self.use_dedicated_xqa
+            and not self.use_dcp
+            and not self.use_trtllm_gen_varlen_decode
+        )
         supports_spec_as_decode = (
             self.flashinfer_trtllm_api_decode_kernel
             == FlashInferDecodeKernel.TRTLLM_GEN
@@ -1432,6 +1443,26 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 BLOCK_SIZE=1024,
             )
         return paged_kv_indices
+
+    def update_draft_decode_metadata(self, metadata: FlashInferMetadata) -> None:
+        """Reuse XQA draft metadata after the runner advances its buffers.
+
+        XQA consumes ``block_tables`` and ``seq_lens`` directly from the
+        persistent GPU buffers owned by the model runner.  Autoregressive
+        drafting changes those buffers in place; it does not change the XQA
+        kernel configuration, query width, or mask for the one-token draft
+        path.  There is therefore no metadata object to rebuild here.
+        """
+        if not self.supports_draft_decode_metadata_update:
+            raise NotImplementedError(
+                "FlashInfer draft metadata update is only supported for SM120 XQA"
+            )
+        assert metadata.decode is not None
+        assert isinstance(metadata.decode, FlashInferTrtllmAPIDecode)
+        assert metadata.decode.kernel == FlashInferDecodeKernel.XQA
+        assert metadata.decode.q_len_per_req == 1
+        assert metadata.decode.q_cu_seq_lens is None
+        assert metadata.decode.mask is None
 
     def build(
         self,

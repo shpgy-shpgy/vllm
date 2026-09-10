@@ -121,6 +121,14 @@ class PleShortConvAttentionMetadataBuilder(ShortConvAttentionMetadataBuilder):
         self.use_full_cuda_graph = (
             self.compilation_config.cudagraph_mode.has_full_cudagraphs()
         )
+        # The autoregressive draft path is ordinary one-token decode.  In
+        # mamba_cache_mode=none without ReplaySSM, PLE consumes stable state
+        # indices and live runner-owned query/sequence buffers, so rebuilding
+        # metadata between draft steps is unnecessary.
+        self.supports_draft_decode_metadata_update = (
+            vllm_config.cache_config.mamba_cache_mode == "none"
+            and not vllm_config.cache_config.use_replayssm
+        )
 
         max_num_seqs = vllm_config.scheduler_config.max_num_seqs
         max_capture_size = self.compilation_config.max_cudagraph_capture_size
@@ -156,6 +164,16 @@ class PleShortConvAttentionMetadataBuilder(ShortConvAttentionMetadataBuilder):
         self.has_initial_states_d = torch.empty(
             (self.decode_cudagraph_max_bs,), dtype=torch.bool, device=device
         )
+
+    def update_draft_decode_metadata(
+        self, metadata: PleShortConvAttentionMetadata
+    ) -> None:
+        """Keep ordinary one-token draft metadata live across MTP steps."""
+        if not self.supports_draft_decode_metadata_update:
+            raise NotImplementedError(
+                "PLE short-conv draft metadata update requires "
+                "mamba cache mode 'none'"
+            )
 
     def _build_non_spec_metadata(
         self,
