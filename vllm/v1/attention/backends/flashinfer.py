@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer with FlashInfer."""
 
+import os
 from dataclasses import dataclass, replace
 from enum import Enum
 from functools import partial
@@ -1981,6 +1982,8 @@ class FlashInferImpl(AttentionImpl):
         sinks: torch.Tensor | None = None,
     ) -> None:
         self.num_heads = num_heads
+        self._small_batch_attention = None
+        self._use_small_batch_attention = os.getenv("VLLM_SMALL_BATCH_ATTN", "1") == "1"
         self.head_size = head_size
         self.scale = float(scale)
         self.num_kv_heads = num_kv_heads
@@ -2635,6 +2638,51 @@ class FlashInferImpl(AttentionImpl):
                         layer, attn_metadata.q_data_type_decode
                     )
                     q_len_per_req: int | None = attn_metadata.decode.q_len_per_req
+
+                    if (
+                        self._use_small_batch_attention
+                        and current_platform.is_device_capability_family(120)
+                        and attn_metadata.num_decodes == 1
+                        and attn_metadata.num_prefills == 0
+                        and attn_metadata.causal
+                        and q_len_per_req in (1, 5)
+                        and num_decode_tokens == q_len_per_req
+                        and attn_metadata.decode.q_cu_seq_lens is None
+                        and self.num_heads == 16
+                        and self.num_kv_heads == 4
+                        and self.head_size == 256
+                        and self.window_left == -1
+                        and not self.logits_soft_cap
+                        and self.sinks is None
+                        and self.alibi_slopes is None
+                        and decode_query.dtype == torch.bfloat16
+                        and kv_cache_tuple[0].dtype == torch.bfloat16
+                        and output.dtype == torch.bfloat16
+                        and self.bmm2_scale == 1.0
+                    ):
+                        if self._small_batch_attention is None:
+                            from vllm.v1.attention.ops.triton_small_batch_attention import (
+                                SmallBatchAttention,
+                            )
+
+                            self._small_batch_attention = SmallBatchAttention()
+                            layout = get_flashinfer_layout_string(self.kv_cache_layout)
+                            logger.info_once(
+                                "Using experimental BS1 split-KV attention "
+                                "(layout=%s, page=%d).",
+                                layout,
+                                kv_cache_tuple[0].shape[1 if layout == "NHD" else 2],
+                            )
+                        self._small_batch_attention(
+                            decode_query,
+                            kv_cache_tuple,
+                            output[:num_decode_tokens],
+                            block_tables_decode,
+                            seq_lens_decode,
+                            bmm1_scale,
+                            get_flashinfer_layout_string(self.kv_cache_layout),
+                        )
+                        return output_padded
 
                     flashinfer_xqa_batch_decode_with_kv_cache(
                         query=decode_query,

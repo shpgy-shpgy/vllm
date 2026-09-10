@@ -90,6 +90,52 @@ def ref_paged_attn(
     return torch.cat(outputs, dim=0)
 
 
+@pytest.mark.parametrize("steps", [1, 5])
+@pytest.mark.parametrize("layout", ["NHD", "HND"])
+def test_small_batch_split_kv_graph_updates(steps, layout):
+    """Graph replay must consume updated page tables/lengths and handle padding."""
+    from vllm.v1.attention.ops.triton_small_batch_attention import SmallBatchAttention
+
+    set_random_seed(9018)
+    shape = (16, 32, 4, 512) if layout == "NHD" else (16, 4, 32, 512)
+    backing = torch.randn(shape, dtype=torch.bfloat16, device=DEVICE_TYPE)
+    kv = backing.split(256, dim=-1)
+    k, v = kv if layout == "NHD" else (x.transpose(1, 2) for x in kv)
+    q = torch.randn(steps, 16, 256, dtype=torch.bfloat16, device=DEVICE_TYPE)
+    out = torch.empty_like(q)
+    table = torch.arange(16, device=DEVICE_TYPE, dtype=torch.int32).view(1, 16)
+    lengths = torch.tensor([511], device=DEVICE_TYPE, dtype=torch.int32)
+    op = SmallBatchAttention()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        op(q, kv, out, table, lengths, 256**-0.5, layout)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        op(q, kv, out, table, lengths, 256**-0.5, layout)
+    for length in (steps, 32, 33, 511, 0):
+        lengths.fill_(length)
+        table.copy_(table.flip(1))
+        graph.replay()
+        torch.cuda.synchronize()
+        if length:
+            with torch.device(DEVICE_TYPE):
+                expected = ref_paged_attn(
+                    q.float(),
+                    k.float().contiguous(),
+                    v.float().contiguous(),
+                    [steps],
+                    [length],
+                    table,
+                    256**-0.5,
+                )
+            torch.testing.assert_close(out.float(), expected, atol=0.003, rtol=0.02)
+        else:
+            assert torch.isfinite(out).all()
+            assert out.count_nonzero() == 0
+
+
 @pytest.mark.parametrize(
     "seq_lens", [[(1, 1328), (5, 18), (129, 463)], [(1, 523), (1, 37), (1, 2011)]]
 )

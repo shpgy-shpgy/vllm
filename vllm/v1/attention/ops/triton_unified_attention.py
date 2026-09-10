@@ -715,6 +715,18 @@ def reduce_segments(
     # sequence len for this particular sequence
     seq_len = tl.load(seq_lens_ptr + seq_idx)
 
+    if seq_len == 0:
+        dims = tl.arange(0, HEAD_SIZE_PADDED)
+        tl.store(
+            output_ptr
+            + query_token_idx * output_stride_0
+            + query_head_idx * output_stride_1
+            + dims,
+            0.0,
+            mask=dims < HEAD_SIZE,
+        )
+        return
+
     # number of segments for this particular sequence
     num_segments = NUM_SEGMENTS_PER_SEQ
     tiles_per_segment = cdiv_fn(seq_len, num_segments * TILE_SIZE)
@@ -847,6 +859,8 @@ def unified_attention(
     # Gemma4: clamp mm_prefix bidirectional ranges by the sliding window.
     # Default False keeps the original behavior for every other model.
     mm_prefix_clamp_sliding_window: bool = False,
+    split_kv_query_len_threshold: int = 1,
+    split_kv_tile_size: int | None = None,
 ):
     # Resolve causal: bool or per-seq tensor.
     use_per_seq_causal = isinstance(causal, torch.Tensor)
@@ -1044,7 +1058,7 @@ def unified_attention(
         or softmax_segm_output is None
         or softmax_segm_max is None
         or softmax_segm_expsum is None
-        or max_seqlen_q > 1
+        or max_seqlen_q > split_kv_query_len_threshold
         or num_seqs > seq_threshold_3D
         or is_batch_invariant
     )
@@ -1078,6 +1092,8 @@ def unified_attention(
         grid = (total_num_q_blocks, num_kv_heads)
         tile_size = TILE_SIZE_PREFILL
     else:
+        if split_kv_tile_size is not None:
+            TILE_SIZE_DECODE = split_kv_tile_size
         grid = (total_num_q_blocks, num_kv_heads, num_par_softmax_segments)
         tile_size = TILE_SIZE_DECODE
 
