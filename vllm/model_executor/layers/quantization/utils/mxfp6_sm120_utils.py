@@ -3,6 +3,7 @@
 """Helpers for the optional ``mxfp6-sm120`` W6A8 backend."""
 
 import importlib
+import os
 from collections.abc import Iterable
 from types import ModuleType
 from typing import TypeAlias
@@ -291,6 +292,18 @@ def mxfp6_sm120_route(
 def _mxfp6_sm120_quantize_mxfp8_packed_impl(
     input: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if (
+        os.getenv("VLLM_MXFP8_FUSED_PADDING", "1") == "1"
+        and input.dtype == torch.bfloat16
+        and 0 < input.shape[0] <= 320
+        and current_platform.is_device_capability(120)
+    ):
+        from vllm.model_executor.layers.quantization.utils.mxfp8_fused_padding import (
+            quantize_mxfp8_with_padding,
+        )
+
+        logger.info_once("Using fused MXFP8 quantization and scale padding on SM120.")
+        return quantize_mxfp8_with_padding(input)
     operand = _import_mxfp6().quantize_mxfp8(input)
     return operand.values.view(torch.float8_e4m3fn), operand.scales
 
