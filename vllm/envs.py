@@ -341,6 +341,7 @@ if TYPE_CHECKING:
     VLLM_NIC_SELECTION_VARS: str = ""
     VLLM_PREFIX_CACHE_RETENTION_INTERVAL: int | None = None
     VLLM_ENABLE_HPC_OPS: bool = False
+    VLLM_MXFP8_FUSED_SILU: bool = True
 
 
 def get_default_cache_root():
@@ -2077,6 +2078,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Debug workspace allocations.
     # logging of workspace resize operations.
     "VLLM_DEBUG_WORKSPACE": lambda: bool(int(os.getenv("VLLM_DEBUG_WORKSPACE", "0"))),
+    # Changes the compiled graph, so it must participate in compile_factors().
+    "VLLM_MXFP8_FUSED_SILU": lambda: bool(
+        int(os.getenv("VLLM_MXFP8_FUSED_SILU", "1"))
+    ),
     # Disables parallel execution of shared_experts via separate cuda stream
     "VLLM_DISABLE_SHARED_EXPERTS_STREAM": lambda: bool(
         int(os.getenv("VLLM_DISABLE_SHARED_EXPERTS_STREAM", "0"))

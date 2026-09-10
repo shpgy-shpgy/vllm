@@ -336,6 +336,37 @@ def mxfp6_sm120_quantize_mxfp8_packed(
     return torch.ops.vllm.mxfp6_sm120_quantize_mxfp8_packed(input)
 
 
+def _mxfp6_sm120_silu_quant_impl(
+    input: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from vllm.model_executor.layers.quantization.utils.mxfp8_fused_padding import (
+        silu_mul_quantize_mxfp8_with_padding,
+    )
+
+    logger.info_once("Using fused native SiLU and packed MXFP8 quantization on SM120.")
+    return silu_mul_quantize_mxfp8_with_padding(input)
+
+
+def _mxfp6_sm120_silu_quant_fake(
+    input: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _mxfp6_sm120_quantize_mxfp8_packed_fake(input[:, : input.shape[1] // 2])
+
+
+direct_register_custom_op(
+    op_name="mxfp6_sm120_silu_quant",
+    op_func=_mxfp6_sm120_silu_quant_impl,
+    mutates_args=[],
+    fake_impl=_mxfp6_sm120_silu_quant_fake,
+)
+
+
+def mxfp6_sm120_silu_quant(
+    input: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.ops.vllm.mxfp6_sm120_silu_quant(input)
+
+
 def _mxfp6_sm120_grouped_gemm_impl(
     output: torch.Tensor,
     activation: torch.Tensor,

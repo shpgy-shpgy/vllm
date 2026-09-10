@@ -8,8 +8,14 @@ import torch
 from torch._higher_order_ops.auto_functionalize import auto_functionalized
 from torch._ops import OpOverload
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.model_executor.layers.activation import SiluAndMul
+from vllm.model_executor.layers.quantization.utils.mxfp6_sm120_utils import (
+    mxfp6_sm120_quantize_mxfp8_packed,
+    mxfp6_sm120_silu_quant,
+)
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     mxfp8_e4m3_quantize,
     silu_and_mul_mxfp8_quant,
@@ -309,6 +315,28 @@ class SiluMulMXFP8QuantPattern(VllmPatternReplacement):
         return _replacement
 
 
+class SiluMulSM120PackedQuantPattern(VllmPatternReplacement):
+    """Fuse the native compiled SiLU path with W6A8-compatible quantization."""
+
+    def get_inputs(self) -> list[torch.Tensor]:
+        return [self.empty_bf16(5, 256)]
+
+    @property
+    def pattern(self):
+        def _pattern(input: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            output = SiluAndMul.forward_native(input)
+            return mxfp6_sm120_quantize_mxfp8_packed(output)
+
+        return _pattern
+
+    @property
+    def replacement(self):
+        def _replacement(input: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            return mxfp6_sm120_silu_quant(input)
+
+        return _replacement
+
+
 class ActivationQuantFusionPass(VllmFusionPatternMatcherPass):
     """
     This pass fuses a pre-defined set of custom ops into fused ops.
@@ -328,6 +356,11 @@ class ActivationQuantFusionPass(VllmFusionPatternMatcherPass):
             self.register(SiluMulNvfp4QuantPattern())
 
         if current_platform.is_device_capability(120):
+            if (
+                envs.VLLM_MXFP8_FUSED_SILU
+                and not SiluAndMul.enabled()
+            ):
+                self.register(SiluMulSM120PackedQuantPattern())
             self.register(SiluMulMXFP8QuantPattern())
             for (
                 quant_key,

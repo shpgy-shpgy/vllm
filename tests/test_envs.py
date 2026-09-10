@@ -37,6 +37,23 @@ def test_nixl_side_channel_host_is_not_compile_factor(
     assert "VLLM_NIXL_SIDE_CHANNEL_HOST" not in envs.compile_factors()
 
 
+def test_mxfp8_silu_switch_changes_aot_cache_key(monkeypatch: pytest.MonkeyPatch):
+    """Disabling a graph fusion must not reload the enabled compiled artifact."""
+    from vllm.compilation.caching import aot_compile_hash_factors
+    from vllm.config import VllmConfig
+
+    config = VllmConfig()
+    monkeypatch.setenv("VLLM_MXFP8_FUSED_SILU", "0")
+    disabled = aot_compile_hash_factors(config)
+    assert envs.compile_factors()["VLLM_MXFP8_FUSED_SILU"] is False
+    monkeypatch.setenv("VLLM_MXFP8_FUSED_SILU", "1")
+    enabled = aot_compile_hash_factors(config)
+    assert envs.compile_factors()["VLLM_MXFP8_FUSED_SILU"] is True
+    assert disabled != enabled
+    monkeypatch.delenv("VLLM_MXFP8_FUSED_SILU")
+    assert aot_compile_hash_factors(config) == enabled
+
+
 def test_api_key_is_not_compile_factor(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("VLLM_API_KEY", "sk-super-secret")
 

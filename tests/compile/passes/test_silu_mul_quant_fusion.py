@@ -226,6 +226,59 @@ CUDA_KERNELS = [
 TEST_KERNELS = ROCM_KERNELS if current_platform.is_rocm() else CUDA_KERNELS
 
 
+@pytest.mark.skipif(
+    not current_platform.is_cuda() or not current_platform.is_device_capability(120),
+    reason="Packed W6A8 quantization requires SM120",
+)
+@pytest.mark.parametrize("num_tokens", [1, 80, 320, 2048])
+def test_sm120_packed_silu_quant_graph_equivalence(num_tokens, monkeypatch):
+    """Fusion must preserve compiled native bytes while graph inputs change."""
+    pytest.importorskip("mxfp6")
+    from vllm.model_executor.layers.quantization.utils.mxfp6_sm120_utils import (
+        mxfp6_sm120_quantize_mxfp8_packed,
+    )
+
+    monkeypatch.setenv("VLLM_MXFP8_FUSED_SILU", "1")
+    config = VllmConfig(
+        compilation_config=CompilationConfig(
+            mode=CompilationMode.VLLM_COMPILE, custom_ops=["none"]
+        )
+    )
+
+    def model(x):
+        y = SiluAndMul.forward_native(x)
+        y = y.reshape(-1, y.shape[-1]).contiguous()
+        return mxfp6_sm120_quantize_mxfp8_packed(y)
+
+    with set_current_vllm_config(config):
+        fusion = ActivationQuantFusionPass(config)
+        backend = TestBackend(
+            NoOpEliminationPass(config), fusion, PostCleanupPass(config)
+        )
+        candidate = torch.compile(model, backend=backend, fullgraph=True)
+        baseline = torch.compile(model, fullgraph=True)
+        x = torch.randn(num_tokens, 18432, device="cuda", dtype=torch.bfloat16)
+        candidate(x)
+        backend.check_before_ops([torch.ops.vllm.mxfp6_sm120_quantize_mxfp8_packed])
+        backend.check_after_ops([torch.ops.vllm.mxfp6_sm120_silu_quant])
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            candidate(x)
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            actual = candidate(x)
+        for amplitude in (1.0, 0.001, 10.0):
+            x.normal_().mul_(amplitude)
+            graph.replay()
+            expected = baseline(x)
+            assert torch.equal(
+                actual[0].view(torch.uint8), expected[0].view(torch.uint8)
+            )
+            assert torch.equal(actual[1], expected[1])
+
+
 @pytest.mark.parametrize("num_tokens", [32, 64])
 @pytest.mark.parametrize("hidden_size", [128, 256])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])

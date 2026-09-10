@@ -17,13 +17,21 @@ def _quantize_padded(
     PK: tl.constexpr,
     PM: tl.constexpr,
     BG: tl.constexpr,
+    SILU_MUL: tl.constexpr = False,
 ):
     group = tl.program_id(0) * BG + tl.arange(0, BG)
     row, kg = group // PK, group % PK
     lane = tl.arange(0, 32)
     valid = (row < M) & (kg < K // 32)
     offset = row[:, None] * K + kg[:, None] * 32 + lane[None, :]
-    x = tl.load(X + offset, valid[:, None], other=0).to(tl.float32)
+    if SILU_MUL:
+        source = row[:, None] * (2 * K) + kg[:, None] * 32 + lane[None, :]
+        gate = tl.load(X + source, valid[:, None], other=0).to(tl.float32)
+        up = tl.load(X + source + K, valid[:, None], other=0).to(tl.float32)
+        # Match Inductor's fused native SiLU/mul: round only its final output.
+        x = ((gate / (1.0 + tl.exp(-gate))) * up).to(tl.bfloat16).to(tl.float32)
+    else:
+        x = tl.load(X + offset, valid[:, None], other=0).to(tl.float32)
     magnitude = tl.where(x == x, tl.abs(x), 0.0)
     maximum = tl.max(magnitude, 1)
     raw = tl.maximum(maximum * (1.0 / 448.0), 1.0e-30)
@@ -56,5 +64,22 @@ def quantize_mxfp8_with_padding(
     groups = 32 if m <= 128 else 64
     _quantize_padded[(triton.cdiv(pm * pk, groups),)](
         x, out, scales, m, k, pk, pm, groups, num_warps=4
+    )
+    return out, scales
+
+
+def silu_mul_quantize_mxfp8_with_padding(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    m, twice_k = x.shape
+    k = twice_k // 2
+    assert x.dtype == torch.bfloat16 and x.is_contiguous()
+    assert m > 0 and twice_k % 256 == 0
+    pm = triton.cdiv(m, 128) * 128
+    pk = k // 32
+    out = torch.empty((m, k), device=x.device, dtype=torch.float8_e4m3fn)
+    scales = torch.empty(pm * pk, device=x.device, dtype=torch.uint8)
+    _quantize_padded[(triton.cdiv(pm * pk, 64),)](
+        x, out, scales, m, k, pk, pm, 64, SILU_MUL=True, num_warps=4
     )
     return out, scales
