@@ -289,6 +289,16 @@ def test_gdn_decode_kernel_env(monkeypatch: pytest.MonkeyPatch):
             env_func()
 
 
+def test_gdn_mtp_reset_pool_cache_env(monkeypatch: pytest.MonkeyPatch):
+    env_func = environment_variables["VLLM_GDN_MTP_RESET_POOL_CACHE"]
+    monkeypatch.delenv("VLLM_GDN_MTP_RESET_POOL_CACHE", raising=False)
+    assert env_func() is True
+    monkeypatch.setenv("VLLM_GDN_MTP_RESET_POOL_CACHE", "1")
+    assert env_func() is True
+    monkeypatch.setenv("VLLM_GDN_MTP_RESET_POOL_CACHE", "0")
+    assert env_func() is False
+
+
 class TestEnvListWithChoices:
     """Test cases for env_list_with_choices function."""
 

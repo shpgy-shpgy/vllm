@@ -89,6 +89,33 @@ logger = init_logger(__name__)
 
 MAX_FUSED_GDN_MTP_TOKENS = 8
 FUSED_GDN_STATE_DTYPES = (torch.float32, torch.bfloat16)
+_FLASHINFER_GDN_MTP_POOL_SIGNATURE: tuple | None = None
+
+
+def _reset_flashinfer_gdn_mtp_pool_cache() -> bool:
+    """Drop CuTe MTP launchers after vLLM replaces the state pool.
+
+    vLLM first binds a small profiling pool and later binds the final pool.
+    FlashInfer 0.6.x keys its non-contiguous MTP launcher cache by strides,
+    but the CuTe input descriptor also captures the pool extent. The two
+    pools have the same page stride, so a cache hit can reuse a launcher with
+    the profiling extent and make the first full CUDA-graph capture fall back
+    to FLA.
+    """
+    try:
+        from flashinfer.gdn_kernels import gdn_decode_mtp
+    except Exception:
+        return False
+
+    cleared = False
+    for name in ("_get_compiled_mtp_kernel", "_get_compiled_mtp_kernel_inline"):
+        cache_clear = getattr(
+            getattr(gdn_decode_mtp, name, None), "cache_clear", None
+        )
+        if cache_clear is not None:
+            cache_clear()
+            cleared = True
+    return cleared
 
 
 @functools.cache
@@ -443,6 +470,28 @@ class ChunkGatedDeltaRule(CustomOp):
 
 @PluggableLayer.register("qwen_gated_delta_net_attention")
 class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+    def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
+        super().bind_kv_cache(kv_cache)
+        if not envs.VLLM_GDN_MTP_RESET_POOL_CACHE:
+            return
+
+        # All Qwen3.5 GDN layers use the same state-pool layout. Reset once
+        # when the allocator changes from the profiling pool to the final
+        # pool; repeated layer bindings then keep the already-correct cache.
+        state = self.kv_cache[1]
+        signature = (tuple(state.shape), tuple(state.stride()))
+        global _FLASHINFER_GDN_MTP_POOL_SIGNATURE
+        if signature == _FLASHINFER_GDN_MTP_POOL_SIGNATURE:
+            return
+        if _reset_flashinfer_gdn_mtp_pool_cache():
+            logger.info_once(
+                "Reset FlashInfer GDN MTP CuTe cache for state pool shape=%s "
+                "stride=%s.",
+                tuple(state.shape),
+                tuple(state.stride()),
+            )
+        _FLASHINFER_GDN_MTP_POOL_SIGNATURE = signature
+
     def get_state_shape(
         self,
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
