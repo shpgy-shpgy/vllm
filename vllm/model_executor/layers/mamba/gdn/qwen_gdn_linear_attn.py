@@ -977,6 +977,34 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         return query, key, value
 
+    def rearrange_mixed_qkv_flashinfer(self, mixed_qkv):
+        """Expose packed qkv as non-contiguous views for FlashInfer MTP.
+
+        FlashInfer's dynamic-layout MTP entry point accepts split views into
+        the row-packed convolution output.  Keeping the original row stride
+        avoids the intermediate ``torch.cat`` used by
+        :meth:`rearrange_mixed_qkv`; the generic FLA and attention paths still
+        use the contiguous layout above because their kernels have different
+        layout contracts.
+        """
+        if mixed_qkv is None:
+            return None, None, None
+
+        q_dim = self.key_dim // self.tp_size
+        k_dim = self.key_dim // self.tp_size
+        v_dim = self.value_dim // self.tp_size
+        query, key, value = torch.split(mixed_qkv, [q_dim, k_dim, v_dim], dim=-1)
+
+        # The leading dimension remains the packed QKV width.  ``view`` is
+        # valid because each split has a contiguous innermost head dimension;
+        # FlashInfer marks these layouts dynamic and consumes the stride
+        # directly.
+        seq_len = mixed_qkv.shape[0]
+        query = query.view(1, seq_len, -1, self.head_k_dim)
+        key = key.view(1, seq_len, -1, self.head_k_dim)
+        value = value.view(1, seq_len, -1, self.head_v_dim)
+        return query, key, value
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -2092,7 +2120,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             max_query_len=seq_len,
             validate_data=False,
         )
-        query, key, value = self.rearrange_mixed_qkv(conv_output)
+        query, key, value = self.rearrange_mixed_qkv_flashinfer(conv_output)
         query = query.reshape(
             batch_size, seq_len, self.num_k_heads // self.tp_size, self.head_k_dim
         )
