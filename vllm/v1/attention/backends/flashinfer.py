@@ -481,6 +481,31 @@ class FlashInferBackend(AttentionBackend):
             return [16, 32, 64]
         return [16, 32, 64, 128, 256, 512, 1024]
 
+    @classmethod
+    def get_preferred_block_size(cls, default_block_size: int) -> int:
+        """Prefer the XQA page size measured for SM120 hybrid decode.
+
+        The default framework block size (16) is still useful for general
+        models, but it prevents a hybrid block from being divisible by the
+        faster XQA page-64 kernel. Keep this workload-specific: explicit
+        ``--block-size`` remains authoritative, and speculative/MTP paths are
+        left unchanged because they have not been validated with this layout.
+        """
+        vllm_config = get_current_vllm_config_or_none()
+        if (
+            default_block_size == 16
+            and _use_separate_kv_head_slots()
+            and current_platform.is_device_capability_family(120)
+            and vllm_config is not None
+            and vllm_config.model_config is not None
+            and vllm_config.model_config.is_hybrid
+            and getattr(vllm_config.speculative_config, "method", None) is None
+            and vllm_config.cache_config.cache_dtype
+            in ("auto", "float16", "bfloat16")
+        ):
+            return 64
+        return super().get_preferred_block_size(default_block_size)
+
     @staticmethod
     def get_name() -> str:
         return "FLASHINFER"
