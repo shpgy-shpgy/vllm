@@ -103,6 +103,14 @@ trtllm_workspace_buffer = None
 _xqa_spec_decode_causal_mask_cache: dict[tuple[str, int, int, int], torch.Tensor] = {}
 
 
+def _use_separate_kv_head_slots() -> bool:
+    """Use separate K/V head slots for the SM120 XQA layout."""
+    return (
+        envs.VLLM_FLASHINFER_SEPARATE_KV_HEADS
+        and current_platform.is_device_capability_family(120)
+    )
+
+
 def _get_trtllm_workspace_buffer():
     global trtllm_workspace_buffer
     if trtllm_workspace_buffer is None:
@@ -412,6 +420,22 @@ class FlashInferBackend(AttentionBackend):
     def customize_spec(cls, spec: "AttentionSpec") -> "AttentionSpec":
         """NVFP4 stores K and V as separate per-head slots of packed fp4 data
         plus fp8 block scales."""
+        if (
+            _use_separate_kv_head_slots()
+            and spec.state_content_bytes is None
+            and spec.kv_quant_mode == KVQuantMode.NONE
+            and spec.head_size == spec.head_size_v
+            and spec.num_head_slots is None
+        ):
+            # The normal BF16/FP16 cache packs K and V into the content axis.
+            # On SM120 this gives XQA a stride of 2*head_dim between adjacent
+            # KV heads.  Keep the same total page size, but put K heads first
+            # and V heads second so each XQA input view is head-contiguous.
+            return replace(
+                spec,
+                num_head_slots=2 * spec.num_kv_heads,
+                state_content_bytes=spec.head_size * get_dtype_size(spec.dtype),
+            )
         if spec.state_content_bytes is not None or not spec.kv_quant_mode.is_nvfp4:
             return spec
         hs_k = nvfp4_kv_cache_full_dim(spec.head_size)
@@ -553,6 +577,12 @@ class FlashInferBackend(AttentionBackend):
     @classmethod
     def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...] | None:
         capability = current_platform.get_device_capability()
+        if _use_separate_kv_head_slots():
+            # The separate-head representation is most effective when the
+            # page interior is head-major: XQA then sees contiguous token
+            # vectors after its zero-copy HND -> NHD view.  Keep the behavior
+            # isolated to this layout while leaving non-SM120 paths unchanged.
+            return (KVCacheLayout.LBHNC,)
         if capability is not None and capability.major == 10:
             # The trtllm-gen kernels consume head-major block interiors; the L/B
             # nesting outside the block is immaterial to them.
@@ -2000,6 +2030,11 @@ class FlashInferImpl(AttentionImpl):
         self.cache_dtype = kv_cache_dtype
         self.is_kvcache_nvfp4 = kv_cache_dtype.startswith("nvfp4")
         self.kv_cache_dtype = "nvfp4" if self.is_kvcache_nvfp4 else kv_cache_dtype
+        self.use_separate_kv_head_slots = (
+            _use_separate_kv_head_slots()
+            and not self.is_kvcache_nvfp4
+            and not is_quantized_kv_cache(self.kv_cache_dtype)
+        )
         self.fp4_data_dim = head_size // 2 if self.is_kvcache_nvfp4 else 0
         self.logits_soft_cap = logits_soft_cap
         self.kv_sharing_target_layer_name = kv_sharing_target_layer_name
@@ -2248,6 +2283,14 @@ class FlashInferImpl(AttentionImpl):
                     cache.permute(*stride_order)
                     for cache in kv_cache.split(self.num_kv_heads, dim=1)
                 )
+            elif self.use_separate_kv_head_slots:
+                kv_perm = kv_cache.permute(*stride_order)
+                head_axis = (
+                    2
+                    if get_flashinfer_layout_string(self.kv_cache_layout) == "NHD"
+                    else 1
+                )
+                kv_cache_views = kv_perm.split(self.num_kv_heads, dim=head_axis)
             else:
                 kv_perm = kv_cache.permute(*stride_order)
                 kv_cache_views = kv_perm.split(self.head_size, dim=-1)
@@ -2295,6 +2338,16 @@ class FlashInferImpl(AttentionImpl):
             v_data, v_sf = nvfp4_split_data_scale(kv_cache_tuple[1])
             nvfp4_kv_data = (k_data, v_data)
             nvfp4_kv_block_scales = (k_sf, v_sf)
+        elif self.use_separate_kv_head_slots:
+            head_axis = (
+                2
+                if get_flashinfer_layout_string(self.kv_cache_layout) == "NHD"
+                else 1
+            )
+            kv_cache_tuple = tuple(
+                canonicalize_singleton_dim_strides(cache)
+                for cache in kv_cache_permute.split(self.num_kv_heads, dim=head_axis)
+            )
         else:
             kv_cache_tuple = kv_cache_permute.split(hs, dim=-1)
 
@@ -2819,6 +2872,12 @@ class FlashInferImpl(AttentionImpl):
                 # (B, 2*H, N, full_dim) -> ((B, N, H, full_dim),
                 #                            (B, N, H, full_dim));
                 # K heads first, then V heads.
+                k_cache, v_cache = kv_cache.transpose(1, 2).split(
+                    self.num_kv_heads, dim=-2
+                )
+            elif self.use_separate_kv_head_slots:
+                # (B, 2*H, N, head_size) -> ((B, N, H, head_size),
+                #                             (B, N, H, head_size)).
                 k_cache, v_cache = kv_cache.transpose(1, 2).split(
                     self.num_kv_heads, dim=-2
                 )
