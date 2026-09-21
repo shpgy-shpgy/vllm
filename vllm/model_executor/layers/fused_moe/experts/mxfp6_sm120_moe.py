@@ -215,7 +215,15 @@ class Mxfp6Sm120MoERunner(MoERunner):
                 "Executing Qwen3.5-35B TP2 MXFP6 indirect grouped schedule"
             )
             self.routed_experts._ensure_moe_quant_config_init()
-            self._maybe_sync_shared_experts_stream(shared_experts_input)
+
+            # Launch shared experts before routing when multi-stream overlap
+            # is selected.  The old _maybe_sync_shared_experts_stream helper
+            # was removed from MoERunner; the current API explicitly returns
+            # whether the shared experts were launched asynchronously and
+            # requires a wait before consuming the output.
+            shared_experts_overlapping = self.shared_experts.maybe_forward_async(
+                shared_experts_input
+            )
             if self.gate is not None:
                 router_logits, _ = self.gate(hidden_states)
 
@@ -224,10 +232,11 @@ class Mxfp6Sm120MoERunner(MoERunner):
                     hidden_states,
                     router_logits,
                 )
-                self._maybe_apply_shared_experts(
-                    shared_experts_input,
-                    SharedExpertsOrder.NO_OVERLAP,
-                )
+                if not shared_experts_overlapping:
+                    self._maybe_apply_shared_experts(
+                        shared_experts_input,
+                        SharedExpertsOrder.NO_OVERLAP,
+                    )
                 workspace, output = _qwen35_grouped_workspace(hidden_states)
                 mxfp6.qwen35_grouped_gemm_out(
                     workspace,
@@ -239,10 +248,8 @@ class Mxfp6Sm120MoERunner(MoERunner):
                     state.w2_scales[:256],
                     renormalize=True,
                 )
-                self._maybe_apply_shared_experts(
-                    shared_experts_input,
-                    SharedExpertsOrder.MULTI_STREAM_OVERLAPPED,
-                )
+                if shared_experts_overlapping:
+                    self.shared_experts.wait()
                 shared_output = self.shared_experts.output
                 mxfp6.qwen35_grouped_reduce_out(
                     workspace,
