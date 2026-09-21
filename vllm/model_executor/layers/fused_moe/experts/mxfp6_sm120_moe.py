@@ -8,6 +8,7 @@ from typing import Literal
 
 import torch
 
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.config import get_current_vllm_config
 from vllm.logger import init_logger
@@ -48,7 +49,9 @@ from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
 
-_QWEN35_MOE_GRAPH_CACHE_VERSION = "qwen35_batch_dispatch_v4_b4_vector_cluster_gate"
+_QWEN35_MOE_GRAPH_CACHE_VERSION = (
+    "qwen35_batch_dispatch_v5_owned_output_canonical_op"
+)
 _QWEN35_SMALL_BATCH_MAX_TOKENS = 4
 _QWEN35_GROUPED_MIN_TOKENS = 5
 _QWEN35_GROUPED_MAX_TOKENS = 96
@@ -68,6 +71,11 @@ direct_register_custom_op(
     op_name="mxfp6_sm120_moe_forward",
     op_func=_moe_forward,
     fake_impl=_moe_forward_fake,
+    # The fast path uses persistent, caller-owned workspaces hidden behind
+    # the runner. Keep the same dependency barrier as vLLM's native MoE
+    # custom op so Inductor/CUDA-Graph cannot move producers/consumers across
+    # the opaque fast-path call.
+    mutates_args=["hidden_states"],
     tags=(torch.Tag.needs_fixed_stride_order,),
 )
 
@@ -160,7 +168,10 @@ def _qwen35_moe_small_batch(
             workspace.shared_gate,
             use_packed_vector_loads=padded_tokens == 4,
         )
-    return workspace.output[:tokens]
+    # The kernel writes a persistent runner-owned workspace.  Returning a
+    # graph-owned tensor prevents Inductor from reusing that scratch view as
+    # an intermediate across opaque MoE calls.
+    return workspace.output[:tokens].clone()
 
 
 def _qwen35_grouped_workspace(hidden_states: torch.Tensor):
@@ -256,7 +267,10 @@ class Mxfp6Sm120MoERunner(MoERunner):
                     output,
                     shared_output,
                 )
-                return output
+                # ``output`` aliases the persistent workspace returned by the
+                # workspace manager.  Give the compiled caller an owned,
+                # graph-visible result instead of exposing that scratch view.
+                return output.clone()
         result = super()._forward_impl(
             hidden_states,
             router_logits,
@@ -286,6 +300,12 @@ def _append_shared_parameter(
 
 def try_enable_qwen35_moe_small_batch(layer: torch.nn.Module) -> bool:
     """Install the Qwen3.5-35B TP2 small-batch schedule when compatible."""
+    if not envs.VLLM_MXFP6_SM120_QWEN35_FASTPATH:
+        logger.info_once(
+            "Disabled Qwen3.5-35B TP2 MXFP6 fused small-batch/grouped "
+            "schedule; using the generic native MXFP6 MoE runner"
+        )
+        return False
     moe = layer.moe_config
     vllm_config = get_current_vllm_config()
     if (
@@ -415,7 +435,12 @@ def try_enable_qwen35_moe_small_batch(layer: torch.nn.Module) -> bool:
         w2_scales=w2_scales,
         workspaces=workspaces,
     )
-    runner._forward_entry = torch.ops.vllm.mxfp6_sm120_moe_forward
+    # Reuse vLLM's canonical MoE custom op.  The fast implementation is
+    # selected by the runner stored in static_forward_context; using a second
+    # op name here makes Inductor treat the call as a different opaque graph
+    # boundary and can invalidate the alias/dependency assumptions made by the
+    # MoE compiler path.
+    runner._forward_entry = torch.ops.vllm.moe_forward
     # This post-load op selection is not part of Dynamo's traced-file cache key.
     vllm_config.additional_config["mxfp6_sm120_moe_graph"] = (
         _QWEN35_MOE_GRAPH_CACHE_VERSION

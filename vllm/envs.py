@@ -284,6 +284,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_FP8_MFMA_PAGE_ATTN: bool = False
     VLLM_ALLREDUCE_USE_SYMM_MEM: bool = True
     VLLM_ALLREDUCE_USE_FLASHINFER: bool | None = None
+    VLLM_MXFP6_SM120_QWEN35_FASTPATH: bool = True
     VLLM_TUNED_CONFIG_FOLDER: str | None = None
     VLLM_ENABLE_STARTUP_PLAN: bool = False
     VLLM_GPT_OSS_SYSTEM_TOOL_MCP_LABELS: set[str] = set()
@@ -1956,6 +1957,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # SM120 TP2 FlashInfer path; 0 disables it and 1 forces the existing path.
     "VLLM_ALLREDUCE_USE_FLASHINFER": env_flag_or_none(
         "VLLM_ALLREDUCE_USE_FLASHINFER"
+    ),
+    # Use the Qwen3.5-specific fused MXFP6 router/shared-expert schedule.
+    # Set to 0 to fall back to the generic native MXFP6 MoE runner.
+    "VLLM_MXFP6_SM120_QWEN35_FASTPATH": lambda: bool(
+        int(os.getenv("VLLM_MXFP6_SM120_QWEN35_FASTPATH", "1"))
     ),
     # Experimental: use this to enable MCP tool calling for non harmony models
     "VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT": lambda: bool(
