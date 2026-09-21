@@ -76,3 +76,46 @@ def test_qwen3_5_mtp_lm_head_receives_quant_config():
         MockLMHead.assert_called_once()
         call_kwargs = MockLMHead.call_args.kwargs
         assert call_kwargs["quant_config"] is mock_quant_config
+
+
+def test_manual_ar_norm_rejects_unsupported_execution_modes(monkeypatch):
+    """Delayed row reductions must not escape into PP, LoRA, MoE, or Eagle."""
+    from types import SimpleNamespace as NS
+
+    import torch
+
+    from vllm.config import CompilationMode
+    from vllm.model_executor.models import qwen3_5 as model
+
+    monkeypatch.setenv("VLLM_QWEN3_5_FUSED_AR_NORM", "1")
+    cfg = NS(
+        model_config=NS(
+            dtype=torch.bfloat16,
+            hf_text_config=NS(
+                model_type="qwen3_5_text", hidden_size=5120, layer_scale=False
+            ),
+        ),
+        parallel_config=NS(tensor_parallel_size=2, pipeline_parallel_size=1),
+        compilation_config=NS(mode=CompilationMode.NONE),
+        quant_config=NS(get_name=lambda: "quark"),
+        speculative_config=None,
+        lora_config=None,
+    )
+    with patch.object(model, "current_platform") as platform:
+        platform.is_cuda.return_value = True
+        platform.is_device_capability.return_value = True
+        assert model._use_mxfp6_ar_norm(cfg)
+        for obj, attr, value in (
+            (cfg, "speculative_config", object()),
+            (cfg, "lora_config", object()),
+            (cfg.parallel_config, "pipeline_parallel_size", 2),
+            (cfg.model_config.hf_text_config, "model_type", "qwen3_5_moe_text"),
+            (cfg.model_config.hf_text_config, "layer_scale", True),
+            (cfg.compilation_config, "mode", CompilationMode.VLLM_COMPILE),
+        ):
+            old = getattr(obj, attr)
+            setattr(obj, attr, value)
+            assert not model._use_mxfp6_ar_norm(cfg)
+            setattr(obj, attr, old)
+        monkeypatch.setenv("VLLM_QWEN3_5_FUSED_AR_NORM", "0")
+        assert not model._use_mxfp6_ar_norm(cfg)

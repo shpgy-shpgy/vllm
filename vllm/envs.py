@@ -315,6 +315,7 @@ if TYPE_CHECKING:
     VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: int = 256
     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
+    VLLM_QWEN3_5_FUSED_AR_NORM: bool = False
     VLLM_USE_V2_MODEL_RUNNER: bool | None = None
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
@@ -2128,6 +2129,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_COMPILE_CACHE_SAVE_FORMAT", "binary", ["binary", "unpacked"]
     ),
     # Flag to control the v2 model runner. If unset, use config defaults.
+    # Opt-in manual fusion for SM120 Qwen3.5 dense MXFP6, TP2, without compile.
+    "VLLM_QWEN3_5_FUSED_AR_NORM": lambda: os.getenv("VLLM_QWEN3_5_FUSED_AR_NORM", "0")
+    == "1",
     "VLLM_USE_V2_MODEL_RUNNER": lambda: maybe_convert_bool(
         os.getenv("VLLM_USE_V2_MODEL_RUNNER", None)
     ),

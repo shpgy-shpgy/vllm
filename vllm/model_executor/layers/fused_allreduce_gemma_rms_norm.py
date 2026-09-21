@@ -8,8 +8,9 @@ into a ``GemmaRMSNorm`` that adds the residual and normalizes. flashinfer ships 
 kernel that fuses all-reduce + residual-add + RMSNorm into a single launch; this
 helper drives it directly (no torch.compile pass) for models that run eager.
 
-Scope: attention output only, no quantization. When the flashinfer fast path is
-not applicable (TP==1, flashinfer/NVSwitch unavailable, unsupported dtype, or an
+Scope: row-parallel outputs followed by GemmaRMSNorm, without activation
+quantization. When the flashinfer fast path is not applicable (TP==1,
+workspace unavailable, unsupported dtype, or an
 oversize batch) it falls back to ``all_reduce`` + ``GemmaRMSNorm``, which is
 numerically identical to the unfused model path.
 """
@@ -86,7 +87,7 @@ def _can_use_flashinfer(hidden_states: torch.Tensor, tp_size: int) -> tuple[bool
         return False, 0
 
     # Lazily create / fetch the (globally cached) workspace; returns None on
-    # GPUs without NVSwitch, in which case we fall back gracefully.
+    # unsupported backends/topologies, in which case we fall back gracefully.
     workspace = get_fi_ar_workspace(
         world_size=tp_size,
         rank=get_tensor_model_parallel_rank(),

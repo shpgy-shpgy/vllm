@@ -25,16 +25,21 @@
 """Inference-only Qwen3.5 Series compatible with HuggingFace weights."""
 
 from collections.abc import Iterable
+from itertools import islice
 
 import torch
 from torch import nn
 
+from vllm import envs
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import VllmConfig
+from vllm.config import CompilationMode, VllmConfig
 from vllm.distributed import (
     get_pp_group,
 )
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_allreduce_gemma_rms_norm import (
+    fused_allreduce_gemma_rms_norm,
+)
 from vllm.model_executor.layers.fused_moe.utils import (
     is_model_fused_shared_expert_compatible,
 )
@@ -54,6 +59,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.tokenizers.registry import cached_tokenizer_from_config
 from vllm.transformers_utils.configs.qwen3_5 import Qwen3_5Config, Qwen3_5TextConfig
@@ -103,6 +109,27 @@ from .utils import (
 logger = init_logger(__name__)
 
 
+def _use_mxfp6_ar_norm(vllm_config: VllmConfig) -> bool:
+    config = vllm_config.model_config.hf_text_config
+    parallel = vllm_config.parallel_config
+    return (
+        envs.VLLM_QWEN3_5_FUSED_AR_NORM
+        and config.model_type == "qwen3_5_text"
+        and config.hidden_size == 5120
+        and not getattr(config, "layer_scale", False)
+        and vllm_config.model_config.dtype == torch.bfloat16
+        and parallel.tensor_parallel_size == 2
+        and parallel.pipeline_parallel_size == 1
+        and vllm_config.speculative_config is None
+        and vllm_config.lora_config is None
+        and vllm_config.compilation_config.mode == CompilationMode.NONE
+        and vllm_config.quant_config is not None
+        and vllm_config.quant_config.get_name() == "quark"
+        and current_platform.is_cuda()
+        and current_platform.is_device_capability(120)
+    )
+
+
 class Qwen3_5ProcessingInfo(Qwen3VLProcessingInfo):
     def get_hf_config(self):
         return self.ctx.get_hf_config(Qwen3_5Config)
@@ -132,6 +159,7 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
         parallel_config = vllm_config.parallel_config
         quant_config = vllm_config.quant_config
 
+        self.use_fused_ar_gemma_norm = _use_mxfp6_ar_norm(vllm_config)
         self.layer_type = layer_type
         self.layer_idx = extract_layer_index(prefix)
         is_moe_layer = config.model_type == "qwen3_5_moe_text"
@@ -147,7 +175,10 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                 vllm_config=vllm_config,
                 prefix=f"{prefix}.linear_attn",
                 gqa_interleaved_layout=False,
-                reduce_results=not self.use_attn_reduce_scatter_for_moe,
+                reduce_results=(
+                    not self.use_attn_reduce_scatter_for_moe
+                    and not self.use_fused_ar_gemma_norm
+                ),
             )
         elif self.layer_type == "full_attention":
             self.self_attn = Qwen3NextAttention(
@@ -156,7 +187,10 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                 cache_config=cache_config,
                 quant_config=quant_config,
                 prefix=f"{prefix}.self_attn",
-                reduce_results=not self.use_attn_reduce_scatter_for_moe,
+                reduce_results=(
+                    not self.use_attn_reduce_scatter_for_moe
+                    and not self.use_fused_ar_gemma_norm
+                ),
             )
         else:
             raise ValueError(f"Invalid layer_type {self.layer_type}")
@@ -175,6 +209,7 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 prefix=f"{prefix}.mlp",
+                reduce_results=not self.use_fused_ar_gemma_norm,
             )
         else:
             raise ValueError(f"Invalid model_type {config.model_type}")
@@ -202,6 +237,38 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                     config.hidden_size,
                 ),
             )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+        positions: torch.Tensor = None,
+        **kwargs: object,
+    ):
+        if not self.use_fused_ar_gemma_norm:
+            return super().forward(
+                hidden_states=hidden_states,
+                residual=residual,
+                positions=positions,
+                **kwargs,
+            )
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = fused_allreduce_gemma_rms_norm(
+                hidden_states, residual, self.input_layernorm
+            )
+        if self.layer_type == "linear_attention":
+            hidden_states = self.linear_attn(hidden_states=hidden_states)
+        else:
+            hidden_states = self.self_attn(
+                hidden_states=hidden_states, positions=positions
+            )
+        hidden_states, residual = fused_allreduce_gemma_rms_norm(
+            hidden_states, residual, self.post_attention_layernorm
+        )
+        return self.mlp(hidden_states), residual
 
 
 @support_torch_compile(
@@ -271,7 +338,38 @@ class Qwen3_5Model(Qwen3NextModel):
         else:
             self.norm = PPMissingLayer()
 
+        self.use_fused_ar_gemma_norm = _use_mxfp6_ar_norm(vllm_config)
+        if self.use_fused_ar_gemma_norm:
+            logger.info_once("Qwen3.5 manual AllReduce/residual/RMSNorm fusion enabled")
         self.aux_hidden_state_layers: tuple[int, ...] = ()
+
+    def forward(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
+        if not self.use_fused_ar_gemma_norm:
+            return super().forward(
+                input_ids, positions, intermediate_tensors, inputs_embeds
+            )
+        if self.aux_hidden_state_layers:
+            raise ValueError("Manual AR/Norm fusion does not support auxiliary states")
+        hidden_states = (
+            inputs_embeds
+            if inputs_embeds is not None
+            else self.embed_input_ids(input_ids)
+        )
+        residual = None
+        for layer in islice(self.layers, self.start_layer, self.end_layer):
+            hidden_states, residual = layer(
+                positions=positions, hidden_states=hidden_states, residual=residual
+            )
+        hidden_states, _ = fused_allreduce_gemma_rms_norm(
+            hidden_states, residual, self.norm
+        )
+        return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # FSE must match construction (Qwen3NextSparseMoeBlock): reroute the
