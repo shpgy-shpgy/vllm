@@ -112,6 +112,10 @@ logger = init_logger(__name__)
 def _use_mxfp6_ar_norm(vllm_config: VllmConfig) -> bool:
     config = vllm_config.model_config.hf_text_config
     parallel = vllm_config.parallel_config
+    if config.model_type == "qwen3_5_moe_text":
+        from vllm.mach.mxfp6.moe_ar_norm import use_moe_ar_norm
+
+        return use_moe_ar_norm(vllm_config)
     return (
         envs.VLLM_QWEN3_5_FUSED_AR_NORM
         and config.model_type == "qwen3_5_text"
@@ -202,6 +206,10 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                 vllm_config=vllm_config,
                 prefix=f"{prefix}.mlp",
             )
+            if self.use_fused_ar_gemma_norm:
+                from vllm.mach.mxfp6.moe_ar_norm import defer_moe_allreduce
+
+                defer_moe_allreduce(self.mlp)
         elif config.model_type == "qwen3_5_text":
             self.mlp = Qwen3NextMLP(
                 hidden_size=config.hidden_size,
@@ -340,6 +348,10 @@ class Qwen3_5Model(Qwen3NextModel):
 
         self.use_fused_ar_gemma_norm = _use_mxfp6_ar_norm(vllm_config)
         if self.use_fused_ar_gemma_norm:
+            if config.model_type == "qwen3_5_moe_text":
+                from vllm.mach.mxfp6.moe_ar_norm import prepare_compiled_ar_norm
+
+                prepare_compiled_ar_norm(vllm_config)
             logger.info_once("Qwen3.5 manual AllReduce/residual/RMSNorm fusion enabled")
         self.aux_hidden_state_layers: tuple[int, ...] = ()
 

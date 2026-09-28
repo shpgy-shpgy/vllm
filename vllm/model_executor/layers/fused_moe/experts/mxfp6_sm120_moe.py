@@ -57,6 +57,23 @@ _QWEN35_GROUPED_MIN_TOKENS = 5
 _QWEN35_GROUPED_MAX_TOKENS = 96
 
 
+def _prepare_qwen35_moe_graph_cache(vllm_config) -> None:
+    if not isinstance(vllm_config.additional_config, dict):
+        vllm_config.additional_config = {}
+    vllm_config.additional_config["mxfp6_sm120_moe_graph"] = (
+        _QWEN35_MOE_GRAPH_CACHE_VERSION
+    )
+    # The normal Qwen3.5 MoE fast path must keep the stock compiler cache
+    # identity.  The rank-specialized functional AR/Norm boundary is only
+    # needed when that path is explicitly requested; adding its cache marker
+    # for every MXFP6 server changes the baseline compile artifact and can
+    # select a different graph without changing the model configuration.
+    if envs.VLLM_QWEN3_5_FUSED_AR_NORM:
+        from vllm.mach.mxfp6.moe_ar_norm import prepare_compiled_ar_norm
+
+        prepare_compiled_ar_norm(vllm_config)
+
+
 def _qwen35_moe_schedule(
     num_tokens: int,
 ) -> Literal["small_batch", "grouped", "generic"]:
@@ -267,9 +284,11 @@ class Mxfp6Sm120MoERunner(MoERunner):
                     output,
                     shared_output,
                 )
-                # ``output`` aliases the persistent workspace returned by the
-                # workspace manager.  Give the compiled caller an owned,
-                # graph-visible result instead of exposing that scratch view.
+                # The workspace manager owns ``output`` and may reuse it on
+                # the next layer/request.  Return an owned tensor so the
+                # caller cannot observe scratch-buffer reuse.  In particular,
+                # do not replace this with a third workspace view: that view
+                # is still temporary and causes corruption at grouped BS.
                 return output.clone()
         result = super()._forward_impl(
             hidden_states,
@@ -319,13 +338,20 @@ def try_enable_qwen35_moe_small_batch(layer: torch.nn.Module) -> bool:
         or moe.dp_size != 1
         or moe.pcp_size != 1
         or moe.is_sequence_parallel
-        or moe.skip_final_all_reduce
+        or (
+            moe.skip_final_all_reduce
+            and not getattr(layer, "_mach_fused_ar_norm", False)
+        )
         or moe.in_dtype != torch.bfloat16
         or layer.expert_map is not None
         or not layer.renormalize
         or layer.scoring_func != "softmax"
         or layer.custom_routing_function is not None
         or layer.routed_scaling_factor != 1.0
+        or layer.apply_router_weight_on_input
+        or moe.activation != MoEActivation.SILU
+        or moe.has_bias
+        or moe.swiglu_limit is not None
         or not isinstance(vllm_config.additional_config, dict)
     ):
         return False
@@ -442,9 +468,7 @@ def try_enable_qwen35_moe_small_batch(layer: torch.nn.Module) -> bool:
     # MoE compiler path.
     runner._forward_entry = torch.ops.vllm.moe_forward
     # This post-load op selection is not part of Dynamo's traced-file cache key.
-    vllm_config.additional_config["mxfp6_sm120_moe_graph"] = (
-        _QWEN35_MOE_GRAPH_CACHE_VERSION
-    )
+    _prepare_qwen35_moe_graph_cache(vllm_config)
     logger.info_once(
         "Enabled Qwen3.5-35B TP2 MXFP6 fused small-batch router/shared-expert schedule"
     )
@@ -471,6 +495,8 @@ class Mxfp6Sm120Experts(mk.FusedMoEExpertsModular):
             raise ValueError("MXFP6 SM120 MoE requires packed weight scales")
         if quant_config.w1_bias is not None or quant_config.w2_bias is not None:
             raise ValueError("MXFP6 SM120 MoE does not support expert bias")
+        if quant_config.gemm1_clamp_limit is not None:
+            raise ValueError("MXFP6 SM120 MoE does not support SwiGLU clamping")
 
     @property
     def expects_unquantized_inputs(self) -> bool:
@@ -562,7 +588,9 @@ class Mxfp6Sm120Experts(mk.FusedMoEExpertsModular):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool,
     ) -> None:
-        del a1q_scale, a2_scale, apply_router_weight_on_input
+        del a1q_scale, a2_scale
+        if apply_router_weight_on_input:
+            raise ValueError("MXFP6 SM120 MoE requires router weights on output")
         if expert_tokens_meta is not None:
             raise ValueError("MXFP6 SM120 MoE requires standard routed activations")
         if activation != MoEActivation.SILU:

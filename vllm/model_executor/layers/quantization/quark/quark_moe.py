@@ -1177,9 +1177,19 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
             act_dtype=act_dtype,
             moe_parallel_config=moe_parallel_config,
         )
-        # Round per-partition sizes up to each backend's requirement. Emulation is
-        # handled inside the helper too (OCP MX block alignment), so no special-case.
-        if self.mxfp4_backend is not None:
+        if self.use_mxfp6_sm120_moe:
+            return (
+                (hidden_size + 127) // 128 * 128,
+                (intermediate_size_per_partition + 31) // 32 * 32,
+            )
+
+        # Round per-partition sizes up to each backend's requirement. The
+        # emulation path already applies OCP-MX block alignment and must not be
+        # treated as a native MXFP4 backend here.
+        if self.mxfp4_backend not in (
+            Mxfp4MoeBackend.NONE,
+            Mxfp4MoeBackend.EMULATION,
+        ):
             hidden_size, intermediate_size_per_partition = (
                 mxfp4_round_up_hidden_size_and_intermediate_size(
                     self.mxfp4_backend, hidden_size, intermediate_size_per_partition

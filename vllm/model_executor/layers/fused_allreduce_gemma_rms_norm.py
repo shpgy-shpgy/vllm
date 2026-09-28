@@ -17,6 +17,7 @@ numerically identical to the unfused model path.
 
 import torch
 
+from vllm import envs
 from vllm.distributed.communication_op import tensor_model_parallel_all_reduce
 from vllm.distributed.parallel_state import (
     get_tensor_model_parallel_rank,
@@ -124,6 +125,17 @@ def fused_allreduce_gemma_rms_norm(
     Returns ``(normed_output, new_residual)``, equivalent to
     ``norm(all_reduce(hidden_states), residual)``.
     """
+    use_mach_compiled_ar_norm = (
+        envs.VLLM_QWEN3_5_FUSED_AR_NORM
+    )
+    if torch.compiler.is_compiling() and use_mach_compiled_ar_norm:
+        from vllm.mach.mxfp6.compiled_ar_norm import (
+            compiled_allreduce_gemma_rms_norm,
+        )
+
+        return compiled_allreduce_gemma_rms_norm(
+            hidden_states, residual, norm.weight, norm.variance_epsilon
+        )
     tp_size = get_tensor_model_parallel_world_size()
     if tp_size == 1:
         # No all-reduce needed; identical to the unfused path.
