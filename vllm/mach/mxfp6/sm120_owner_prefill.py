@@ -60,8 +60,21 @@ def packed_weight(module, *, merged=True):
 
 
 def apply_mxfp8_weight(activation, weight):
-    mxfp6 = import_module("mxfp6")
-    return mxfp6.gemm_w6a8(activation, weight, out_dtype=torch.bfloat16)
+    # Match the Quark serving path: use the native dispatcher, whose weights
+    # and library are already prepared. The Python gemm_w6a8 wrapper profiles
+    # unseen ragged shapes synchronously, stalling every request in the batch.
+    # Offline/startup tuning can still install native dispatch entries.
+    return torch.ops.mxfp6.gemm_w6a8(
+        activation.values,
+        weight.values,
+        activation.scales,
+        weight.scales,
+        activation.rows,
+        weight.rows,
+        activation.k,
+        1.0,
+        torch.bfloat16,
+    )
 
 
 def load_native():

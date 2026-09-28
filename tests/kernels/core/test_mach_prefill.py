@@ -373,6 +373,68 @@ def test_owner_prefill_rejects_invalid_replica_selection(monkeypatch, raw):
         replica_layers()
 
 
+@pytest.mark.parametrize("rows", [952, 1802, 2048, 3000, 4096])
+def test_owner_prefill_gemm_does_not_autotune_in_request(monkeypatch, rows):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from vllm.mach.mxfp6 import sm120_owner_prefill as owner
+
+    # Ragged request shapes must not trigger the Python wrapper's cache I/O,
+    # GPU synchronization or candidate profiling, even with autotune enabled.
+    monkeypatch.setenv("MXFP6_AUTOTUNE", "on")
+    autotuning_api = Mock(side_effect=AssertionError("online autotuning"))
+    monkeypatch.setattr(
+        owner, "import_module", lambda _: SimpleNamespace(gemm_w6a8=autotuning_api)
+    )
+    result = object()
+    native = Mock(return_value=result)
+    monkeypatch.setattr(torch.ops.mxfp6, "gemm_w6a8", native, raising=False)
+    activation = SimpleNamespace(values=object(), scales=object(), rows=rows, k=5120)
+    weight = SimpleNamespace(values=object(), scales=object(), rows=8192, k=5120)
+    assert owner.apply_mxfp8_weight(activation, weight) is result
+    native.assert_called_once_with(
+        activation.values,
+        weight.values,
+        activation.scales,
+        weight.scales,
+        rows,
+        8192,
+        5120,
+        1.0,
+        torch.bfloat16,
+    )
+    autotuning_api.assert_not_called()
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda() or not current_platform.is_device_capability(120),
+    reason="SM120 required",
+)
+@pytest.mark.skipif(not torch.accelerator.is_available(), reason="GPU required")
+@pytest.mark.parametrize("rows", [952, 1802, 2048, 4096])
+def test_owner_prefill_gemm_matches_native_without_online_tuning(monkeypatch, rows):
+    mxfp6 = pytest.importorskip("mxfp6")
+    from vllm.mach.mxfp6 import sm120_owner_prefill as owner
+
+    set_random_seed(981)
+    x = torch.randn(rows, 5120, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(8192, 5120, device="cuda", dtype=torch.bfloat16)
+    activation = mxfp6.quantize_mxfp8(x)
+    weight = mxfp6.quantize_mxfp6(w)
+    monkeypatch.setenv("MXFP6_AUTOTUNE", "off")
+    reference = mxfp6.gemm_w6a8(activation, weight, out_dtype=torch.bfloat16)
+
+    def unexpected_tuning(*args, **kwargs):
+        raise AssertionError("owner prefill called the online autotuning wrapper")
+
+    monkeypatch.setenv("MXFP6_AUTOTUNE", "on")
+    monkeypatch.setattr(mxfp6, "gemm_w6a8", unexpected_tuning)
+    actual = owner.apply_mxfp8_weight(activation, weight)
+    torch.accelerator.synchronize()
+    assert torch.equal(actual, reference)
+
+
 @pytest.mark.parametrize("rows", [32, 511, 1024, 1052, 4097])
 def test_owner_prefill_fallback_does_not_initialize_owner_resources(monkeypatch, rows):
     from types import SimpleNamespace
