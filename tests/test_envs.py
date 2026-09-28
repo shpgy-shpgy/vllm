@@ -575,6 +575,8 @@ def test_disabled_mach_adapters_preserve_baseline_compile_factors(monkeypatch):
         monkeypatch.delenv(name, raising=False)
     baseline = envs.compile_factors()
     assert names.isdisjoint(baseline)
+    monkeypatch.setenv("VLLM_MACH_GDN_REQUIRE_PRECOMPILED", "1")
+    assert envs.compile_factors() == baseline
     monkeypatch.setenv("VLLM_MACH_GDN_PERSISTENT", "1")
     enabled = envs.compile_factors()
     assert enabled["VLLM_MACH_GDN_PERSISTENT"] is True

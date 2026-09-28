@@ -12,6 +12,57 @@ import torch
 from vllm.mach.mxfp6.gdn_decode import select_path
 
 
+def test_precompiled_gdn_loads_once_without_jit(monkeypatch):
+    """Deployment must load the wheel once and reuse it for graph readiness."""
+    import sys
+
+    from vllm.mach.mxfp6.gdn import persistent
+
+    calls = []
+    module = object()
+
+    def load(geometry, digest):
+        calls.append((geometry, digest))
+        return module
+
+    monkeypatch.setattr(persistent, "_modules", {})
+    monkeypatch.setattr(persistent, "_kernel_digest", lambda: "source-hash")
+    monkeypatch.setitem(sys.modules, "vllm_mach_gdn", SimpleNamespace(load=load))
+    geometry = (5120, 48, 5120, 8, 24, 128, 4, 3, 32)
+    assert persistent._get_module(geometry) is module
+    assert persistent._get_module(geometry) is module
+    assert calls == [(geometry, "source-hash")]
+
+
+def test_strict_gdn_missing_wheel_fails_without_jit(monkeypatch):
+    import sys
+
+    from vllm.mach.mxfp6.gdn import persistent
+
+    monkeypatch.setattr(persistent, "_modules", {})
+    monkeypatch.setitem(sys.modules, "vllm_mach_gdn", None)
+    monkeypatch.setenv("VLLM_MACH_GDN_REQUIRE_PRECOMPILED", "1")
+    with pytest.raises(RuntimeError, match="deployment forbids GDN JIT"):
+        persistent._get_module((5120, 48, 5120, 8, 24, 128, 4, 3, 32))
+
+
+def test_incompatible_gdn_wheel_does_not_fall_back_to_jit(monkeypatch):
+    import sys
+
+    from vllm.mach.mxfp6.gdn import persistent
+
+    def incompatible(*args):
+        raise RuntimeError("ABI mismatch")
+
+    monkeypatch.setattr(persistent, "_modules", {})
+    monkeypatch.setitem(
+        sys.modules, "vllm_mach_gdn", SimpleNamespace(load=incompatible)
+    )
+    monkeypatch.setenv("VLLM_MACH_GDN_REQUIRE_PRECOMPILED", "0")
+    with pytest.raises(RuntimeError, match="ABI mismatch"):
+        persistent._get_module((5120, 48, 5120, 8, 24, 128, 4, 3, 32))
+
+
 def test_default_startup_does_not_touch_baseline_model(monkeypatch):
     """No adapter flag means no model traversal, patching or config access."""
     from vllm.mach.mxfp6.warmup import prepare_model

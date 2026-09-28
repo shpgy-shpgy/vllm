@@ -3,23 +3,27 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Fused GDN decode step -- single-launch persistent CUDA impl (SM120).
 
-Host side of the ported persistent kernel: one B-dynamic JIT
+Host side of the ported persistent kernel: one B-dynamic compiled
 module per layer geometry (``gdn_fused_decode_sm120.cu`` in this package,
 two template instantiations each: B==1 / general) launched on the caller's
 current stream.  The kernel runs the whole fused step in a single persistent
 launch, synchronized by a device-wide grid barrier.
 
-Compilation is lazy: the first eager :func:`execute` of a geometry builds and
-loads its module and allocates the per-device barrier and the
+The first eager :func:`execute` loads a precompiled wheel module, or builds it
+only when the wheel is absent and deployment strict mode is disabled.
+It allocates the per-device barrier and the
 per-(geometry, batch, device) launch scratch; once warm, calls are capture-safe
 (regular launches only, no allocation). The native adapter in
 ``vllm.mach.mxfp6.gdn_decode`` gates geometry, dtype and physical rows.
 """
 
+import hashlib
+from functools import lru_cache
+from pathlib import Path
+
 import torch
 
 from ._stream_order import order_after_previous_stream
-from .jit import gen_gdn_fused_decode_module
 
 # K-split factor of the kernel's b/a GEMV (fp32 partials in ba_scratch).
 _GEMV_NSPLIT = 160
@@ -99,12 +103,37 @@ def _geometry_from_tensors(
     return (hidden, n_ba, qkv_dim, h_q, hv, d, conv_width, conv_state_len, state_bits)
 
 
+@lru_cache(maxsize=1)
+def _kernel_digest():
+    source = Path(__file__).with_name("gdn_fused_decode_sm120.cu")
+    return hashlib.sha256(source.read_bytes()).hexdigest()
+
+
 def _get_module(geometry: tuple):
-    """Build-and-load this geometry's JIT module once per process (the
-    Python-level module cache; the on-disk .so cache is the second level)."""
+    """Prefer packaged modules; deployment mode forbids a missing-wheel JIT."""
     module = _modules.get(geometry)
     if module is None:
-        module = gen_gdn_fused_decode_module(*geometry).build_and_load()
+        try:
+            import vllm_mach_gdn
+        except ModuleNotFoundError as exc:
+            if exc.name != "vllm_mach_gdn":
+                raise
+            from vllm import envs
+
+            if envs.VLLM_MACH_GDN_REQUIRE_PRECOMPILED:
+                raise RuntimeError(
+                    "Install vllm-mach-gdn: deployment forbids GDN JIT compilation"
+                ) from exc
+            from .jit import gen_gdn_fused_decode_module
+
+            module = gen_gdn_fused_decode_module(*geometry).build_and_load()
+        else:
+            module = vllm_mach_gdn.load(geometry, _kernel_digest())
+            from vllm.logger import init_logger
+
+            init_logger(__name__).info(
+                "Loaded precompiled Mach GDN geometry=%s (no JIT)", geometry
+            )
         _modules[geometry] = module
     return module
 

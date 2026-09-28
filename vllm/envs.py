@@ -319,6 +319,7 @@ if TYPE_CHECKING:
     VLLM_QWEN3_5_FUSED_AR_NORM: bool = False
     VLLM_QWEN3_5_FP16_SSM: bool = False
     VLLM_MACH_GDN_PERSISTENT: bool = False
+    VLLM_MACH_GDN_REQUIRE_PRECOMPILED: bool = False
     VLLM_MACH_GDN_BA_OVERLAP: bool = False
     VLLM_MACH_FUSED_SWIGLU_QUANT: str = "0"
     VLLM_MACH_FUSED_GDN_QUANT: str = "0"
@@ -2155,6 +2156,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_MACH_GDN_PERSISTENT": lambda: (
         os.getenv("VLLM_MACH_GDN_PERSISTENT", "0") == "1"
     ),
+    "VLLM_MACH_GDN_REQUIRE_PRECOMPILED": lambda: (
+        os.getenv("VLLM_MACH_GDN_REQUIRE_PRECOMPILED", "0") == "1"
+    ),
     "VLLM_MACH_GDN_BA_OVERLAP": lambda: (
         os.getenv("VLLM_MACH_GDN_BA_OVERLAP", "0") == "1"
     ),
@@ -2516,6 +2520,7 @@ def compile_factors() -> dict[str, object]:
         ignored_factors.update(
             {
                 "VLLM_SM120_LOSSLESS_PREFILL_VERIFY",
+                "VLLM_MACH_GDN_REQUIRE_PRECOMPILED",
                 "VLLM_SM120_LOSSLESS_PREFILL_GRAPH",
                 "VLLM_SM120_OWNER_MLP_LAYERS",
                 "VLLM_SM120_OWNER_VERIFY",
