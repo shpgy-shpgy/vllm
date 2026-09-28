@@ -83,7 +83,9 @@ def configure_dense_defaults(config) -> None:
         and config.use_v2_model_runner
         and state_dtype in ("float32", "float16")
         and config.cache_config.mamba_cache_dtype in ("auto", "bfloat16")
-        and not config.cache_config.enable_prefix_caching
+        and config.cache_config.mamba_cache_mode
+        == ("align" if config.cache_config.enable_prefix_caching else "none")
+        and not config.cache_config.use_replayssm
         and config.compilation_config.backend == "inductor"
         and config.compilation_config.mode
         in (None, CompilationMode.NONE, CompilationMode.VLLM_COMPILE)
@@ -117,10 +119,13 @@ def configure_dense_defaults(config) -> None:
     activate_dense_defaults(config)
     init_logger(__name__).info(
         "Auto-enabled SM120 TP2 Dense27B %s SSM optimization bundle: "
-        "%s; compilation=NONE, CUDA graphs=FULL_DECODE_ONLY. "
+        "%s; prefix_caching=%s, mamba_cache_mode=%s; "
+        "compilation=NONE, CUDA graphs=FULL_DECODE_ONLY. "
         "Set VLLM_MACH_DENSE_AUTO=0 to keep the original configuration.",
         state_dtype,
         ", ".join(DENSE_FLAGS),
+        config.cache_config.enable_prefix_caching,
+        config.cache_config.mamba_cache_mode,
     )
 
 

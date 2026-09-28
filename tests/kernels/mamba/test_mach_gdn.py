@@ -161,6 +161,8 @@ def dense_auto_config(monkeypatch):
             mamba_ssm_cache_dtype="float32",
             mamba_cache_dtype="auto",
             enable_prefix_caching=False,
+            mamba_cache_mode="none",
+            use_replayssm=False,
         ),
         compilation_config=ns(
             backend="inductor",
@@ -178,8 +180,9 @@ def dense_auto_config(monkeypatch):
 
 
 @pytest.mark.parametrize("state_dtype", ["float32", "float16"])
+@pytest.mark.parametrize("prefix_caching", [False, True])
 def test_dense_auto_selects_bundle_without_exporting_environment(
-    dense_auto_config, state_dtype
+    dense_auto_config, state_dtype, prefix_caching
 ):
     import os
 
@@ -189,7 +192,12 @@ def test_dense_auto_selects_bundle_without_exporting_environment(
 
     before = dict(os.environ)
     dense_auto_config.cache_config.mamba_ssm_cache_dtype = state_dtype
+    dense_auto_config.cache_config.enable_prefix_caching = prefix_caching
+    cache_mode = "align" if prefix_caching else "none"
+    dense_auto_config.cache_config.mamba_cache_mode = cache_mode
     warmup.configure_dense_defaults(dense_auto_config)
+    assert dense_auto_config.cache_config.enable_prefix_caching == prefix_caching
+    assert dense_auto_config.cache_config.mamba_cache_mode == cache_mode
     assert dense_auto_config.cache_config.mamba_ssm_cache_dtype == state_dtype
     assert (state_dtype == "float16") == envs.VLLM_QWEN3_5_FP16_SSM
     assert dense_auto_config.compilation_config.mode == CompilationMode.NONE
@@ -263,6 +271,8 @@ def test_dense_auto_respects_explicit_disable(monkeypatch, dense_auto_config, fl
     [
         ("cache_config", "mamba_ssm_cache_dtype", "bfloat16"),
         ("cache_config", "enable_prefix_caching", True),
+        ("cache_config", "mamba_cache_mode", "all"),
+        ("cache_config", "use_replayssm", True),
         ("parallel_config", "tensor_parallel_size", 1),
         ("model_config", "enforce_eager", True),
         (None, "speculative_config", object()),
