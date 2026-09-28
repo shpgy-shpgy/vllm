@@ -2,11 +2,126 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Prepare optional model adapters before profiling and graph capture."""
 
+import os
+from importlib.util import find_spec
+
 import torch
 
 from vllm import envs
-from vllm.config import CompilationMode, set_current_vllm_config
+from vllm.config import CompilationMode, CUDAGraphMode, set_current_vllm_config
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
+
+DENSE_FLAGS = (
+    "VLLM_QWEN3_5_FUSED_AR_NORM",
+    "VLLM_MACH_GDN_PERSISTENT",
+    "VLLM_MACH_GDN_BA_OVERLAP",
+    "VLLM_MACH_FUSED_SWIGLU_QUANT",
+    "VLLM_MACH_FUSED_GDN_QUANT",
+    "VLLM_MACH_FUSED_AR_QUANT",
+    "VLLM_SM120_LOSSLESS_PREFILL",
+    "VLLM_SM120_OWNER_PREFILL",
+)
+
+
+def activate_dense_defaults(config) -> None:
+    """Restore the serialized decision in spawned workers before model loading."""
+    extra = config.additional_config
+    enabled = isinstance(extra, dict) and extra.get("mach_dense_auto") is True
+    envs.set_mach_dense_defaults(
+        enabled,
+        fp16=enabled and config.cache_config.mamba_ssm_cache_dtype == "float16",
+    )
+
+
+def configure_dense_defaults(config) -> None:
+    """Select the supported Dense27B bundle without changing the SSM dtype."""
+    envs.set_mach_dense_defaults(False)
+    extra = config.additional_config
+    if not isinstance(extra, dict):
+        return
+    extra.pop("mach_dense_auto", None)
+    if not envs.VLLM_MACH_DENSE_AUTO or any(
+        os.getenv(flag) == "0" for flag in DENSE_FLAGS
+    ):
+        return
+    model, parallel = config.model_config, config.parallel_config
+    if model is None or model.enforce_eager:
+        return
+    state_dtype = config.cache_config.mamba_ssm_cache_dtype
+    if state_dtype == "float16" and os.getenv("VLLM_QWEN3_5_FP16_SSM") == "0":
+        return
+    hf = model.hf_text_config
+    geometry = {
+        "model_type": "qwen3_5_text",
+        "hidden_size": 5120,
+        "num_hidden_layers": 64,
+        "linear_num_key_heads": 16,
+        "linear_num_value_heads": 48,
+        "linear_key_head_dim": 128,
+        "linear_value_head_dim": 128,
+        "linear_conv_kernel_dim": 4,
+    }
+    if any(getattr(hf, key, None) != value for key, value in geometry.items()):
+        return
+    quant = config.quant_config
+    scheme = getattr(quant, "quant_config", {}).get("global_quant_config", {})
+    if not (
+        model.dtype == torch.bfloat16
+        and not getattr(hf, "layer_scale", False)
+        and parallel.tensor_parallel_size == 2
+        and parallel.pipeline_parallel_size == parallel.data_parallel_size == 1
+        and parallel.prefill_context_parallel_size == 1
+        and parallel.decode_context_parallel_size == 1
+        and not parallel.enable_expert_parallel
+        and not parallel.enable_eplb
+        and not parallel.use_sequence_parallel_moe
+        and not parallel.use_ubatching
+        and config.speculative_config is None
+        and config.lora_config is None
+        and config.kv_transfer_config is None
+        and config.use_v2_model_runner
+        and state_dtype in ("float32", "float16")
+        and config.cache_config.mamba_cache_dtype in ("auto", "bfloat16")
+        and not config.cache_config.enable_prefix_caching
+        and config.compilation_config.backend == "inductor"
+        and config.compilation_config.mode
+        in (None, CompilationMode.NONE, CompilationMode.VLLM_COMPILE)
+        and config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+        and config.profiler_config.profiler != "proton"
+        and not envs.VLLM_USE_BREAKABLE_CUDAGRAPH
+        and quant is not None
+        and quant.get_name() == "quark"
+        and scheme.get("weight", {}).get("dtype") == "fp6_e3m2"
+        and scheme.get("input_tensors", {}).get("dtype") == "fp8_e4m3"
+        and current_platform.is_cuda()
+        and current_platform.is_device_capability(120)
+    ):
+        return
+    modules = (
+        "vllm_mach_gdn",
+        "mach_ar_norm_ext",
+        "mach_owner_prefill_ext",
+        "mach_lossless_prefill_direct_ext",
+        "mach_lossless_prefill_long_ext",
+    )
+    if any(find_spec(name) is None for name in modules):
+        init_logger(__name__).warning_once(
+            "Dense auto optimizations skipped: install the GDN, AR norm, owner "
+            "and lossless prefill wheels. Keeping the original compilation config."
+        )
+        return
+    extra["mach_dense_auto"] = True
+    config.compilation_config.mode = CompilationMode.NONE
+    config.compilation_config.cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
+    activate_dense_defaults(config)
+    init_logger(__name__).info(
+        "Auto-enabled SM120 TP2 Dense27B %s SSM optimization bundle: "
+        "%s; compilation=NONE, CUDA graphs=FULL_DECODE_ONLY. "
+        "Set VLLM_MACH_DENSE_AUTO=0 to keep the original configuration.",
+        state_dtype,
+        ", ".join(DENSE_FLAGS),
+    )
 
 
 def prepare_model(model, config) -> None:

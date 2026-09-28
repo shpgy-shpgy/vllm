@@ -118,6 +118,10 @@ def _use_mxfp6_ar_norm(vllm_config: VllmConfig) -> bool:
         return use_moe_ar_norm(vllm_config)
     return (
         envs.VLLM_QWEN3_5_FUSED_AR_NORM
+        and (
+            envs.is_set("VLLM_QWEN3_5_FUSED_AR_NORM")
+            or envs.mach_dense_default() == "1"
+        )
         and config.model_type == "qwen3_5_text"
         and config.hidden_size == 5120
         and not getattr(config, "layer_scale", False)

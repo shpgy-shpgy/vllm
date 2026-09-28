@@ -54,7 +54,7 @@ def order_after_previous_stream(
     if previous is not None and previous != current:
         # The event is created on the current *device*, which must be the one
         # the streams belong to.
-        with torch.accelerator.device_index(device):
+        with torch.accelerator.device_index(device.index):
             event = torch.cuda.Event()
             event.record(previous)
         current.wait_event(event)

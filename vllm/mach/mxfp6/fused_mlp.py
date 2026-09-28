@@ -4,10 +4,11 @@
 
 from __future__ import annotations
 
-import os
 import types
 
 import torch
+
+from vllm import envs
 
 from .dense import _import_mxfp6, is_native_linear
 
@@ -78,7 +79,7 @@ def _eligible(module):
 
 def prepare(model):
     """Install only on native, bias-free Qwen TP2 partial-output MLPs."""
-    mode = os.environ.get("VLLM_MACH_FUSED_SWIGLU_QUANT", "0")
+    mode = envs.VLLM_MACH_FUSED_SWIGLU_QUANT
     if mode == "0":
         return 0
     if mode not in ("auto", "1"):

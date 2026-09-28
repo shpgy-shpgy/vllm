@@ -9,12 +9,13 @@ activation cache: each invocation owns its outputs and uses vLLM's AR workspace.
 
 from __future__ import annotations
 
-import os
 import types
 from collections import Counter
 from importlib import metadata, util
 
 import torch
+
+from vllm import envs
 
 ABI = "ar-norm-mxfp8-v1"
 _ROWS = (2, 4, 8, 16, 24, 32)
@@ -261,7 +262,7 @@ def _forward(layer, hidden_states, residual, positions=None, *, original, **kwar
 
 def prepare(model):
     """Prepare eligible Dense layers after GDN/MLP producers, before capture."""
-    mode = os.environ.get("VLLM_MACH_FUSED_AR_QUANT", "0")
+    mode = envs.VLLM_MACH_FUSED_AR_QUANT
     if mode not in ("auto", "0", "1"):
         raise ValueError("VLLM_MACH_FUSED_AR_QUANT must be auto, 0 or 1")
     if mode == "0":

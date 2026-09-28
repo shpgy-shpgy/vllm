@@ -1374,6 +1374,10 @@ class VllmConfig:
                 "precision for chunked prefill triton kernels."
             )
 
+        from vllm.mach.mxfp6.warmup import configure_dense_defaults
+
+        configure_dense_defaults(self)
+
         if self.model_config is not None and self.model_config.enforce_eager:
             logger.warning_once(
                 "Enforce eager set, disabling torch.compile and CUDAGraphs. "

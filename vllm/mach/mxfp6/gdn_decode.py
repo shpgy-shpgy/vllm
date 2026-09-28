@@ -10,12 +10,13 @@ serialized worker execution, including CUDA Graph replay.
 
 from __future__ import annotations
 
-import os
 from collections import Counter
 from functools import partial
 from typing import Any
 
 import torch
+
+from vllm import envs
 
 PERSISTENT_ROWS = (1, 2, 4, 8)
 OVERLAP_ROWS = (16, 24, 32)
@@ -23,7 +24,7 @@ _STATS: Counter[str] = Counter()
 
 
 def enabled(name: str) -> bool:
-    return os.environ.get("VLLM_MACH_GDN_" + name) == "1"
+    return bool(getattr(envs, "VLLM_MACH_GDN_" + name))
 
 
 def stats() -> dict:

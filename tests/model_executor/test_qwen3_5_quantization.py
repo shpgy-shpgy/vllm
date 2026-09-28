@@ -119,3 +119,81 @@ def test_manual_ar_norm_rejects_unsupported_execution_modes(monkeypatch):
             setattr(obj, attr, old)
         monkeypatch.setenv("VLLM_QWEN3_5_FUSED_AR_NORM", "0")
         assert not model._use_mxfp6_ar_norm(cfg)
+        monkeypatch.delenv("VLLM_QWEN3_5_FUSED_AR_NORM")
+        assert not model._use_mxfp6_ar_norm(cfg)
+
+
+def test_moe_ar_norm_defaults_on_only_for_supported_models(monkeypatch):
+    """The measured MoE path defaults on; overrides and admission still apply."""
+    from types import SimpleNamespace as NS
+
+    import torch
+
+    from vllm.config import CompilationMode
+    from vllm.mach.mxfp6 import moe_ar_norm as ar
+
+    monkeypatch.delenv("VLLM_QWEN3_5_FUSED_AR_NORM", raising=False)
+    config = NS(
+        model_config=NS(
+            dtype=torch.bfloat16,
+            hf_text_config=NS(
+                model_type="qwen3_5_moe_text",
+                hidden_size=2048,
+                num_experts=256,
+                num_experts_per_tok=8,
+                moe_intermediate_size=512,
+                shared_expert_intermediate_size=512,
+            ),
+        ),
+        parallel_config=NS(
+            rank=0,
+            tensor_parallel_size=2,
+            pipeline_parallel_size=1,
+            data_parallel_size=1,
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=1,
+            enable_expert_parallel=False,
+            enable_eplb=False,
+            use_sequence_parallel_moe=False,
+            use_ubatching=False,
+        ),
+        quant_config=NS(
+            get_name=lambda: "quark",
+            quant_config={
+                "global_quant_config": {
+                    "weight": {"dtype": "fp6_e3m2"},
+                    "input_tensors": {"dtype": "fp8_e4m3"},
+                }
+            },
+        ),
+        compilation_config=NS(mode=CompilationMode.VLLM_COMPILE),
+        speculative_config=None,
+        lora_config=None,
+        additional_config={},
+    )
+    with patch.object(ar, "current_platform") as platform:
+        platform.is_cuda.return_value = True
+        platform.is_device_capability.return_value = True
+        assert ar.use_moe_ar_norm(config)
+        ar.prepare_compiled_ar_norm(config)
+        assert config.additional_config["mach_compiled_ar_norm"]["rank"] == 0
+        monkeypatch.setenv("VLLM_QWEN3_5_FUSED_AR_NORM", "0")
+        assert not ar.use_moe_ar_norm(config)
+        config.additional_config = {}
+        ar.prepare_compiled_ar_norm(config)
+        assert config.additional_config == {}
+        monkeypatch.delenv("VLLM_QWEN3_5_FUSED_AR_NORM")
+        for obj, name, value in (
+            (config.parallel_config, "tensor_parallel_size", 1),
+            (config.model_config.hf_text_config, "hidden_size", 2560),
+            (config, "speculative_config", object()),
+            (config, "lora_config", object()),
+        ):
+            previous = getattr(obj, name)
+            setattr(obj, name, value)
+            assert not ar.use_moe_ar_norm(config)
+            ar.prepare_compiled_ar_norm(config)
+            assert config.additional_config == {}
+            setattr(obj, name, previous)
+        platform.is_device_capability.return_value = False
+        assert not ar.use_moe_ar_norm(config)

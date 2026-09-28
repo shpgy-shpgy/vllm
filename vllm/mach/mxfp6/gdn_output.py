@@ -4,9 +4,9 @@
 
 from __future__ import annotations
 
-import os
-
 import torch
+
+from vllm import envs
 
 from .dense import _import_mxfp6, is_native_linear
 
@@ -52,7 +52,7 @@ def _eligible(layer):
 
 
 def prepare(layer):
-    mode = os.environ.get("VLLM_MACH_FUSED_GDN_QUANT", "0")
+    mode = envs.VLLM_MACH_FUSED_GDN_QUANT
     if mode not in ("auto", "0", "1"):
         raise ValueError("VLLM_MACH_FUSED_GDN_QUANT must be auto, 0 or 1")
     if mode == "0" or not _eligible(layer):

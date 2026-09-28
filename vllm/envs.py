@@ -316,7 +316,8 @@ if TYPE_CHECKING:
     VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: int = 256
     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
-    VLLM_QWEN3_5_FUSED_AR_NORM: bool = False
+    VLLM_QWEN3_5_FUSED_AR_NORM: bool = True
+    VLLM_MACH_DENSE_AUTO: bool = True
     VLLM_QWEN3_5_FP16_SSM: bool = False
     VLLM_MACH_GDN_PERSISTENT: bool = False
     VLLM_MACH_GDN_REQUIRE_PRECOMPILED: bool = False
@@ -422,6 +423,23 @@ def use_mega_aot_artifact():
     )
 
     return os.environ.get("VLLM_USE_MEGA_AOT_ARTIFACT", default_value) == "1"
+
+
+_mach_dense_defaults = False
+_mach_dense_fp16_defaults = False
+
+
+def set_mach_dense_defaults(enabled: bool, *, fp16: bool = False) -> None:
+    """Set process-local model defaults without exporting them to other engines."""
+    global _mach_dense_defaults, _mach_dense_fp16_defaults
+    _mach_dense_defaults = enabled
+    _mach_dense_fp16_defaults = enabled and fp16
+    if hasattr(__getattr__, "cache_clear"):
+        __getattr__.cache_clear()
+
+
+def mach_dense_default() -> str:
+    return "1" if _mach_dense_defaults else "0"
 
 
 def env_with_choices(
@@ -2148,34 +2166,39 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_COMPILE_CACHE_SAVE_FORMAT", "binary", ["binary", "unpacked"]
     ),
     # Flag to control the v2 model runner. If unset, use config defaults.
-    # Opt-in manual fusion for SM120 Qwen3.5 dense MXFP6, TP2, without compile.
+    # Default on for eligible SM120 TP2 Qwen3.5 MoE MXFP6 models.
+    # Dense requires explicit opt-in or the validated automatic bundle.
     "VLLM_QWEN3_5_FUSED_AR_NORM": lambda: (
-        os.getenv("VLLM_QWEN3_5_FUSED_AR_NORM", "0") == "1"
+        os.getenv("VLLM_QWEN3_5_FUSED_AR_NORM", "1") == "1"
     ),
-    "VLLM_QWEN3_5_FP16_SSM": lambda: os.getenv("VLLM_QWEN3_5_FP16_SSM", "0") == "1",
+    "VLLM_QWEN3_5_FP16_SSM": lambda: os.getenv(
+        "VLLM_QWEN3_5_FP16_SSM", "1" if _mach_dense_fp16_defaults else "0"
+    )
+    == "1",
+    "VLLM_MACH_DENSE_AUTO": lambda: os.getenv("VLLM_MACH_DENSE_AUTO", "1") == "1",
     "VLLM_MACH_GDN_PERSISTENT": lambda: (
-        os.getenv("VLLM_MACH_GDN_PERSISTENT", "0") == "1"
+        os.getenv("VLLM_MACH_GDN_PERSISTENT", mach_dense_default()) == "1"
     ),
     "VLLM_MACH_GDN_REQUIRE_PRECOMPILED": lambda: (
         os.getenv("VLLM_MACH_GDN_REQUIRE_PRECOMPILED", "0") == "1"
     ),
     "VLLM_MACH_GDN_BA_OVERLAP": lambda: (
-        os.getenv("VLLM_MACH_GDN_BA_OVERLAP", "0") == "1"
+        os.getenv("VLLM_MACH_GDN_BA_OVERLAP", mach_dense_default()) == "1"
     ),
-    "VLLM_MACH_FUSED_SWIGLU_QUANT": env_with_choices(
-        "VLLM_MACH_FUSED_SWIGLU_QUANT", "0", ["0", "1", "auto"]
-    ),
-    "VLLM_MACH_FUSED_GDN_QUANT": env_with_choices(
-        "VLLM_MACH_FUSED_GDN_QUANT", "0", ["0", "1", "auto"]
-    ),
-    "VLLM_MACH_FUSED_AR_QUANT": env_with_choices(
-        "VLLM_MACH_FUSED_AR_QUANT", "0", ["0", "1", "auto"]
-    ),
+    "VLLM_MACH_FUSED_SWIGLU_QUANT": lambda: env_with_choices(
+        "VLLM_MACH_FUSED_SWIGLU_QUANT", mach_dense_default(), ["0", "1", "auto"]
+    )(),
+    "VLLM_MACH_FUSED_GDN_QUANT": lambda: env_with_choices(
+        "VLLM_MACH_FUSED_GDN_QUANT", mach_dense_default(), ["0", "1", "auto"]
+    )(),
+    "VLLM_MACH_FUSED_AR_QUANT": lambda: env_with_choices(
+        "VLLM_MACH_FUSED_AR_QUANT", mach_dense_default(), ["0", "1", "auto"]
+    )(),
     "VLLM_MACH_MOE_PROJECTION_TUNING": env_with_choices(
         "VLLM_MACH_MOE_PROJECTION_TUNING", "0", ["0", "1", "auto"]
     ),
     "VLLM_SM120_LOSSLESS_PREFILL": lambda: (
-        os.getenv("VLLM_SM120_LOSSLESS_PREFILL", "0") == "1"
+        os.getenv("VLLM_SM120_LOSSLESS_PREFILL", mach_dense_default()) == "1"
     ),
     "VLLM_SM120_LOSSLESS_PREFILL_VERIFY": lambda: (
         os.getenv("VLLM_SM120_LOSSLESS_PREFILL_VERIFY", "0") == "1"
@@ -2184,7 +2207,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_SM120_LOSSLESS_PREFILL_GRAPH", "0") == "1"
     ),
     "VLLM_SM120_OWNER_PREFILL": lambda: (
-        os.getenv("VLLM_SM120_OWNER_PREFILL", "0") == "1"
+        os.getenv("VLLM_SM120_OWNER_PREFILL", mach_dense_default()) == "1"
     ),
     "VLLM_SM120_OWNER_MLP_LAYERS": lambda: os.getenv(
         "VLLM_SM120_OWNER_MLP_LAYERS", str(list(range(0, 64, 2)))
@@ -2448,6 +2471,8 @@ def compile_factors() -> dict[str, object]:
         # Credential; never affects compiled artifacts and must not be
         # persisted in cache_key_factors.json.
         "VLLM_API_KEY",
+        # Effective adapter flags and compilation config encode this decision.
+        "VLLM_MACH_DENSE_AUTO",
         "VLLM_USAGE_STATS_SERVER",
         "VLLM_NO_USAGE_STATS",
         "VLLM_DO_NOT_TRACK",

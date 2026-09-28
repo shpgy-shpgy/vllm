@@ -12,6 +12,28 @@ import torch
 from vllm.mach.mxfp6.gdn_decode import select_path
 
 
+def test_gdn_cross_stream_order_uses_integer_device_index(monkeypatch):
+    """Switching warmup/capture streams must use the accelerator API contract."""
+    from contextlib import nullcontext
+    from unittest.mock import Mock
+
+    from vllm.mach.mxfp6.gdn._stream_order import order_after_previous_stream
+
+    device = torch.device("cuda:1")
+    previous, current, event = Mock(), Mock(), Mock()
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda _: current)
+    monkeypatch.setattr(torch.cuda, "Event", lambda: event)
+    context = Mock(return_value=nullcontext())
+    monkeypatch.setattr(torch.accelerator, "device_index", context)
+    streams = {str(device): previous}
+    order_after_previous_stream(streams, device)
+    context.assert_called_once_with(1)
+    event.record.assert_called_once_with(previous)
+    current.wait_event.assert_called_once_with(event)
+    assert streams[str(device)] is current
+
+
 def test_precompiled_gdn_loads_once_without_jit(monkeypatch):
     """Deployment must load the wheel once and reuse it for graph readiness."""
     import sys
@@ -79,6 +101,208 @@ def test_default_startup_does_not_touch_baseline_model(monkeypatch):
     ):
         monkeypatch.delenv(name, raising=False)
     prepare_model(object(), object())
+
+
+@pytest.fixture
+def dense_auto_config(monkeypatch):
+    from vllm import envs
+    from vllm.config import CompilationMode
+    from vllm.mach.mxfp6 import warmup
+
+    for name in (
+        *warmup.DENSE_FLAGS,
+        "VLLM_MACH_DENSE_AUTO",
+        "VLLM_USE_BREAKABLE_CUDAGRAPH",
+        "VLLM_QWEN3_5_FP16_SSM",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(envs, "_mach_dense_defaults", False)
+    monkeypatch.setattr(envs, "_mach_dense_fp16_defaults", False)
+    monkeypatch.setattr(warmup, "find_spec", lambda _: object())
+    monkeypatch.setattr(warmup.current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(warmup.current_platform, "is_device_capability", lambda _: True)
+    ns = SimpleNamespace
+    return ns(
+        model_config=ns(
+            dtype=torch.bfloat16,
+            enforce_eager=False,
+            hf_text_config=ns(
+                model_type="qwen3_5_text",
+                hidden_size=5120,
+                num_hidden_layers=64,
+                linear_num_key_heads=16,
+                linear_num_value_heads=48,
+                linear_key_head_dim=128,
+                linear_value_head_dim=128,
+                linear_conv_kernel_dim=4,
+            ),
+        ),
+        parallel_config=ns(
+            tensor_parallel_size=2,
+            pipeline_parallel_size=1,
+            data_parallel_size=1,
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=1,
+            enable_expert_parallel=False,
+            enable_eplb=False,
+            use_sequence_parallel_moe=False,
+            use_ubatching=False,
+        ),
+        quant_config=ns(
+            get_name=lambda: "quark",
+            quant_config={
+                "global_quant_config": {
+                    "weight": {"dtype": "fp6_e3m2"},
+                    "input_tensors": {"dtype": "fp8_e4m3"},
+                }
+            },
+        ),
+        cache_config=ns(
+            mamba_ssm_cache_dtype="float32",
+            mamba_cache_dtype="auto",
+            enable_prefix_caching=False,
+        ),
+        compilation_config=ns(
+            backend="inductor",
+            mode=CompilationMode.VLLM_COMPILE,
+            cudagraph_mode=None,
+            cudagraph_capture_sizes=[1, 4, 32],
+        ),
+        profiler_config=ns(profiler=None),
+        speculative_config=None,
+        lora_config=None,
+        kv_transfer_config=None,
+        use_v2_model_runner=True,
+        additional_config={},
+    )
+
+
+@pytest.mark.parametrize("state_dtype", ["float32", "float16"])
+def test_dense_auto_selects_bundle_without_exporting_environment(
+    dense_auto_config, state_dtype
+):
+    import os
+
+    from vllm import envs
+    from vllm.config import CompilationMode, CUDAGraphMode
+    from vllm.mach.mxfp6 import warmup
+
+    before = dict(os.environ)
+    dense_auto_config.cache_config.mamba_ssm_cache_dtype = state_dtype
+    warmup.configure_dense_defaults(dense_auto_config)
+    assert dense_auto_config.cache_config.mamba_ssm_cache_dtype == state_dtype
+    assert (state_dtype == "float16") == envs.VLLM_QWEN3_5_FP16_SSM
+    assert dense_auto_config.compilation_config.mode == CompilationMode.NONE
+    assert (
+        dense_auto_config.compilation_config.cudagraph_mode
+        == CUDAGraphMode.FULL_DECODE_ONLY
+    )
+    assert dense_auto_config.compilation_config.cudagraph_capture_sizes == [1, 4, 32]
+    for name in warmup.DENSE_FLAGS:
+        assert getattr(envs, name) in (True, "1")
+    from vllm.mach.mxfp6.gdn_decode import enabled
+
+    assert enabled("PERSISTENT") and enabled("BA_OVERLAP")
+    assert dict(os.environ) == before
+    envs.set_mach_dense_defaults(False)
+    warmup.activate_dense_defaults(dense_auto_config)
+    assert envs.VLLM_MACH_GDN_PERSISTENT
+    assert (state_dtype == "float16") == envs.VLLM_QWEN3_5_FP16_SSM
+    warmup.activate_dense_defaults(SimpleNamespace(additional_config={}))
+    assert not envs.VLLM_MACH_GDN_PERSISTENT
+    assert not envs.VLLM_QWEN3_5_FP16_SSM
+
+
+@pytest.mark.parametrize("state_dtype", ["float32", "float16"])
+def test_dense_auto_refreshes_cached_worker_defaults(dense_auto_config, state_dtype):
+    from vllm import envs
+    from vllm.mach.mxfp6 import warmup
+
+    dense_auto_config.cache_config.mamba_ssm_cache_dtype = state_dtype
+    envs.enable_envs_cache()
+    try:
+        assert not envs.VLLM_MACH_GDN_PERSISTENT
+        warmup.configure_dense_defaults(dense_auto_config)
+        assert envs.VLLM_MACH_GDN_PERSISTENT
+        assert (state_dtype == "float16") == envs.VLLM_QWEN3_5_FP16_SSM
+        warmup.activate_dense_defaults(SimpleNamespace(additional_config={}))
+        assert not envs.VLLM_MACH_GDN_PERSISTENT
+        assert not envs.VLLM_QWEN3_5_FP16_SSM
+    finally:
+        envs.disable_envs_cache()
+
+
+@pytest.mark.parametrize(
+    "flag",
+    [
+        "VLLM_MACH_DENSE_AUTO",
+        "VLLM_QWEN3_5_FUSED_AR_NORM",
+        "VLLM_MACH_GDN_PERSISTENT",
+        "VLLM_MACH_GDN_BA_OVERLAP",
+        "VLLM_MACH_FUSED_SWIGLU_QUANT",
+        "VLLM_MACH_FUSED_GDN_QUANT",
+        "VLLM_MACH_FUSED_AR_QUANT",
+        "VLLM_SM120_OWNER_PREFILL",
+        "VLLM_SM120_LOSSLESS_PREFILL",
+    ],
+)
+def test_dense_auto_respects_explicit_disable(monkeypatch, dense_auto_config, flag):
+    from vllm import envs
+    from vllm.config import CompilationMode
+    from vllm.mach.mxfp6.warmup import configure_dense_defaults
+
+    monkeypatch.setenv(flag, "0")
+    configure_dense_defaults(dense_auto_config)
+    assert dense_auto_config.additional_config == {}
+    assert dense_auto_config.compilation_config.mode == CompilationMode.VLLM_COMPILE
+    assert envs.mach_dense_default() == "0"
+
+
+@pytest.mark.parametrize(
+    "parent,name,value",
+    [
+        ("cache_config", "mamba_ssm_cache_dtype", "bfloat16"),
+        ("cache_config", "enable_prefix_caching", True),
+        ("parallel_config", "tensor_parallel_size", 1),
+        ("model_config", "enforce_eager", True),
+        (None, "speculative_config", object()),
+        (None, "lora_config", object()),
+        (None, "use_v2_model_runner", False),
+    ],
+)
+def test_dense_auto_rejects_unvalidated_config(dense_auto_config, parent, name, value):
+    from vllm.config import CompilationMode
+    from vllm.mach.mxfp6.warmup import configure_dense_defaults
+
+    obj = getattr(dense_auto_config, parent) if parent else dense_auto_config
+    setattr(obj, name, value)
+    configure_dense_defaults(dense_auto_config)
+    assert dense_auto_config.additional_config == {}
+    assert dense_auto_config.compilation_config.mode == CompilationMode.VLLM_COMPILE
+
+
+def test_dense_auto_fp16_respects_explicit_disable(monkeypatch, dense_auto_config):
+    from vllm import envs
+    from vllm.config import CompilationMode
+    from vllm.mach.mxfp6.warmup import configure_dense_defaults
+
+    dense_auto_config.cache_config.mamba_ssm_cache_dtype = "float16"
+    monkeypatch.setenv("VLLM_QWEN3_5_FP16_SSM", "0")
+    configure_dense_defaults(dense_auto_config)
+    assert dense_auto_config.compilation_config.mode == CompilationMode.VLLM_COMPILE
+    assert dense_auto_config.cache_config.mamba_ssm_cache_dtype == "float16"
+    assert not envs.VLLM_QWEN3_5_FP16_SSM
+    assert not envs.VLLM_MACH_GDN_PERSISTENT
+
+
+def test_dense_auto_missing_wheel_preserves_compile(monkeypatch, dense_auto_config):
+    from vllm.config import CompilationMode
+    from vllm.mach.mxfp6 import warmup
+
+    monkeypatch.setattr(warmup, "find_spec", lambda _: None)
+    warmup.configure_dense_defaults(dense_auto_config)
+    assert dense_auto_config.additional_config == {}
+    assert dense_auto_config.compilation_config.mode == CompilationMode.VLLM_COMPILE
 
 
 def test_adapters_reject_speculative_model_before_mutation(monkeypatch):
@@ -311,8 +535,11 @@ def test_graph_readiness_does_not_reuse_dense_geometry(monkeypatch):
 
 @pytest.mark.parametrize("hidden, heads", [(5120, 24), (2048, 16)])
 @pytest.mark.parametrize("rows", [4, 16, 24, 32])
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.float16])
 @torch.inference_mode()
-def test_gpu_adapter_matches_native_decode(monkeypatch, hidden, heads, rows):
+def test_gpu_adapter_matches_native_decode(
+    monkeypatch, hidden, heads, rows, state_dtype
+):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0):
         pytest.skip("requires SM120")
     import vllm.forward_context
@@ -336,7 +563,7 @@ def test_gpu_adapter_matches_native_decode(monkeypatch, hidden, heads, rows):
     conv = rand(rows + 1, 3, qkv_dim).transpose(1, 2)
     if is_conv_state_dim_first():
         conv = conv.contiguous()
-    state = rand(rows + 1, heads, 128, 128).float()
+    state = rand(rows + 1, heads, 128, 128).to(state_dtype)
     reference_conv, reference_state = conv.clone(), state.clone()
     indices = torch.arange(1, rows + 1, device="cuda", dtype=torch.int32)
     md = metadata(rows, non_spec_state_indices_tensor=indices)

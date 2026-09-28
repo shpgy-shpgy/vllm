@@ -212,6 +212,10 @@ class Worker(WorkerBase):
             is_driver_worker=is_driver_worker,
         )
 
+        from vllm.mach.mxfp6.warmup import activate_dense_defaults
+
+        activate_dense_defaults(vllm_config)
+
         # configure float32 matmul precision according to vLLM env.
         precision = envs.VLLM_FLOAT32_MATMUL_PRECISION
         torch.set_float32_matmul_precision(precision)

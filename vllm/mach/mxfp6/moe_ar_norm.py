@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Qwen3.5 MoE reduction ownership for manual AR/Norm fusion."""
 
 from __future__ import annotations
@@ -74,6 +75,8 @@ def defer_moe_allreduce(block) -> None:
 def prepare_compiled_ar_norm(vllm_config) -> None:
     """Separate rank-specialized compiled artifacts."""
 
+    if not use_moe_ar_norm(vllm_config):
+        return
     if vllm_config.compilation_config.mode == CompilationMode.VLLM_COMPILE:
         if not isinstance(vllm_config.additional_config, dict):
             vllm_config.additional_config = {}
