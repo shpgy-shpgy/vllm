@@ -8,3 +8,9 @@ include tools/build_rust.py
 
 recursive-include cmake *
 recursive-include csrc *
+recursive-include vllm/mach/mxfp6/gdn *.cu
+recursive-include vllm/mach/mxfp6/profile *.json
+recursive-include native/mach *.cu *.cuh *.cpp *.py LICENSE README.md MANIFEST.in
+recursive-exclude native/mach/ar_norm/build *
+recursive-exclude native/mach/lossless_prefill/build *
+recursive-exclude native/mach/owner_prefill/build *

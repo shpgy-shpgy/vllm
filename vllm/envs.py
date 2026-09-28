@@ -317,6 +317,20 @@ if TYPE_CHECKING:
     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
     VLLM_QWEN3_5_FUSED_AR_NORM: bool = False
+    VLLM_QWEN3_5_FP16_SSM: bool = False
+    VLLM_MACH_GDN_PERSISTENT: bool = False
+    VLLM_MACH_GDN_BA_OVERLAP: bool = False
+    VLLM_MACH_FUSED_SWIGLU_QUANT: str = "0"
+    VLLM_MACH_FUSED_GDN_QUANT: str = "0"
+    VLLM_MACH_FUSED_AR_QUANT: str = "0"
+    VLLM_MACH_MOE_PROJECTION_TUNING: str = "0"
+    VLLM_SM120_LOSSLESS_PREFILL: bool = False
+    VLLM_SM120_LOSSLESS_PREFILL_VERIFY: bool = False
+    VLLM_SM120_LOSSLESS_PREFILL_GRAPH: bool = False
+    VLLM_SM120_OWNER_PREFILL: bool = False
+    VLLM_SM120_OWNER_MLP_LAYERS: str = ""
+    VLLM_SM120_OWNER_VERIFY: int = 0
+    VLLM_SM120_OWNER_VERIFY_ONLY_RAGGED: bool = False
     VLLM_USE_V2_MODEL_RUNNER: bool | None = None
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
@@ -1573,7 +1587,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_HYBRID_NVFP4_LM_HEAD_BACKEND": lambda: os.getenv(
         "VLLM_HYBRID_NVFP4_LM_HEAD_BACKEND", "b12x"
-    ).strip().lower(),
+    )
+    .strip()
+    .lower(),
     "VLLM_HYBRID_NVFP4_LM_HEAD_CANDIDATES": lambda: int(
         os.getenv("VLLM_HYBRID_NVFP4_LM_HEAD_CANDIDATES", "128")
     ),
@@ -1600,7 +1616,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_HYBRID_MXFP4_LM_HEAD_MIXED_BATCH_MODE": lambda: os.getenv(
         "VLLM_HYBRID_MXFP4_LM_HEAD_MIXED_BATCH_MODE", "all"
-    ).strip().lower(),
+    )
+    .strip()
+    .lower(),
     "VLLM_HYBRID_MXFP8_LM_HEAD": lambda: bool(
         int(os.getenv("VLLM_HYBRID_MXFP8_LM_HEAD", "0"))
     ),
@@ -1614,9 +1632,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.getenv("VLLM_HYBRID_MXFP8_LM_HEAD_USE_FLASHINFER_TOPK", "1"))
     ),
     # Opt-in per-request QUEUED/SCHEDULED timing debug logs (SCHED_TT).
-    "VLLM_SCHED_TT_DEBUG": lambda: bool(
-        int(os.getenv("VLLM_SCHED_TT_DEBUG", "0"))
-    ),
+    "VLLM_SCHED_TT_DEBUG": lambda: bool(int(os.getenv("VLLM_SCHED_TT_DEBUG", "0"))),
     # Whether to turn on the outlines cache for V1
     # This cache is unbounded and on disk, so it's not safe to use in
     # an environment with potentially malicious users.
@@ -1955,9 +1971,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Whether to use FlashInfer allreduce. Unset auto-selects the validated
     # SM120 TP2 FlashInfer path; 0 disables it and 1 forces the existing path.
-    "VLLM_ALLREDUCE_USE_FLASHINFER": env_flag_or_none(
-        "VLLM_ALLREDUCE_USE_FLASHINFER"
-    ),
+    "VLLM_ALLREDUCE_USE_FLASHINFER": env_flag_or_none("VLLM_ALLREDUCE_USE_FLASHINFER"),
     # Use the Qwen3.5-specific fused MXFP6 router/shared-expert schedule.
     # Set to 0 to fall back to the generic native MXFP6 MoE runner.
     "VLLM_MXFP6_SM120_QWEN35_FASTPATH": lambda: bool(
@@ -2094,9 +2108,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # logging of workspace resize operations.
     "VLLM_DEBUG_WORKSPACE": lambda: bool(int(os.getenv("VLLM_DEBUG_WORKSPACE", "0"))),
     # Changes the compiled graph, so it must participate in compile_factors().
-    "VLLM_MXFP8_FUSED_SILU": lambda: bool(
-        int(os.getenv("VLLM_MXFP8_FUSED_SILU", "1"))
-    ),
+    "VLLM_MXFP8_FUSED_SILU": lambda: bool(int(os.getenv("VLLM_MXFP8_FUSED_SILU", "1"))),
     # Disables parallel execution of shared_experts via separate cuda stream
     "VLLM_DISABLE_SHARED_EXPERTS_STREAM": lambda: bool(
         int(os.getenv("VLLM_DISABLE_SHARED_EXPERTS_STREAM", "0"))
@@ -2136,8 +2148,47 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Flag to control the v2 model runner. If unset, use config defaults.
     # Opt-in manual fusion for SM120 Qwen3.5 dense MXFP6, TP2, without compile.
-    "VLLM_QWEN3_5_FUSED_AR_NORM": lambda: os.getenv("VLLM_QWEN3_5_FUSED_AR_NORM", "0")
-    == "1",
+    "VLLM_QWEN3_5_FUSED_AR_NORM": lambda: (
+        os.getenv("VLLM_QWEN3_5_FUSED_AR_NORM", "0") == "1"
+    ),
+    "VLLM_QWEN3_5_FP16_SSM": lambda: os.getenv("VLLM_QWEN3_5_FP16_SSM", "0") == "1",
+    "VLLM_MACH_GDN_PERSISTENT": lambda: (
+        os.getenv("VLLM_MACH_GDN_PERSISTENT", "0") == "1"
+    ),
+    "VLLM_MACH_GDN_BA_OVERLAP": lambda: (
+        os.getenv("VLLM_MACH_GDN_BA_OVERLAP", "0") == "1"
+    ),
+    "VLLM_MACH_FUSED_SWIGLU_QUANT": env_with_choices(
+        "VLLM_MACH_FUSED_SWIGLU_QUANT", "0", ["0", "1", "auto"]
+    ),
+    "VLLM_MACH_FUSED_GDN_QUANT": env_with_choices(
+        "VLLM_MACH_FUSED_GDN_QUANT", "0", ["0", "1", "auto"]
+    ),
+    "VLLM_MACH_FUSED_AR_QUANT": env_with_choices(
+        "VLLM_MACH_FUSED_AR_QUANT", "0", ["0", "1", "auto"]
+    ),
+    "VLLM_MACH_MOE_PROJECTION_TUNING": env_with_choices(
+        "VLLM_MACH_MOE_PROJECTION_TUNING", "0", ["0", "1", "auto"]
+    ),
+    "VLLM_SM120_LOSSLESS_PREFILL": lambda: (
+        os.getenv("VLLM_SM120_LOSSLESS_PREFILL", "0") == "1"
+    ),
+    "VLLM_SM120_LOSSLESS_PREFILL_VERIFY": lambda: (
+        os.getenv("VLLM_SM120_LOSSLESS_PREFILL_VERIFY", "0") == "1"
+    ),
+    "VLLM_SM120_LOSSLESS_PREFILL_GRAPH": lambda: (
+        os.getenv("VLLM_SM120_LOSSLESS_PREFILL_GRAPH", "0") == "1"
+    ),
+    "VLLM_SM120_OWNER_PREFILL": lambda: (
+        os.getenv("VLLM_SM120_OWNER_PREFILL", "0") == "1"
+    ),
+    "VLLM_SM120_OWNER_MLP_LAYERS": lambda: os.getenv(
+        "VLLM_SM120_OWNER_MLP_LAYERS", str(list(range(0, 64, 2)))
+    ),
+    "VLLM_SM120_OWNER_VERIFY": lambda: int(os.getenv("VLLM_SM120_OWNER_VERIFY", "0")),
+    "VLLM_SM120_OWNER_VERIFY_ONLY_RAGGED": lambda: (
+        os.getenv("VLLM_SM120_OWNER_VERIFY_ONLY_RAGGED", "0") == "1"
+    ),
     "VLLM_USE_V2_MODEL_RUNNER": lambda: maybe_convert_bool(
         os.getenv("VLLM_USE_V2_MODEL_RUNNER", None)
     ),
@@ -2444,6 +2495,33 @@ def compile_factors() -> dict[str, object]:
         "CUDA_VISIBLE_DEVICES",
         "NO_COLOR",
     }
+
+    # Keep the pre-migration baseline cache key unchanged when all Mach
+    # adapters are disabled. Enabled adapters must have isolated artifacts.
+    mach_opt_in_flags = {
+        "VLLM_QWEN3_5_FP16_SSM",
+        "VLLM_MACH_GDN_PERSISTENT",
+        "VLLM_MACH_GDN_BA_OVERLAP",
+        "VLLM_MACH_FUSED_SWIGLU_QUANT",
+        "VLLM_MACH_FUSED_GDN_QUANT",
+        "VLLM_MACH_FUSED_AR_QUANT",
+        "VLLM_MACH_MOE_PROJECTION_TUNING",
+        "VLLM_SM120_LOSSLESS_PREFILL",
+        "VLLM_SM120_OWNER_PREFILL",
+    }
+    if not any(
+        environment_variables[name]() not in (False, "0") for name in mach_opt_in_flags
+    ):
+        ignored_factors.update(mach_opt_in_flags)
+        ignored_factors.update(
+            {
+                "VLLM_SM120_LOSSLESS_PREFILL_VERIFY",
+                "VLLM_SM120_LOSSLESS_PREFILL_GRAPH",
+                "VLLM_SM120_OWNER_MLP_LAYERS",
+                "VLLM_SM120_OWNER_VERIFY",
+                "VLLM_SM120_OWNER_VERIFY_ONLY_RAGGED",
+            }
+        )
 
     from vllm.config.utils import normalize_value
 

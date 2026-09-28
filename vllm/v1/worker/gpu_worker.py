@@ -564,6 +564,10 @@ class Worker(WorkerBase):
         """
         maybe_apply_startup_plan(self)
 
+        from vllm.mach.mxfp6.warmup import prepare_model
+
+        prepare_model(self.get_model(), self.vllm_config)
+
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
             # still need a profile run which compiles the model for
             # max_num_batched_tokens

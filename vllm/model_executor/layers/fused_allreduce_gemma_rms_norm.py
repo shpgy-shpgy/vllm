@@ -125,9 +125,7 @@ def fused_allreduce_gemma_rms_norm(
     Returns ``(normed_output, new_residual)``, equivalent to
     ``norm(all_reduce(hidden_states), residual)``.
     """
-    use_mach_compiled_ar_norm = (
-        envs.VLLM_QWEN3_5_FUSED_AR_NORM
-    )
+    use_mach_compiled_ar_norm = envs.VLLM_QWEN3_5_FUSED_AR_NORM
     if torch.compiler.is_compiling() and use_mach_compiled_ar_norm:
         from vllm.mach.mxfp6.compiled_ar_norm import (
             compiled_allreduce_gemma_rms_norm,
@@ -144,6 +142,13 @@ def fused_allreduce_gemma_rms_norm(
     ok, max_token_num = _can_use_flashinfer(hidden_states, tp_size)
     if ok:
         norm_out = torch.empty_like(hidden_states)
+        if envs.VLLM_SM120_LOSSLESS_PREFILL:
+            from vllm.mach.mxfp6.sm120_lossless_prefill import try_lossless_prefill
+
+            if try_lossless_prefill(
+                hidden_states, residual, norm, norm_out, tp_size, max_token_num
+            ):
+                return norm_out, hidden_states
         # With norm_out provided, the kernel writes the new residual
         # (all_reduce(hidden_states) + residual) into the hidden_states buffer
         # and the normalized result into norm_out, leaving `residual` untouched.

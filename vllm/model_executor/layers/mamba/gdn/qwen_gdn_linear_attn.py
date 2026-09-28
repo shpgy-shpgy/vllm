@@ -110,9 +110,7 @@ def _reset_flashinfer_gdn_mtp_pool_cache() -> bool:
 
     cleared = False
     for name in ("_get_compiled_mtp_kernel", "_get_compiled_mtp_kernel_inline"):
-        cache_clear = getattr(
-            getattr(gdn_decode_mtp, name, None), "cache_clear", None
-        )
+        cache_clear = getattr(getattr(gdn_decode_mtp, name, None), "cache_clear", None)
         if cache_clear is not None:
             cache_clear()
             cleared = True
@@ -226,9 +224,13 @@ def _resolve_gdn_prefill_backend(
     if current_platform.is_device_capability(90):
         supports_flashinfer = True
     elif (
-        current_platform.is_device_capability_family(100)
-        or current_platform.is_device_capability_family(120)
-    ) and head_k_dim == 128 and current_platform.get_cuda_runtime_major() >= 13:
+        (
+            current_platform.is_device_capability_family(100)
+            or current_platform.is_device_capability_family(120)
+        )
+        and head_k_dim == 128
+        and current_platform.get_cuda_runtime_major() >= 13
+    ):
         supports_flashinfer = _is_libs_cu13_install_intact()
         supports_cutedsl = current_platform.is_device_capability_family(100)
         if not supports_flashinfer:
@@ -680,6 +682,18 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self, vllm_config: VllmConfig
     ) -> str | None:
         conv_state_dtype, recurrent_state_dtype = self.get_state_dtype()
+        narrow_fp16_state = (
+            envs.VLLM_QWEN3_5_FP16_SSM
+            and recurrent_state_dtype == torch.float16
+            and self._is_sm120
+            and self.tp_size == 2
+            and (self.hidden_size, self.num_v_heads) in ((5120, 48), (2048, 32))
+            and self.num_k_heads == 16
+            and vllm_config.speculative_config is None
+            and vllm_config.lora_config is None
+            and self.enable_packed_recurrent_decode
+            and self.norm.activation == "silu"
+        )
         if (
             self.gqa_interleaved_layout
             or self.head_k_dim != 128
@@ -687,7 +701,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             or self.norm.activation not in ("silu", "sigmoid")
             or vllm_config.model_config.dtype != torch.bfloat16
             or conv_state_dtype != torch.bfloat16
-            or recurrent_state_dtype not in FUSED_GDN_STATE_DTYPES
+            or (
+                recurrent_state_dtype not in FUSED_GDN_STATE_DTYPES
+                and not narrow_fp16_state
+            )
             or not current_platform.has_device_capability(80)
         ):
             return (
@@ -1738,9 +1755,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             direct_prefill_output = spec_sequence_masks is None
             if direct_prefill_output:
                 prefill_start = num_decode_tokens if split_non_spec else 0
-                prefill_output = core_attn_out[
-                    prefill_start:num_actual_tokens
-                ]
+                prefill_output = core_attn_out[prefill_start:num_actual_tokens]
             else:
                 prefill_output = None
             (
@@ -1801,9 +1816,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             # Both index tensors address the first dimension of the flattened
             # caller-owned output.  Avoid the temporary merged_out buffer and its
             # extra device-to-device copy.
-            core_attn_out.index_copy_(
-                0, spec_token_indx, core_attn_out_spec.squeeze(0)
-            )
+            core_attn_out.index_copy_(0, spec_token_indx, core_attn_out_spec.squeeze(0))
             core_attn_out.index_copy_(
                 0, non_spec_token_indx, core_attn_out_non_spec.squeeze(0)
             )
@@ -1850,8 +1863,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     (
                         source_weight[start : start + local_heads],
                         source_weight[
-                            self.num_v_heads
-                            + start : self.num_v_heads
+                            self.num_v_heads + start : self.num_v_heads
                             + start
                             + local_heads
                         ],
@@ -2103,9 +2115,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         conv_weights = self.conv1d.weight.detach().view(
             self.conv1d.weight.size(0), self.conv1d.weight.size(2)
         )
-        conv_bias = (
-            None if self.conv1d.bias is None else self.conv1d.bias.detach()
-        )
+        conv_bias = None if self.conv1d.bias is None else self.conv1d.bias.detach()
         active_state_indices = state_indices[:batch_size, :seq_len]
         active_cu_seqlens = cu_seqlens[: batch_size + 1]
         active_num_accepted = num_accepted_tokens[:batch_size]
@@ -2511,14 +2521,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             return
 
         assert isinstance(attn_metadata, GDNAttentionMetadata)
-        if (
-            not (
-                attn_metadata.spec_sequence_masks is not None
-                and attn_metadata.num_prefills == 0
-                and self._is_sm120
-            )
-            and self._can_use_fused_gdn_mtp_decode(attn_metadata)
-        ):
+        if not (
+            attn_metadata.spec_sequence_masks is not None
+            and attn_metadata.num_prefills == 0
+            and self._is_sm120
+        ) and self._can_use_fused_gdn_mtp_decode(attn_metadata):
             self._forward_core_decode_spec_fused_norm(
                 mixed_qkv=mixed_qkv,
                 b=b,

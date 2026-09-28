@@ -373,6 +373,17 @@ class Qwen3_5Model(Qwen3NextModel):
             if inputs_embeds is not None
             else self.embed_input_ids(input_ids)
         )
+        if envs.VLLM_SM120_OWNER_PREFILL:
+            from vllm.mach.mxfp6.sm120_owner_prefill import begin, finish, run_layer
+
+            owner_state = begin(self, hidden_states)
+            if owner_state is not None:
+                residual = None
+                for layer in islice(self.layers, self.start_layer, self.end_layer):
+                    hidden_states, residual = run_layer(
+                        owner_state, layer, hidden_states, residual, positions
+                    )
+                return finish(owner_state, hidden_states, residual, self.norm)
         residual = None
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             hidden_states, residual = layer(

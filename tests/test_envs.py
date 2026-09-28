@@ -564,6 +564,25 @@ class TestVllmConfigureLogging:
                 _ = envs.VLLM_CONFIGURE_LOGGING
 
 
+def test_disabled_mach_adapters_preserve_baseline_compile_factors(monkeypatch):
+    names = {
+        name
+        for name in envs.environment_variables
+        if name.startswith(("VLLM_MACH_", "VLLM_SM120_OWNER_", "VLLM_SM120_LOSSLESS_"))
+        or name == "VLLM_QWEN3_5_FP16_SSM"
+    }
+    for name in names:
+        monkeypatch.delenv(name, raising=False)
+    baseline = envs.compile_factors()
+    assert names.isdisjoint(baseline)
+    monkeypatch.setenv("VLLM_MACH_GDN_PERSISTENT", "1")
+    enabled = envs.compile_factors()
+    assert enabled["VLLM_MACH_GDN_PERSISTENT"] is True
+    assert {k: v for k, v in enabled.items() if k not in names} == baseline
+    monkeypatch.setenv("VLLM_MACH_GDN_PERSISTENT", "0")
+    assert envs.compile_factors() == baseline
+
+
 class TestVllmMaxNSequences:
     def test_default_value(self):
         """Test that VLLM_MAX_N_SEQUENCES defaults to 64."""
