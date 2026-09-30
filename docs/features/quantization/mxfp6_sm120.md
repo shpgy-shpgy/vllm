@@ -32,6 +32,30 @@ VLLM_PLUGINS='' MXFP6_AUTOTUNE=off CUDA_VISIBLE_DEVICES=0,1 \
 This preserves the checkpoint's existing embedding and output-head formats;
 it does not introduce embedding or output-head requantization.
 
+## Native MXFP8 W8A8 on SM120
+
+For a pure `compressed-tensors` MXFP8 checkpoint, select the native
+`mxfp6-sm120` W8A8 path explicitly with `--linear-backend mxfp6-sm120`.
+This uses `mxfp6.mxfp8` for dynamic activation quantization and the MXFP8 GEMM
+for medium/large decode M. To avoid the fixed launch and quantization overhead
+at very small M, M<=16 is dispatched through the existing FlashInfer
+`b12x-decode` path; `--attention-backend` remains independent and can still be
+set to `FLASHINFER`.
+
+```bash
+MXFP6_LIBRARY_PATH=/path/to/site-packages/mxfp6/mxfp6_torch.so \
+MXFP8_LIBRARY_PATH=/path/to/site-packages/mxfp6/mxfp8_torch.so \
+CUDA_VISIBLE_DEVICES=5 python3 -m vllm.entrypoints.openai.api_server \
+  --model /data/models/Qwen3.5-4B-MXFP8 \
+  --attention-backend FLASHINFER \
+  --linear-backend mxfp6-sm120
+```
+
+The native W8A8 implementation requires SM120 and positive `N/K` dimensions
+that are multiples of 128. The Qwen3.5-4B MXFP8 checkpoint's quantized linear
+weights satisfy this constraint; BF16-only layers continue through their
+ordinary path.
+
 ## Manual AllReduce and RMSNorm fusion
 
 Set `VLLM_QWEN3_5_FUSED_AR_NORM=1` to delay row-parallel reductions into the

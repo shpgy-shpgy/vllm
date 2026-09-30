@@ -191,6 +191,7 @@ LinearBackend = Literal[
     "flashinfer_cudnn",
     "flashinfer_b12x",
     "b12x",
+    "mxfp6_sm120",
     "marlin",
     "humming",
     "triton",
@@ -281,6 +282,7 @@ class KernelConfig:
     - "flashinfer_cudnn": Use FlashInfer with cuDNN kernels
     - "flashinfer_b12x": Use FlashInfer b12x CuteDSL NVFP4 GEMM (SM120+)
     - "b12x": Use native B12X FP8 and FP4 linear kernels on SM12x
+    - "mxfp6_sm120": Use the native mxfp6-sm120 MXFP8 W8A8 kernel on SM120
     - "marlin": Use Marlin kernels
     - "triton": Use Triton-based kernels
     - "deep_gemm": Use DeepGEMM kernels
