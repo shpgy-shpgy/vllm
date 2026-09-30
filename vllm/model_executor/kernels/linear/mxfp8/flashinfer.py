@@ -16,6 +16,37 @@ from vllm.utils.flashinfer import has_flashinfer, has_flashinfer_cutedsl
 from .Mxfp8LinearKernel import Mxfp8LinearKernel, Mxfp8LinearLayerConfig
 
 
+def use_qwen35_mxfp8_decode(config) -> bool:
+    """Enable measured SM120 decode shapes without overriding an explicit backend."""
+    model = config.model_config
+    if model is None:
+        return False
+    hf = model.hf_text_config
+    if not (
+        current_platform.is_cuda()
+        and current_platform.is_device_capability(120)
+        and model.dtype == torch.bfloat16
+        and model.quantization == "compressed-tensors"
+        and getattr(hf, "model_type", None) == "qwen3_5_text"
+        and getattr(hf, "hidden_size", None) == 2560
+        and getattr(hf, "intermediate_size", None) == 9216
+        and config.kernel_config.linear_backend == "auto"
+        and config.parallel_config.tensor_parallel_size == 1
+        and config.lora_config is None
+        and config.speculative_config is None
+    ):
+        return False
+    try:
+        from flashinfer.gemm.gemm_mm_mxfp8_cute_dsl import (
+            _b12x_mxfp8_dsl_supported,
+        )
+        from flashinfer.jit.cpp_ext import get_cuda_version
+
+        return _b12x_mxfp8_dsl_supported() and get_cuda_version().major >= 13
+    except (ImportError, AttributeError, OSError, RuntimeError, ValueError):
+        return False
+
+
 class FlashInferCutlassMxfp8LinearKernel(Mxfp8LinearKernel):
     """MXFP8 W8A8 GEMM via FlashInfer CUTLASS (SM100+)."""
 
@@ -36,6 +67,13 @@ class FlashInferCutlassMxfp8LinearKernel(Mxfp8LinearKernel):
         return True, None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        from vllm.config import get_current_vllm_config
+
+        layer.mxfp8_backend = (
+            "b12x-decode"
+            if use_qwen35_mxfp8_decode(get_current_vllm_config())
+            else "cutlass"
+        )
         weight = layer.weight.data  # [N, K]
         N, K = weight.shape
 
@@ -88,7 +126,7 @@ class FlashInferCutlassMxfp8LinearKernel(Mxfp8LinearKernel):
             input_scale,
             weight_scale,
             out_dtype=out_dtype,
-            backend="cutlass",
+            backend=layer.mxfp8_backend,
         )
 
         if bias is not None:

@@ -271,7 +271,7 @@ def autotune_with_torch_cuda_delay(*args, **kwargs):
     implementation = (
         _get_submodule(implementation_name) if implementation_name else None
     )
-    delay_owners = []
+    delay_owners: list[Any] = []
     for module in (autotuner, implementation):
         if (
             module is not None
@@ -691,6 +691,27 @@ def use_trtllm_attention(
     return True
 
 
+# The B12x decode path is intentionally limited to low-M decode shapes.
+# The earlier 32 < M <= 64 experiment slowed the high-batch graph tail;
+# keep the whole high-batch range (including M=48, 56, and 64) on CUTLASS.
+_QWEN35_MXFP8_B12X_MAX_M = 32
+_QWEN35_MXFP8_B12X_SHAPES = frozenset(
+    {
+        (12288, 2560),
+        (2560, 4096),
+        (18432, 2560),
+        (2560, 9216),
+        (10240, 2560),
+    }
+)
+
+
+def _qwen35_mxfp8_backend(m: int, n: int, k: int) -> str:
+    if m <= _QWEN35_MXFP8_B12X_MAX_M and (n, k) in _QWEN35_MXFP8_B12X_SHAPES:
+        return "b12x"
+    return "cutlass"
+
+
 if has_flashinfer():
     from vllm.utils.torch_utils import direct_register_custom_op
 
@@ -957,6 +978,11 @@ if has_flashinfer():
     ) -> torch.Tensor:
         from flashinfer import mm_mxfp8 as mm_mxfp8_
 
+        if backend == "b12x-decode":
+            # Dispatch inside the custom op to preserve the dynamic compile range.
+            m, k = A.shape
+            n = B.shape[1]
+            backend = _qwen35_mxfp8_backend(m, n, k)
         return mm_mxfp8_(
             A,
             B,
@@ -1176,9 +1202,7 @@ def flashinfer_nvfp4_quantize_128x4(
     """Quantize NVFP4 with the 128x4 scale layout required by b12x."""
     if not has_flashinfer():
         raise RuntimeError("FlashInfer is required for NVFP4 quantization")
-    return torch.ops.vllm.flashinfer_nvfp4_quantize_128x4.default(
-        a, a_global_sf
-    )
+    return torch.ops.vllm.flashinfer_nvfp4_quantize_128x4.default(a, a_global_sf)
 
 
 flashinfer_fp8_blockscale_gemm = _lazy_import_wrapper(

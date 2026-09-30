@@ -301,6 +301,12 @@ _FLASHINFER_BF16_AUTOTUNE_MAX_TOKENS = 32
 
 def _flashinfer_autotune_token_counts(runner: "GPUModelRunner") -> tuple[int, ...]:
     max_tokens = runner.scheduler_config.max_num_batched_tokens
+    from vllm.model_executor.kernels.linear.mxfp8.flashinfer import (
+        use_qwen35_mxfp8_decode,
+    )
+
+    if use_qwen35_mxfp8_decode(runner.vllm_config):
+        return tuple(dict.fromkeys((max_tokens, min(max_tokens, 32))))
     linear_backend = runner.vllm_config.kernel_config.linear_backend
     if (
         linear_backend == "flashinfer_cutedsl"

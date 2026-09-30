@@ -23,6 +23,7 @@ from vllm.model_executor.layers.hybrid_mxfp8_lm_head import (
     select_lm_head_candidates,
 )
 from vllm.platforms import current_platform
+from vllm.triton_utils import tl, triton
 from vllm.utils.flashinfer import (
     autotune_with_torch_cuda_delay,
     flashinfer_nvfp4_quantize_128x4,
@@ -45,8 +46,55 @@ _BUFFER_NAMES = (_WEIGHT_NAME, _SCALE_NAME, _GLOBAL_SCALE_NAME)
 _DEFAULT_AUTOTUNE_MAX_ROWS = 2048
 
 
+@triton.jit(do_not_specialize=["N"])
+def _global_scale_reduce_kernel(X, Out, N, BLOCK: tl.constexpr, FINAL: tl.constexpr):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    values = tl.load(X + offsets, offsets < N, other=0).to(tl.float32)
+    maximum = tl.max(tl.abs(values), 0)
+    if FINAL:
+        scale = tl.div_rn(1.0, tl.maximum(maximum, 1.0e-12)) * 2688.0
+        maximum = tl.where(maximum > 0, scale, 1.0)
+    tl.store(Out + tl.program_id(0), maximum)
+
+
 def _global_scale(tensor: torch.Tensor) -> torch.Tensor:
     """Return the FlashInfer NVFP4 global scale for a BF16 activation/weight."""
+    # Decode activations need only one or two launches, including the scale
+    # arithmetic. Keep large initialization-time weight reductions in PyTorch.
+    if (
+        tensor.is_cuda
+        and tensor.is_contiguous()
+        and tensor.dtype == torch.bfloat16
+        and 0 < tensor.numel() <= 262144
+    ):
+        n = tensor.numel()
+        result = torch.empty((), dtype=torch.float32, device=tensor.device)
+        if n <= 8192:
+            _global_scale_reduce_kernel[(1,)](
+                tensor,
+                result,
+                n,
+                triton.next_power_of_2(n),
+                True,
+            )
+        else:
+            blocks = triton.cdiv(n, 4096)
+            partial = torch.empty((blocks,), dtype=torch.float32, device=tensor.device)
+            _global_scale_reduce_kernel[(blocks,)](
+                tensor,
+                partial,
+                n,
+                4096,
+                False,
+            )
+            _global_scale_reduce_kernel[(1,)](
+                partial,
+                result,
+                blocks,
+                triton.next_power_of_2(blocks),
+                True,
+            )
+        return result
     # Inference activations and the loaded lm-head weights are finite BF16
     # tensors.  Reducing them in BF16 is exact for ``amax`` (there is no
     # accumulation), while avoiding the full-tensor BF16->FP32 cast and the
@@ -199,9 +247,7 @@ class HybridNvfp4LmHead:
         top_k: int | None = None,
     ) -> torch.Tensor:
         candidates = (
-            self.candidates
-            if top_k is None
-            else self.candidate_count_for_topk(top_k)
+            self.candidates if top_k is None else self.candidate_count_for_topk(top_k)
         )
         candidates = min(candidates, coarse_logits.shape[-1])
         if top_k is not None and candidates > self.candidates:
@@ -290,9 +336,7 @@ def autotune_hybrid_nvfp4_lm_head(
     row_shapes: tuple[int, ...] | None = None,
 ) -> tuple[float, tuple[int, ...]]:
     if row_shapes is None:
-        row_shapes = autotune_row_buckets(
-            state.max_rows or _DEFAULT_AUTOTUNE_MAX_ROWS
-        )
+        row_shapes = autotune_row_buckets(state.max_rows or _DEFAULT_AUTOTUNE_MAX_ROWS)
     hidden_states = torch.zeros(
         (max(row_shapes), state.input_size),
         dtype=torch.bfloat16,
@@ -416,9 +460,9 @@ def prepare_hybrid_nvfp4_lm_head(
     _attach_state(layer, state)
     setattr(weight, _SHARED_STATE_NAME, state)
 
-    extra_mib = sum(
-        getattr(layer, name).nbytes for name in _BUFFER_NAMES
-    ) / (1024 * 1024)
+    extra_mib = sum(getattr(layer, name).nbytes for name in _BUFFER_NAMES) / (
+        1024 * 1024
+    )
     logger.info_once(
         "Prepared hybrid NVFP4 b12x lm-head for weight %s with %d candidates "
         "and M<=%s (%.2f MiB persistent overhead; FlashInfer autotune and "

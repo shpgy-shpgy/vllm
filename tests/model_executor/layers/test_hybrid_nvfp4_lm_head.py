@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import pytest
 import torch
 
 import vllm.model_executor.layers.hybrid_nvfp4_lm_head as hybrid_nvfp4
@@ -43,6 +45,28 @@ def test_nvfp4_global_scale_matches_fp32_reference_for_finite_bf16() -> None:
         torch.ones_like(expected_max),
     )
     torch.testing.assert_close(hybrid_nvfp4._global_scale(tensor), expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("rows", [1, 3, 4, 7, 16, 31, 32, 64, 103])
+@pytest.mark.parametrize("magnitude", [0.0, 1.0e-15, 1.0, 1.0e10])
+def test_nvfp4_global_scale_cuda_graph_matches_reference(rows, magnitude):
+    # Cover both reduction stages, zero handling, the clamp, and the large
+    # tensor fallback. Scaling must not change NVFP4 quantization decisions.
+    tensor = torch.randn((rows, 2560), device="cuda", dtype=torch.bfloat16)
+    tensor *= magnitude
+    maximum = tensor.abs().amax().float()
+    expected = torch.where(
+        maximum > 0,
+        maximum.clamp_min(1.0e-12).reciprocal() * 2688.0,
+        torch.ones_like(maximum),
+    )
+    hybrid_nvfp4._global_scale(tensor)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = hybrid_nvfp4._global_scale(tensor)
+    graph.replay()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 def test_nvfp4_can_use_records_compact_path_failure() -> None:
@@ -112,7 +136,7 @@ def test_nvfp4_shared_state_attaches_without_requantizing(monkeypatch) -> None:
         candidates=40,
         max_rows=64,
     )
-    setattr(weight, "_hybrid_nvfp4_lm_head_shared_state", state)
+    weight._hybrid_nvfp4_lm_head_shared_state = state
     layer = torch.nn.Module()
     layer.weight = weight
 
@@ -155,19 +179,19 @@ def test_logits_processor_accepts_nvfp4_state() -> None:
             return True
 
         def coarse_logits(self, hidden_states, bias):
-            return torch.tensor(
-                [[10.0, 9.0, 8.0, 7.0]], dtype=torch.bfloat16
-            ).expand(hidden_states.shape[0], -1).clone()
+            return (
+                torch.tensor([[10.0, 9.0, 8.0, 7.0]], dtype=torch.bfloat16)
+                .expand(hidden_states.shape[0], -1)
+                .clone()
+            )
 
         def select_candidates(self, coarse_logits, *, top_k=None):
             return torch.topk(coarse_logits, 2, dim=-1, sorted=False).indices
 
-        def refine_logits(
-            self, hidden_states, bf16_weight, candidate_indices, bias
-        ):
-            exact = torch.tensor(
-                [[10.0, 9.0, 8.0, 7.0]], dtype=torch.bfloat16
-            ).expand(hidden_states.shape[0], -1)
+        def refine_logits(self, hidden_states, bf16_weight, candidate_indices, bias):
+            exact = torch.tensor([[10.0, 9.0, 8.0, 7.0]], dtype=torch.bfloat16).expand(
+                hidden_states.shape[0], -1
+            )
             return exact.gather(1, candidate_indices)
 
     shard_indices = type(
