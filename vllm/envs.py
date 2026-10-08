@@ -285,6 +285,7 @@ if TYPE_CHECKING:
     VLLM_ALLREDUCE_USE_SYMM_MEM: bool = True
     VLLM_ALLREDUCE_USE_FLASHINFER: bool | None = None
     VLLM_MXFP6_SM120_QWEN35_FASTPATH: bool = True
+    VLLM_MXFP6_SM120_BA_GEMV: bool = False
     VLLM_TUNED_CONFIG_FOLDER: str | None = None
     VLLM_ENABLE_STARTUP_PLAN: bool = False
     VLLM_GPT_OSS_SYSTEM_TOOL_MCP_LABELS: set[str] = set()
@@ -1996,6 +1997,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_MXFP6_SM120_QWEN35_FASTPATH": lambda: bool(
         int(os.getenv("VLLM_MXFP6_SM120_QWEN35_FASTPATH", "1"))
     ),
+    "VLLM_MXFP6_SM120_BA_GEMV": lambda: os.getenv("VLLM_MXFP6_SM120_BA_GEMV", "0")
+    == "1",
     # Experimental: use this to enable MCP tool calling for non harmony models
     "VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT": lambda: bool(
         int(os.getenv("VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT", "0"))
@@ -2535,9 +2538,15 @@ def compile_factors() -> dict[str, object]:
         "VLLM_MACH_FUSED_GDN_QUANT",
         "VLLM_MACH_FUSED_AR_QUANT",
         "VLLM_MACH_MOE_PROJECTION_TUNING",
+        "VLLM_MXFP6_SM120_BA_GEMV",
         "VLLM_SM120_LOSSLESS_PREFILL",
         "VLLM_SM120_OWNER_PREFILL",
     }
+    # The BA adapter changes the model graph only when explicitly enabled;
+    # keeping its disabled value out of a cache key preserves the existing
+    # baseline key even when another Mach adapter is active.
+    if not environment_variables["VLLM_MXFP6_SM120_BA_GEMV"]():
+        ignored_factors.add("VLLM_MXFP6_SM120_BA_GEMV")
     if not any(
         environment_variables[name]() not in (False, "0") for name in mach_opt_in_flags
     ):

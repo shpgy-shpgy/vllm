@@ -24,6 +24,50 @@ DENSE_FLAGS = (
 )
 
 
+def _mxfp6_sm120_workspace_warmup_sizes() -> tuple[int, ...]:
+    raw = os.getenv(
+        "VLLM_MXFP6_SM120_WORKSPACE_WARMUP_SIZES",
+        "17,32,64,128,256,512,1024,2048",
+    )
+    try:
+        values = tuple(
+            sorted({int(item.strip()) for item in raw.split(",") if item.strip()})
+        )
+    except ValueError as exc:
+        raise ValueError(
+            "VLLM_MXFP6_SM120_WORKSPACE_WARMUP_SIZES must be a comma-separated "
+            "list of positive integers"
+        ) from exc
+    if any(value <= 0 for value in values):
+        raise ValueError(
+            "VLLM_MXFP6_SM120_WORKSPACE_WARMUP_SIZES must contain positive integers"
+        )
+    return values
+
+
+def _prepare_mxfp8_sm120_adapters(model, config) -> None:
+    """Prepare the opt-in 4B adapters before profiling and graph capture."""
+    linear_backend = getattr(config.kernel_config, "linear_backend", None)
+    if linear_backend in ("mxfp6_sm120", "mxfp6-sm120"):
+        from vllm.model_executor.kernels.linear.mxfp8.mxfp6_sm120 import (
+            warmup_mxfp6_sm120_mxfp8_workspaces,
+        )
+
+        sizes = _mxfp6_sm120_workspace_warmup_sizes()
+        launches = warmup_mxfp6_sm120_mxfp8_workspaces(model, sizes)
+        if launches:
+            init_logger(__name__).info(
+                "Warmed %d mxfp6-sm120 native MXFP8 workspace launches for sizes=%s",
+                launches,
+                sizes,
+            )
+
+    if envs.VLLM_MXFP6_SM120_BA_GEMV:
+        from .ba import prepare_model as prepare_ba_model
+
+        prepare_ba_model(model)
+
+
 def activate_dense_defaults(config) -> None:
     """Restore the serialized decision in spawned workers before model loading."""
     extra = config.additional_config
@@ -130,6 +174,8 @@ def configure_dense_defaults(config) -> None:
 
 
 def prepare_model(model, config) -> None:
+    _prepare_mxfp8_sm120_adapters(model, config)
+
     if envs.VLLM_MACH_MOE_PROJECTION_TUNING != "0" and not getattr(
         model, "_mach_projection_prepared", False
     ):

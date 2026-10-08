@@ -56,6 +56,33 @@ that are multiples of 128. The Qwen3.5-4B MXFP8 checkpoint's quantized linear
 weights satisfy this constraint; BF16-only layers continue through their
 ordinary path.
 
+The medium/large-M native path is an opaque vLLM custom op. It quantizes the
+activation with the existing vLLM layout, allocates the native
+`mxfp8_sm120::allocate_workspace` result once per CUDA stream and `(M,N,K)`,
+and then reuses that workspace for graph replay. The startup warmup defaults
+to the dispatch-bin sizes `17,32,64,128,256,512,1024,2048`; override them with
+`VLLM_MXFP6_SM120_WORKSPACE_WARMUP_SIZES` when startup memory needs to be
+bounded. A workspace miss during graph capture is treated as an error so it
+cannot silently allocate inside capture.
+
+For the TP1 Qwen3.5-4B BA projection, the optional b12x small-M GEMV can be
+enabled after installing a compatible vLLM `b12x` extra (`1.2.6` is the
+validated reference version):
+
+```bash
+VLLM_MXFP6_SM120_BA_GEMV=1 \
+  VLLM_MXFP6_SM120_WORKSPACE_WARMUP_SIZES=17,32,64,128,256,512,1024,2048 \
+  python3 -m vllm.entrypoints.openai.api_server \
+  --model /data/models/Qwen3.5-4B-MXFP8 \
+  --linear-backend mxfp6-sm120 --attention-backend FLASHINFER
+```
+
+Only `in_proj_ba` weights with shape `[64,2560]`, BF16, no bias and M1..8
+are routed to GEMV. All other BA calls retain the original linear method. The
+adapter is off by default; if the installed b12x build does not expose the
+required compiler/intrinsics/runtime interfaces, enabling it fails early with
+an actionable compatibility error.
+
 ## Manual AllReduce and RMSNorm fusion
 
 Set `VLLM_QWEN3_5_FUSED_AR_NORM=1` to delay row-parallel reductions into the
