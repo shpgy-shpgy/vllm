@@ -190,7 +190,8 @@ def prepare_model(model, config) -> None:
             raise ValueError("MoE projection tuning enabled but model is not eligible")
         model._mach_projection_prepared = bool(count)
     requested = (
-        envs.VLLM_MACH_GDN_PERSISTENT
+        envs.VLLM_MACH_GDN_ORDERED
+        or envs.VLLM_MACH_GDN_PERSISTENT
         or envs.VLLM_MACH_GDN_BA_OVERLAP
         or envs.VLLM_MACH_FUSED_SWIGLU_QUANT != "0"
         or envs.VLLM_MACH_FUSED_GDN_QUANT != "0"
@@ -204,7 +205,19 @@ def prepare_model(model, config) -> None:
         raise ValueError(
             "Mach model adapters require non-speculative inference without LoRA"
         )
-    if config.compilation_config.mode != CompilationMode.NONE:
+    requires_python_model_adapter = (
+        envs.VLLM_MACH_GDN_PERSISTENT
+        or envs.VLLM_MACH_GDN_BA_OVERLAP
+        or envs.VLLM_MACH_FUSED_SWIGLU_QUANT != "0"
+        or envs.VLLM_MACH_FUSED_GDN_QUANT != "0"
+        or envs.VLLM_MACH_FUSED_AR_QUANT != "0"
+        or envs.VLLM_SM120_OWNER_PREFILL
+        or envs.VLLM_SM120_LOSSLESS_PREFILL
+    )
+    if (
+        requires_python_model_adapter
+        and config.compilation_config.mode != CompilationMode.NONE
+    ):
         raise ValueError(
             "Mach Python GDN/prefill/producer adapters require compilation mode NONE; "
             "FULL_DECODE_ONLY CUDA graphs remain supported. MoE AR-Norm alone "
@@ -239,10 +252,18 @@ def prepare_model(model, config) -> None:
                         "FP16 SSM needs VLLM_QWEN3_5_FP16_SSM=1."
                     )
     with torch.inference_mode(), set_current_vllm_config(config):
+        if envs.VLLM_MACH_GDN_ORDERED:
+            from .ordered_gdn import prepare as prepare_ordered_gdn
+
+            prepare_ordered_gdn(model)
         gdn_decode.prepare(model)
         fused_mlp.prepare(model)
         ar_norm.prepare(model)
     required = {
+        "Ordered GDN": (
+            envs.VLLM_MACH_GDN_ORDERED,
+            "_mach_ordered_gdn_prepared",
+        ),
         "GDN persistent/BA": (
             envs.VLLM_MACH_GDN_PERSISTENT or envs.VLLM_MACH_GDN_BA_OVERLAP,
             "_mach_gdn_prepared",

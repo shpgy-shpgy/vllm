@@ -320,6 +320,7 @@ if TYPE_CHECKING:
     VLLM_QWEN3_5_FUSED_AR_NORM: bool = True
     VLLM_MACH_DENSE_AUTO: bool = True
     VLLM_QWEN3_5_FP16_SSM: bool = False
+    VLLM_MACH_GDN_ORDERED: bool = False
     VLLM_MACH_GDN_PERSISTENT: bool = False
     VLLM_MACH_GDN_REQUIRE_PRECOMPILED: bool = False
     VLLM_MACH_GDN_BA_OVERLAP: bool = False
@@ -2179,6 +2180,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     )
     == "1",
     "VLLM_MACH_DENSE_AUTO": lambda: os.getenv("VLLM_MACH_DENSE_AUTO", "1") == "1",
+    "VLLM_MACH_GDN_ORDERED": lambda: (os.getenv("VLLM_MACH_GDN_ORDERED", "0") == "1"),
     "VLLM_MACH_GDN_PERSISTENT": lambda: (
         os.getenv("VLLM_MACH_GDN_PERSISTENT", mach_dense_default()) == "1"
     ),
@@ -2532,6 +2534,7 @@ def compile_factors() -> dict[str, object]:
     # adapters are disabled. Enabled adapters must have isolated artifacts.
     mach_opt_in_flags = {
         "VLLM_QWEN3_5_FP16_SSM",
+        "VLLM_MACH_GDN_ORDERED",
         "VLLM_MACH_GDN_PERSISTENT",
         "VLLM_MACH_GDN_BA_OVERLAP",
         "VLLM_MACH_FUSED_SWIGLU_QUANT",

@@ -510,6 +510,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     def _collect_hybrid_lm_head_processors(self) -> tuple[Any, ...]:
         """Cache target/draft logits processors used by hybrid lm-heads."""
+
         def collect(models: list[Any]) -> tuple[Any, ...]:
             processors: list[Any] = []
             seen: set[int] = set()
@@ -557,9 +558,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         for processor in processors:
             processor.hybrid_lm_head_row_mask = row_mask
 
-    def _make_hybrid_lm_head_row_mask(
-        self, input_batch: InputBatch
-    ) -> torch.Tensor:
+    def _make_hybrid_lm_head_row_mask(self, input_batch: InputBatch) -> torch.Tensor:
         """Expand per-request decode eligibility to target logits rows."""
         num_logits_per_req = np.diff(input_batch.cu_num_logits_np)
         allow_hybrid = np.logical_not(input_batch.is_prefilling_np)
@@ -567,13 +566,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         return torch.from_numpy(row_mask_np).to(self.device, non_blocking=True)
 
     def _set_hybrid_lm_head_enabled(self, enabled: bool) -> None:
-        self._set_hybrid_lm_head_enabled_for(
-            self._hybrid_lm_head_processors, enabled
-        )
+        self._set_hybrid_lm_head_enabled_for(self._hybrid_lm_head_processors, enabled)
 
-    def _set_hybrid_lm_head_row_mask(
-        self, row_mask: torch.Tensor | None
-    ) -> None:
+    def _set_hybrid_lm_head_row_mask(self, row_mask: torch.Tensor | None) -> None:
         self._set_hybrid_lm_head_row_mask_for(
             self._target_hybrid_lm_head_processors, row_mask
         )
@@ -1557,9 +1552,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                             scope="global",
                         )
                         sampled = self.model.get_top_tokens(sample_hidden_states)
-                    elif mode == "full" and hasattr(
-                        self.model, "sample_full_tokens"
-                    ):
+                    elif mode == "full" and hasattr(self.model, "sample_full_tokens"):
                         logger.info_once(
                             "Using V2 vocab-parallel full-distribution sampling "
                             "fast path.",
@@ -1568,12 +1561,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         sampled = self.model.sample_full_tokens(
                             sample_hidden_states, temperature=temperature
                         )
-                    elif mode == "topk" and hasattr(
-                        self.model, "sample_topk_tokens"
-                    ):
+                    elif mode == "topk" and hasattr(self.model, "sample_topk_tokens"):
                         logger.info_once(
-                            "Using V2 vocab-parallel compact top-k sampling "
-                            "fast path.",
+                            "Using V2 vocab-parallel compact top-k sampling fast path.",
                             scope="global",
                         )
                         if presence_only:
@@ -2007,6 +1997,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         self.step_timing.forward_start()
 
+        if envs.VLLM_MACH_GDN_ORDERED:
+            from vllm.mach.mxfp6.ordered_gdn import before_model_run
+
+            before_model_run(self, attn_metadata, batch_desc, dummy_run)
+
         # Run model.
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Use explicit cudagraph replay for FULL mode.
@@ -2140,10 +2135,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if mixed_batch_mode not in ("row_split", "draft_all", "all"):
             mixed_batch_mode = "all"
         hybrid_prefill_guard = bool(
-            (
-                envs.VLLM_HYBRID_NVFP4_LM_HEAD
-                or envs.VLLM_HYBRID_MXFP4_LM_HEAD
-            )
+            (envs.VLLM_HYBRID_NVFP4_LM_HEAD or envs.VLLM_HYBRID_MXFP4_LM_HEAD)
             and mixed_batch_mode != "all"
             and input_batch.is_prefilling_np.size > 0
             and np.any(input_batch.is_prefilling_np)
