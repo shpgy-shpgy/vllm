@@ -45,8 +45,58 @@ def _mxfp6_sm120_workspace_warmup_sizes() -> tuple[int, ...]:
     return values
 
 
-def _prepare_mxfp8_sm120_adapters(model, config) -> None:
-    """Prepare the opt-in 4B adapters before profiling and graph capture."""
+def _ordered_gdn_auto_eligible(model, config) -> bool:
+    """Check whether the model matches the safe Ordered GDN auto target."""
+    if (
+        not config.use_v2_model_runner
+        or config.speculative_config is not None
+        or config.lora_config is not None
+        or envs.VLLM_MACH_GDN_PERSISTENT
+        or envs.VLLM_MACH_GDN_BA_OVERLAP
+    ):
+        return False
+    if getattr(config.kernel_config, "linear_backend", None) not in (
+        "mxfp6_sm120",
+        "mxfp6-sm120",
+    ):
+        return False
+
+    try:
+        from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+            QwenGatedDeltaNetAttention,
+        )
+
+        from . import ordered_gdn
+
+        layers = [
+            layer
+            for layer in model.modules()
+            if isinstance(layer, QwenGatedDeltaNetAttention)
+        ]
+        if not layers or not all(
+            ordered_gdn._eligible_layer(layer) for layer in layers
+        ):
+            return False
+        device = layers[0].A_log.device
+        return (
+            device.type == "cuda"
+            and all(layer.A_log.device == device for layer in layers)
+            and torch.cuda.get_device_capability(device) == (12, 0)
+        )
+    except (AttributeError, ImportError, RuntimeError, TypeError, ValueError):
+        return False
+
+
+def _ordered_gdn_enabled(model, config) -> bool:
+    """Resolve explicit overrides before the model-specific default."""
+    raw = os.getenv("VLLM_MACH_GDN_ORDERED")
+    if raw is not None:
+        return raw == "1"
+    return _ordered_gdn_auto_eligible(model, config)
+
+
+def _prepare_mxfp8_sm120_adapters(model, config, ordered_gdn_enabled: bool) -> None:
+    """Prepare the MXFP6/Ordered GDN adapters before profiling and capture."""
     linear_backend = getattr(config.kernel_config, "linear_backend", None)
     if linear_backend in ("mxfp6_sm120", "mxfp6-sm120"):
         from vllm.model_executor.kernels.linear.mxfp8.mxfp6_sm120 import (
@@ -62,10 +112,18 @@ def _prepare_mxfp8_sm120_adapters(model, config) -> None:
                 sizes,
             )
 
-    if envs.VLLM_MXFP6_SM120_BA_GEMV:
+    # Ordered GDN's low-M route and the Mach champion both rely on the same
+    # unquantized [64,2560] BA projection.  Enable the companion GEMV whenever
+    # Ordered GDN is selected; the explicit flag remains available for runs
+    # that want BA GEMV without Ordered GDN.
+    if envs.VLLM_MXFP6_SM120_BA_GEMV or ordered_gdn_enabled:
         from .ba import prepare_model as prepare_ba_model
 
-        prepare_ba_model(model)
+        count = prepare_ba_model(model)
+        if ordered_gdn_enabled and count:
+            init_logger(__name__).info(
+                "Enabled Ordered GDN companion BA GEMV for %d layers", count
+            )
 
 
 def activate_dense_defaults(config) -> None:
@@ -174,7 +232,8 @@ def configure_dense_defaults(config) -> None:
 
 
 def prepare_model(model, config) -> None:
-    _prepare_mxfp8_sm120_adapters(model, config)
+    ordered_gdn_enabled = _ordered_gdn_enabled(model, config)
+    _prepare_mxfp8_sm120_adapters(model, config, ordered_gdn_enabled)
 
     if envs.VLLM_MACH_MOE_PROJECTION_TUNING != "0" and not getattr(
         model, "_mach_projection_prepared", False
@@ -190,7 +249,7 @@ def prepare_model(model, config) -> None:
             raise ValueError("MoE projection tuning enabled but model is not eligible")
         model._mach_projection_prepared = bool(count)
     requested = (
-        envs.VLLM_MACH_GDN_ORDERED
+        ordered_gdn_enabled
         or envs.VLLM_MACH_GDN_PERSISTENT
         or envs.VLLM_MACH_GDN_BA_OVERLAP
         or envs.VLLM_MACH_FUSED_SWIGLU_QUANT != "0"
@@ -252,7 +311,7 @@ def prepare_model(model, config) -> None:
                         "FP16 SSM needs VLLM_QWEN3_5_FP16_SSM=1."
                     )
     with torch.inference_mode(), set_current_vllm_config(config):
-        if envs.VLLM_MACH_GDN_ORDERED:
+        if ordered_gdn_enabled:
             from .ordered_gdn import prepare as prepare_ordered_gdn
 
             prepare_ordered_gdn(model)
@@ -261,7 +320,7 @@ def prepare_model(model, config) -> None:
         ar_norm.prepare(model)
     required = {
         "Ordered GDN": (
-            envs.VLLM_MACH_GDN_ORDERED,
+            ordered_gdn_enabled,
             "_mach_ordered_gdn_prepared",
         ),
         "GDN persistent/BA": (

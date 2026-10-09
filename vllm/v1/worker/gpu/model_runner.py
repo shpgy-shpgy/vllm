@@ -1997,7 +1997,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         self.step_timing.forward_start()
 
-        if envs.VLLM_MACH_GDN_ORDERED:
+        if envs.VLLM_MACH_GDN_ORDERED and getattr(
+            getattr(self, "model", None), "_mach_ordered_gdn_prepared", False
+        ):
             from vllm.mach.mxfp6.ordered_gdn import before_model_run
 
             before_model_run(self, attn_metadata, batch_desc, dummy_run)

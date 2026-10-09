@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Opt-in Ordered GDN adapter for Qwen3.5-4B on SM120.
+"""Model-gated Ordered GDN adapter for Qwen3.5-4B on SM120.
 
 This is the Ordered GDN migration from vllm-mach.  It hooks the existing
 ``qwen_gdn_attention_core`` opaque op, so the model and scheduler retain the
-normal vLLM lifecycle.  Pure decode batches with M1/2/4/8 use full-store
-kernels, M16 uses deferred W4 scratch, and larger/mixed calls keep the stock
-GDN implementation after draining pending state.
+normal vLLM lifecycle.  Decode batches through M32 remain on the stock
+FlashInfer route.  M40..128 use deferred W4 scratch, while the BA projection
+uses the companion small-M GEMV adapter.
 """
 
 from __future__ import annotations
@@ -21,13 +21,17 @@ import torch
 from vllm import envs
 from vllm.logger import init_logger
 
-from .gdn import ordered_lowm, ordered_m16_deferred
+from .gdn import ordered_allm, ordered_m16_deferred
 
 logger = init_logger(__name__)
 
-LOW_ROWS = ordered_lowm.ROWS
-DEFERRED_ROW = 16
-ROWS = LOW_ROWS + (DEFERRED_ROW,)
+# The Mach source covers M24/M32 too, but the current FlashInfer build is
+# faster for those two shapes on the target RTX5090.  Keep the migrated path
+# on the measured winning side of the crossover; the kernel itself still
+# accepts M24/M32 for explicit direct experiments.
+HIGH_ROWS = tuple(range(40, 129, 8))
+DEFERRED_ROWS = HIGH_ROWS
+ROWS = DEFERRED_ROWS
 _STATS: Counter[str] = Counter()
 _ORIGINAL_CORE = None
 _ORIGINAL_BIND = None
@@ -101,42 +105,39 @@ def _warm_deferred(layer, state, scratch) -> None:
         return
 
     device = state.device
-    for rows in LOW_ROWS:
+    for rows in DEFERRED_ROWS:
+        qkv = torch.empty_strided(
+            (rows, ordered_m16_deferred.QKV),
+            (12288, 1),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        qkv.zero_()
+        a = torch.zeros(
+            (rows, ordered_m16_deferred.HV),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        b = torch.zeros_like(a)
+        out = torch.empty(
+            (rows, 1, ordered_m16_deferred.HV, ordered_m16_deferred.V),
+            dtype=torch.bfloat16,
+            device=device,
+        )
         indices = torch.zeros((rows,), dtype=torch.int32, device=device)
+        ordered_m16_deferred.reset_slots(state, indices, scratch)
+        ordered_allm.decode(
+            qkv,
+            a,
+            b,
+            layer.A_log,
+            layer.dt_bias,
+            state,
+            out,
+            indices,
+            scratch,
+        )
         ordered_m16_deferred.materialize_slots(state, indices, scratch)
-
-    qkv = torch.empty_strided(
-        (DEFERRED_ROW, ordered_m16_deferred.QKV),
-        (12288, 1),
-        dtype=torch.bfloat16,
-        device=device,
-    )
-    qkv.zero_()
-    a = torch.zeros(
-        (DEFERRED_ROW, ordered_m16_deferred.HV),
-        dtype=torch.bfloat16,
-        device=device,
-    )
-    b = torch.zeros_like(a)
-    out = torch.empty(
-        (DEFERRED_ROW, 1, ordered_m16_deferred.HV, ordered_m16_deferred.V),
-        dtype=torch.bfloat16,
-        device=device,
-    )
-    indices = torch.zeros((DEFERRED_ROW,), dtype=torch.int32, device=device)
-    ordered_m16_deferred.reset_slots(state, indices, scratch)
-    ordered_m16_deferred.decode(
-        qkv,
-        a,
-        b,
-        layer.A_log,
-        layer.dt_bias,
-        state,
-        out,
-        indices,
-        scratch,
-    )
-    ordered_m16_deferred.materialize_slots(state, indices, scratch)
     _DEFERRED_WARMED.add(signature)
 
 
@@ -217,9 +218,9 @@ def _target(layer, metadata: Any, mixed_qkv, b, a) -> bool:
     ):
         return False
     if (
-        tuple(mixed_qkv.shape) != (rows, ordered_lowm.QKV)
-        or tuple(b.shape) != (rows, ordered_lowm.HV)
-        or tuple(a.shape) != (rows, ordered_lowm.HV)
+        tuple(mixed_qkv.shape) != (rows, ordered_m16_deferred.QKV)
+        or tuple(b.shape) != (rows, ordered_m16_deferred.HV)
+        or tuple(a.shape) != (rows, ordered_m16_deferred.HV)
         or mixed_qkv.dtype != torch.bfloat16
         or b.dtype != torch.bfloat16
         or a.dtype != torch.bfloat16
@@ -231,16 +232,17 @@ def _target(layer, metadata: Any, mixed_qkv, b, a) -> bool:
     if not layer.kv_cache or len(layer.kv_cache) != 2:
         return False
     conv, state = layer.kv_cache
-    if rows == DEFERRED_ROW and _layer_scratch(layer) is None:
+    if rows in DEFERRED_ROWS and _layer_scratch(layer) is None:
         return False
     indices = metadata.non_spec_state_indices_tensor[:rows]
     return (
         conv.dtype == torch.bfloat16
         and state.dtype == torch.float32
-        and tuple(state.shape[1:]) == (ordered_lowm.HV, ordered_lowm.V, ordered_lowm.K)
+        and tuple(state.shape[1:])
+        == (ordered_m16_deferred.HV, ordered_m16_deferred.V, ordered_m16_deferred.K)
         and state.stride(-1) == 1
-        and state.stride(-2) == ordered_lowm.K
-        and state.stride(-3) == ordered_lowm.V * ordered_lowm.K
+        and state.stride(-2) == ordered_m16_deferred.K
+        and state.stride(-3) == ordered_m16_deferred.V * ordered_m16_deferred.K
         and indices.ndim == 1
         and indices.shape[0] == rows
         and indices.dtype in (torch.int32, torch.int64)
@@ -271,24 +273,9 @@ def _dispatch(layer, mixed_qkv, b, a, core_attn_out, metadata) -> None:
     )
     out = core_attn_out[: mixed_qkv.shape[0]].unsqueeze(1)
     scratch = _layer_scratch(layer)
-    if mixed_qkv.shape[0] == DEFERRED_ROW:
-        if scratch is None:
-            raise RuntimeError("M16 Ordered GDN scratch was not bound")
-        ordered_m16_deferred.decode(
-            mixed_qkv=mixed_qkv,
-            a=a,
-            b=b,
-            A_log=layer.A_log,
-            dt_bias=layer.dt_bias,
-            base=state,
-            out=out,
-            indices=indices,
-            scratch=scratch,
-            scale=layer.head_k_dim**-0.5,
-        )
-        return
-
-    ordered_lowm.decode(
+    if scratch is None:
+        raise RuntimeError("high-M Ordered GDN scratch was not bound")
+    ordered_allm.decode(
         mixed_qkv=mixed_qkv,
         a=a,
         b=b,
@@ -297,12 +284,13 @@ def _dispatch(layer, mixed_qkv, b, a, core_attn_out, metadata) -> None:
         base=state,
         out=out,
         indices=indices,
+        scratch=scratch,
         scale=layer.head_k_dim**-0.5,
     )
 
 
 def _materialize_fallback(layer, metadata: Any) -> None:
-    """Drain pending M16 terms before the stock path reads a state pool."""
+    """Drain pending deferred terms before stock GDN reads a state pool."""
 
     scratch = _layer_scratch(layer)
     if (
@@ -331,17 +319,17 @@ def _materialize_fallback(layer, metadata: Any) -> None:
 
 
 def before_model_run(model_runner, attn_metadata, batch_desc, dummy_run: bool) -> None:
-    """Materialize only when the scheduler changes away from physical M16.
+    """Materialize only when the scheduler changes away from deferred rows.
 
     This hook runs after GDN metadata is built but before a CUDA graph replay.
-    Keeping the transition materialize outside the M1/2/4/8 graphs avoids a
+    Keeping the transition materialize outside the ordered graphs avoids a
     per-layer scratch-check kernel on the common small-batch path.
     """
 
     if dummy_run:
         return
     if not isinstance(attn_metadata, dict):
-        model_runner._mach_ordered_gdn_last_m16 = False
+        model_runner._mach_ordered_gdn_last_deferred = False
         return
 
     metadata = next(
@@ -354,20 +342,20 @@ def before_model_run(model_runner, attn_metadata, batch_desc, dummy_run: bool) -
         None,
     )
     if metadata is None:
-        model_runner._mach_ordered_gdn_last_m16 = False
+        model_runner._mach_ordered_gdn_last_deferred = False
         return
 
     rows = int(getattr(batch_desc, "num_tokens", 0))
-    current_m16 = (
-        rows == DEFERRED_ROW
+    current_deferred = (
+        rows in DEFERRED_ROWS
         and metadata.spec_sequence_masks is None
         and metadata.num_spec_decodes == 0
         and metadata.num_prefills == 0
         and metadata.num_decodes > 0
         and metadata.num_actual_tokens == rows
     )
-    previous_m16 = getattr(model_runner, "_mach_ordered_gdn_last_m16", False)
-    if previous_m16 and not current_m16:
+    previous_deferred = getattr(model_runner, "_mach_ordered_gdn_last_deferred", False)
+    if previous_deferred and not current_deferred:
         for layer in list(_DEFERRED_LAYERS):
             if not getattr(layer, "_mach_ordered_gdn_deferred_seen", False):
                 continue
@@ -376,7 +364,7 @@ def before_model_run(model_runner, attn_metadata, batch_desc, dummy_run: bool) -
                 continue
             _materialize_fallback(layer, layer_metadata)
 
-    model_runner._mach_ordered_gdn_last_m16 = current_m16
+    model_runner._mach_ordered_gdn_last_deferred = current_deferred
 
 
 def _flatten_block_ids(blocks) -> list[int]:
@@ -494,7 +482,7 @@ def _install_core_hook() -> None:
             if not _STATS[key]:
                 logger.info("Ordered GDN selected at physical M%d", mixed_qkv.shape[0])
             _STATS[key] += 1
-            if mixed_qkv.shape[0] == DEFERRED_ROW:
+            if mixed_qkv.shape[0] in DEFERRED_ROWS:
                 self._mach_ordered_gdn_deferred_seen = True
             _dispatch(self, mixed_qkv, b, a, core_attn_out, metadata)
             return
@@ -543,40 +531,6 @@ def prepare(model) -> int:
     if device.type != "cuda" or torch.cuda.get_device_capability(device) != (12, 0):
         raise ValueError("Ordered GDN requires an SM120 CUDA device")
 
-    # Keep the real mixed-QKV row stride used by Qwen3.5's [q,k,v,z] split.
-    for rows in LOW_ROWS:
-        qkv = torch.empty_strided(
-            (rows, ordered_lowm.QKV),
-            (12288, 1),
-            dtype=torch.bfloat16,
-            device=device,
-        )
-        qkv.zero_()
-        a = torch.zeros((rows, ordered_lowm.HV), dtype=torch.bfloat16, device=device)
-        b = torch.zeros((rows, ordered_lowm.HV), dtype=torch.bfloat16, device=device)
-        state = torch.zeros(
-            (rows + 1, ordered_lowm.HV, ordered_lowm.V, ordered_lowm.K),
-            dtype=torch.float32,
-            device=device,
-        )
-        indices = torch.arange(1, rows + 1, dtype=torch.int32, device=device)
-        out = torch.empty(
-            (rows, 1, ordered_lowm.HV, ordered_lowm.V),
-            dtype=torch.bfloat16,
-            device=device,
-        )
-        ordered_lowm.decode(
-            qkv,
-            a,
-            b,
-            layers[0].A_log,
-            layers[0].dt_bias,
-            state,
-            out,
-            indices,
-        )
-
-    torch.accelerator.synchronize()
     _install_core_hook()
     _install_bind_hook()
     _install_runner_lifecycle()
@@ -585,10 +539,8 @@ def prepare(model) -> int:
     model._mach_ordered_gdn_prepared = True
     _STATS["prepared_layers"] = len(layers)
     logger.info(
-        "Prepared Ordered GDN for %d Qwen3.5-4B layers: full-store rows=%s, "
-        "deferred row=%d",
+        "Prepared Ordered GDN for %d Qwen3.5-4B layers: deferred rows=%s",
         len(layers),
-        LOW_ROWS,
-        DEFERRED_ROW,
+        DEFERRED_ROWS,
     )
     return len(layers)

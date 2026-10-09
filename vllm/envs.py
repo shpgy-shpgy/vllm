@@ -320,7 +320,7 @@ if TYPE_CHECKING:
     VLLM_QWEN3_5_FUSED_AR_NORM: bool = True
     VLLM_MACH_DENSE_AUTO: bool = True
     VLLM_QWEN3_5_FP16_SSM: bool = False
-    VLLM_MACH_GDN_ORDERED: bool = False
+    VLLM_MACH_GDN_ORDERED: bool = True
     VLLM_MACH_GDN_PERSISTENT: bool = False
     VLLM_MACH_GDN_REQUIRE_PRECOMPILED: bool = False
     VLLM_MACH_GDN_BA_OVERLAP: bool = False
@@ -2180,7 +2180,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     )
     == "1",
     "VLLM_MACH_DENSE_AUTO": lambda: os.getenv("VLLM_MACH_DENSE_AUTO", "1") == "1",
-    "VLLM_MACH_GDN_ORDERED": lambda: (os.getenv("VLLM_MACH_GDN_ORDERED", "0") == "1"),
+    # Default on for the model-gated Ordered GDN adapter.  The warmup layer
+    # only activates it for the validated Qwen3.5-4B SM120 geometry; an
+    # explicit VLLM_MACH_GDN_ORDERED=0 remains a hard opt-out.
+    "VLLM_MACH_GDN_ORDERED": lambda: (os.getenv("VLLM_MACH_GDN_ORDERED", "1") == "1"),
     "VLLM_MACH_GDN_PERSISTENT": lambda: (
         os.getenv("VLLM_MACH_GDN_PERSISTENT", mach_dense_default()) == "1"
     ),
@@ -2545,10 +2548,12 @@ def compile_factors() -> dict[str, object]:
         "VLLM_SM120_LOSSLESS_PREFILL",
         "VLLM_SM120_OWNER_PREFILL",
     }
-    # The BA adapter changes the model graph only when explicitly enabled;
-    # keeping its disabled value out of a cache key preserves the existing
-    # baseline key even when another Mach adapter is active.
-    if not environment_variables["VLLM_MXFP6_SM120_BA_GEMV"]():
+    # Ordered GDN enables the BA adapter as a companion; include the BA
+    # decision in that graph's cache factors while preserving the baseline key
+    # when neither adapter is active.
+    ba_gemv_enabled = environment_variables["VLLM_MXFP6_SM120_BA_GEMV"]()
+    ordered_gdn_enabled = environment_variables["VLLM_MACH_GDN_ORDERED"]()
+    if not ba_gemv_enabled and not ordered_gdn_enabled:
         ignored_factors.add("VLLM_MXFP6_SM120_BA_GEMV")
     if not any(
         environment_variables[name]() not in (False, "0") for name in mach_opt_in_flags
