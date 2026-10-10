@@ -178,13 +178,11 @@ def _fused_swiglu_down_impl(
     weight_scale: torch.Tensor,
 ) -> torch.Tensor:
     """Produce packed MXFP8 SwiGLU output and consume it in native W8A8 GEMM."""
-    import mxfp6
-
-    operand = mxfp6.silu_and_mul_mxfp8(gate_up)
+    input_mxfp8, input_scale = torch.ops.mxfp6.silu_and_mul_mxfp8(gate_up)
     return torch.ops.vllm.mxfp6_sm120_native_mxfp8_gemm_pdl(
-        operand.values.view(torch.float8_e4m3fn),
+        input_mxfp8.view(torch.float8_e4m3fn),
         weight,
-        operand.scales,
+        input_scale,
         weight_scale,
     )
 
