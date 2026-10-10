@@ -97,6 +97,25 @@ def _ordered_gdn_enabled(model, config) -> bool:
 
 def _prepare_mxfp8_sm120_adapters(model, config, ordered_gdn_enabled: bool) -> None:
     """Prepare the MXFP6/Ordered GDN adapters before profiling and capture."""
+    from .native import prepare_model as prepare_native_model
+
+    native_count = prepare_native_model(model, config)
+    if native_count:
+        init_logger(__name__).info(
+            "Warmed common native MXFP8 decode path for %d projections",
+            native_count,
+        )
+
+    if envs.VLLM_MXFP6_SM120_MXFP8_DUAL:
+        from .dual import prepare_model as prepare_dual_model
+
+        gateup_count, qkvz_count = prepare_dual_model(model, config)
+        init_logger(__name__).info(
+            "Warmed dual MXFP8 dispatch for %d gate/up and %d QKVZ projections",
+            gateup_count,
+            qkvz_count,
+        )
+
     linear_backend = getattr(config.kernel_config, "linear_backend", None)
     if linear_backend in ("mxfp6_sm120", "mxfp6-sm120"):
         from vllm.model_executor.kernels.linear.mxfp8.mxfp6_sm120 import (

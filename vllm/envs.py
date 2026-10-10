@@ -286,6 +286,8 @@ if TYPE_CHECKING:
     VLLM_ALLREDUCE_USE_FLASHINFER: bool | None = None
     VLLM_MXFP6_SM120_QWEN35_FASTPATH: bool = True
     VLLM_MXFP6_SM120_BA_GEMV: bool = False
+    VLLM_MXFP6_SM120_MXFP8_NATIVE: bool = True
+    VLLM_MXFP6_SM120_MXFP8_DUAL: bool = False
     VLLM_TUNED_CONFIG_FOLDER: str | None = None
     VLLM_ENABLE_STARTUP_PLAN: bool = False
     VLLM_GPT_OSS_SYSTEM_TOOL_MCP_LABELS: set[str] = set()
@@ -2000,6 +2002,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_MXFP6_SM120_BA_GEMV": lambda: os.getenv("VLLM_MXFP6_SM120_BA_GEMV", "0")
     == "1",
+    # Use the native SM120 MXFP8 kernel for the validated Qwen3.5-4B
+    # decode-sized public path. Set to 0 to retain the FlashInfer-only path.
+    "VLLM_MXFP6_SM120_MXFP8_NATIVE": lambda: os.getenv(
+        "VLLM_MXFP6_SM120_MXFP8_NATIVE", "1"
+    )
+    == "1",
+    # Opt-in: use the validated small-M dual-limb MXFP8 activation path for
+    # Qwen3.5-4B on SM120. The original mxfp6 0.2.1 wheel does not expose
+    # the required dual_gemm_out operator.
+    "VLLM_MXFP6_SM120_MXFP8_DUAL": lambda: os.getenv(
+        "VLLM_MXFP6_SM120_MXFP8_DUAL", "0"
+    )
+    == "1",
     # Experimental: use this to enable MCP tool calling for non harmony models
     "VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT": lambda: bool(
         int(os.getenv("VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT", "0"))
@@ -2545,6 +2560,8 @@ def compile_factors() -> dict[str, object]:
         "VLLM_MACH_FUSED_AR_QUANT",
         "VLLM_MACH_MOE_PROJECTION_TUNING",
         "VLLM_MXFP6_SM120_BA_GEMV",
+        "VLLM_MXFP6_SM120_MXFP8_NATIVE",
+        "VLLM_MXFP6_SM120_MXFP8_DUAL",
         "VLLM_SM120_LOSSLESS_PREFILL",
         "VLLM_SM120_OWNER_PREFILL",
     }
