@@ -29,6 +29,16 @@ _MODEL_INTERMEDIATE_SIZE = 9216
 _NATIVE_MIN_M = 4
 _NATIVE_MAX_M = 64
 
+# The SM120 native kernel is not uniformly best across the four projection
+# shapes.  In particular, the QKVZ/GateUp tile selected for M=32 loses to the
+# tuned FlashInfer B12x decode kernel, while the same native path remains the
+# better choice for the other capture sizes.  Keep this policy inside the
+# opaque dispatcher so M stays runtime-dynamic to TorchInductor/CUDA Graphs.
+_FLASHINFER_M_BY_SHAPE = {
+    (12_288, 2_560): frozenset({32}),  # QKVZ
+    (18_432, 2_560): frozenset({32}),  # GateUp
+}
+
 _INSTALLED = False
 _OP_REGISTERED = False
 _ORIGINAL_APPLY: Any = None
@@ -93,10 +103,11 @@ def _eligible_layer(layer: torch.nn.Module) -> bool:
     )
 
 
-def _use_native_shape(m: int, k: int) -> bool:
-    """Return the measured common decode policy for a projection shape."""
-    del k
-    return _NATIVE_MIN_M <= m <= _NATIVE_MAX_M
+def _use_native_shape(m: int, n: int, k: int) -> bool:
+    """Return the measured native policy for one projection shape."""
+    if not _NATIVE_MIN_M <= m <= _NATIVE_MAX_M:
+        return False
+    return m not in _FLASHINFER_M_BY_SHAPE.get((n, k), ())
 
 
 def _public_native_impl(
@@ -123,8 +134,8 @@ def _public_native_impl(
         input_, is_sf_swizzled_layout=True
     )
     m = int(input_.shape[0])
-    if _use_native_shape(m, int(weight.shape[1])):
-        return torch.ops.vllm.mxfp6_sm120_native_mxfp8_gemm(
+    if _use_native_shape(m, int(weight.shape[0]), int(weight.shape[1])):
+        return torch.ops.vllm.mxfp6_sm120_native_mxfp8_gemm_pdl(
             input_mxfp8,
             weight,
             input_scale,
@@ -257,6 +268,8 @@ def _warmup_sizes(config) -> tuple[int, ...]:
 def _warmup_small_workspaces(
     model: torch.nn.Module,
     sizes: tuple[int, ...],
+    *,
+    use_pdl: bool = False,
 ) -> int:
     """Warm native workspaces below the legacy helper's M>=17 cutoff."""
     from vllm.model_executor.kernels.linear.mxfp8.mxfp6_sm120 import (
@@ -287,23 +300,23 @@ def _warmup_small_workspaces(
 
     load_mxfp6_sm120_mxfp8_libraries()
     launches = 0
-    for (device_index, _, k), (weight, weight_scale) in shapes.items():
+    for (device_index, n, k), (weight, weight_scale) in shapes.items():
         device = torch.device("cuda", device_index)
         for m in small_sizes:
             # M<4 is intentionally not in the native policy; the capture
             # list may still contain it for the original FlashInfer path.
-            if not _use_native_shape(m, k):
+            if not _use_native_shape(m, n, k):
                 continue
             input_ = torch.zeros((m, k), device=device, dtype=torch.bfloat16)
             input_mxfp8, input_scale = mxfp8_e4m3_quantize(
                 input_, is_sf_swizzled_layout=True
             )
-            torch.ops.vllm.mxfp6_sm120_native_mxfp8_gemm(
-                input_mxfp8,
-                weight,
-                input_scale,
-                weight_scale,
+            op = (
+                torch.ops.vllm.mxfp6_sm120_native_mxfp8_gemm_pdl
+                if use_pdl
+                else torch.ops.vllm.mxfp6_sm120_native_mxfp8_gemm
             )
+            op(input_mxfp8, weight, input_scale, weight_scale)
             launches += 1
 
     for device_index, _, _ in shapes:
@@ -341,8 +354,10 @@ def prepare_model(model: torch.nn.Module, config) -> int:
 
     sizes = _warmup_sizes(config)
     with torch.inference_mode():
-        launches = warmup_mxfp6_sm120_mxfp8_workspaces(model, sizes)
-        launches += _warmup_small_workspaces(model, sizes)
+        launches = warmup_mxfp6_sm120_mxfp8_workspaces(
+            model, sizes, use_pdl=True
+        )
+        launches += _warmup_small_workspaces(model, sizes, use_pdl=True)
 
     model._mxfp6_sm120_public_native_prepared = True
     model._mxfp6_sm120_public_native_count = count

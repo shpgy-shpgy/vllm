@@ -15,6 +15,7 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     MXFP8_BLOCK_SIZE,
     MXFP8_SCALE_DTYPE,
     MXFP8_VALUE_DTYPE,
+    mxfp8_e4m3_quantize,
     swizzle_mxfp8_scale,
 )
 from vllm.platforms import current_platform
@@ -40,7 +41,8 @@ class _WorkspaceEntry:
 
 _NATIVE_LOCK = threading.RLock()
 _NATIVE_WORKSPACES: dict[
-    tuple[int, int, int, int, int, tuple[int, int, int, int]], _WorkspaceEntry
+    tuple[int, int, int, int, int, bool, tuple[int, int, int, int]],
+    _WorkspaceEntry,
 ] = {}
 _NATIVE_COUNTS: Counter[str] = Counter()
 
@@ -90,13 +92,19 @@ def load_mxfp6_sm120_mxfp8_libraries() -> None:
         raise RuntimeError(
             f"unexpected mxfp8_sm120::allocate_workspace schema: {workspace_schema}"
         )
+    if "bool use_pdl" not in gemm_schema:
+        raise RuntimeError(
+            f"mxfp8_sm120::gemm does not expose PDL: {gemm_schema}"
+        )
 
 
-def _native_gemm_impl(
+def _native_gemm_impl_with_options(
     activation: torch.Tensor,
     weight: torch.Tensor,
     activation_scale: torch.Tensor,
     weight_scale: torch.Tensor,
+    *,
+    use_pdl: bool,
 ) -> torch.Tensor:
     """Launch the prequantized native GEMM through an opaque vLLM op.
 
@@ -111,7 +119,15 @@ def _native_gemm_impl(
     if device_index is None:
         device_index = torch.accelerator.current_device_index()
     stream = torch.cuda.current_stream(device_index)
-    key = (device_index, int(stream.cuda_stream), m, n, k, _MXFP8_NATIVE_CONFIG)
+    key = (
+        device_index,
+        int(stream.cuda_stream),
+        m,
+        n,
+        k,
+        use_pdl,
+        _MXFP8_NATIVE_CONFIG,
+    )
     capturing = torch.cuda.is_current_stream_capturing()
 
     with _NATIVE_LOCK:
@@ -155,6 +171,7 @@ def _native_gemm_impl(
         output,
         entry.workspace,
         *_MXFP8_NATIVE_CONFIG,
+        use_pdl,
     )
     with _NATIVE_LOCK:
         _NATIVE_COUNTS["native_calls"] += 1
@@ -162,6 +179,36 @@ def _native_gemm_impl(
             "native_capture_calls" if capturing else "native_eager_calls"
         ] += 1
     return output
+
+
+def _native_gemm_impl(
+    activation: torch.Tensor,
+    weight: torch.Tensor,
+    activation_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+) -> torch.Tensor:
+    return _native_gemm_impl_with_options(
+        activation,
+        weight,
+        activation_scale,
+        weight_scale,
+        use_pdl=False,
+    )
+
+
+def _native_gemm_pdl_impl(
+    activation: torch.Tensor,
+    weight: torch.Tensor,
+    activation_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+) -> torch.Tensor:
+    return _native_gemm_impl_with_options(
+        activation,
+        weight,
+        activation_scale,
+        weight_scale,
+        use_pdl=True,
+    )
 
 
 def _native_gemm_fake(
@@ -237,6 +284,13 @@ direct_register_custom_op(
 )
 
 direct_register_custom_op(
+    op_name="mxfp6_sm120_native_mxfp8_gemm_pdl",
+    op_func=_native_gemm_pdl_impl,
+    mutates_args=[],
+    fake_impl=_native_gemm_fake,
+)
+
+direct_register_custom_op(
     op_name="mxfp6_sm120_mxfp8_gemm",
     op_func=_mxfp6_sm120_mxfp8_gemm_impl,
     mutates_args=[],
@@ -247,6 +301,8 @@ direct_register_custom_op(
 def warmup_mxfp6_sm120_mxfp8_workspaces(
     model: torch.nn.Module,
     sizes: tuple[int, ...] | list[int] | None = None,
+    *,
+    use_pdl: bool = False,
 ) -> int:
     """Pre-allocate and first-launch native workspaces for model GEMM shapes.
 
@@ -291,7 +347,20 @@ def warmup_mxfp6_sm120_mxfp8_workspaces(
             input_ = torch.zeros(
                 (m, k), device=torch.device("cuda", device_index), dtype=torch.bfloat16
             )
-            torch.ops.vllm.mxfp6_sm120_mxfp8_gemm(input_, weight, weight_scale)
+            if use_pdl:
+                input_mxfp8, input_scale = mxfp8_e4m3_quantize(
+                    input_, is_sf_swizzled_layout=True
+                )
+                torch.ops.vllm.mxfp6_sm120_native_mxfp8_gemm_pdl(
+                    input_mxfp8,
+                    weight,
+                    input_scale,
+                    weight_scale,
+                )
+            else:
+                torch.ops.vllm.mxfp6_sm120_mxfp8_gemm(
+                    input_, weight, weight_scale
+                )
             launches += 1
     for device_index, _, _ in by_shape:
         torch.accelerator.synchronize(device_index)
@@ -308,7 +377,8 @@ def native_mxfp8_workspace_stats() -> dict[str, object]:
                 "m": key[2],
                 "n": key[3],
                 "k": key[4],
-                "config": key[5],
+                "use_pdl": key[5],
+                "config": key[6],
                 "workspace_bytes": 0
                 if entry.workspace is None
                 else entry.workspace.numel() * entry.workspace.element_size(),
