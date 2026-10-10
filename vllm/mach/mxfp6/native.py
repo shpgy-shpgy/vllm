@@ -12,6 +12,7 @@ model/shape range.
 
 from __future__ import annotations
 
+import types
 from functools import wraps
 from typing import Any
 
@@ -28,6 +29,8 @@ _MODEL_HIDDEN_SIZE = 2560
 _MODEL_INTERMEDIATE_SIZE = 9216
 _NATIVE_MIN_M = 4
 _NATIVE_MAX_M = 64
+_FUSED_SWIGLU_MIN_M = 1
+_FUSED_SWIGLU_MAX_M = 64
 
 # The SM120 native kernel is not uniformly best across the four projection
 # shapes.  In particular, the QKVZ/GateUp tile selected for M=32 loses to the
@@ -41,6 +44,7 @@ _FLASHINFER_M_BY_SHAPE = {
 
 _INSTALLED = False
 _OP_REGISTERED = False
+_FUSED_SWIGLU_OP_REGISTERED = False
 _ORIGINAL_APPLY: Any = None
 
 
@@ -166,6 +170,189 @@ def _public_native_fake(
         device=input_.device,
         dtype=torch.bfloat16,
     )
+
+
+def _fused_swiglu_down_impl(
+    gate_up: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+) -> torch.Tensor:
+    """Produce packed MXFP8 SwiGLU output and consume it in native W8A8 GEMM."""
+    import mxfp6
+
+    operand = mxfp6.silu_and_mul_mxfp8(gate_up)
+    return torch.ops.vllm.mxfp6_sm120_native_mxfp8_gemm_pdl(
+        operand.values.view(torch.float8_e4m3fn),
+        weight,
+        operand.scales,
+        weight_scale,
+    )
+
+
+def _fused_swiglu_down_fake(
+    gate_up: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+) -> torch.Tensor:
+    del weight_scale
+    return torch.empty(
+        (gate_up.shape[0], weight.shape[0]),
+        device=gate_up.device,
+        dtype=torch.bfloat16,
+    )
+
+
+def _register_fused_swiglu_op() -> None:
+    global _FUSED_SWIGLU_OP_REGISTERED
+    if _FUSED_SWIGLU_OP_REGISTERED:
+        return
+    direct_register_custom_op(
+        op_name="mxfp6_sm120_fused_swiglu_mxfp8_down",
+        op_func=_fused_swiglu_down_impl,
+        mutates_args=[],
+        fake_impl=_fused_swiglu_down_fake,
+    )
+    _FUSED_SWIGLU_OP_REGISTERED = True
+
+
+def _fused_swiglu_mlp_eligible(module: torch.nn.Module) -> bool:
+    """Match only the TP1 dense Qwen3.5 MXFP8 MLP geometry."""
+    from vllm.model_executor.layers.activation import SiluAndMul
+    from vllm.model_executor.layers.linear import (
+        MergedColumnParallelLinear,
+        RowParallelLinear,
+    )
+    from vllm.model_executor.models.qwen2_moe import Qwen2MoeMLP
+
+    if type(module) is not Qwen2MoeMLP or module.expert_gate is not None:
+        return False
+    if type(module.act_fn) is not SiluAndMul:
+        return False
+    up, down = module.gate_up_proj, module.down_proj
+    if (
+        type(up) is not MergedColumnParallelLinear
+        or type(down) is not RowParallelLinear
+    ):
+        return False
+    if (
+        up.tp_size != down.tp_size
+        or up.tp_size != 1
+        or not down.input_is_parallel
+        or up.bias is not None
+        or down.bias is not None
+    ):
+        return False
+    if tuple(up.weight.shape) != (_MODEL_INTERMEDIATE_SIZE * 2, _MODEL_HIDDEN_SIZE):
+        return False
+    if tuple(down.weight.shape) != (_MODEL_HIDDEN_SIZE, _MODEL_INTERMEDIATE_SIZE):
+        return False
+    return all(
+        isinstance(
+            getattr(layer, "mxfp6_sm120_mxfp8_weight_values", None), torch.Tensor
+        )
+        and isinstance(
+            getattr(layer, "mxfp6_sm120_mxfp8_weight_scales", None), torch.Tensor
+        )
+        for layer in (up, down)
+    )
+
+
+def _tag_fused_swiglu_mlps(model: torch.nn.Module) -> int:
+    """Replace eligible dense MLP forwards with the fused producer consumer."""
+    count = 0
+    for module in model.modules():
+        if getattr(module, "_mxfp6_sm120_fused_swiglu_prepared", False):
+            continue
+        if not _fused_swiglu_mlp_eligible(module):
+            continue
+
+        original = module.forward
+
+        def forward(this, x, _original=original):
+            if (
+                x.ndim != 2
+                or not _FUSED_SWIGLU_MIN_M <= x.shape[0] <= _FUSED_SWIGLU_MAX_M
+                or x.dtype != torch.bfloat16
+                or not x.is_cuda
+            ):
+                return _original(x)
+            gate_up, _ = this.gate_up_proj(x)
+            down = this.down_proj
+            return torch.ops.vllm.mxfp6_sm120_fused_swiglu_mxfp8_down(
+                gate_up,
+                down.mxfp6_sm120_mxfp8_weight_values,
+                down.mxfp6_sm120_mxfp8_weight_scales,
+            )
+
+        module.forward = types.MethodType(forward, module)
+        module._mxfp6_sm120_fused_swiglu_prepared = True
+        count += 1
+    return count
+
+
+def _fused_swiglu_warmup_sizes(config) -> tuple[int, ...]:
+    sizes = {
+        1,
+        2,
+        3,
+        4,
+        8,
+        10,
+        12,
+        14,
+        16,
+        20,
+        24,
+        28,
+        32,
+        36,
+        40,
+        48,
+        56,
+        64,
+    }
+    capture_sizes = getattr(config.compilation_config, "cudagraph_capture_sizes", None)
+    if capture_sizes:
+        sizes.update(
+            int(size)
+            for size in capture_sizes
+            if _FUSED_SWIGLU_MIN_M <= int(size) <= _FUSED_SWIGLU_MAX_M
+        )
+    return tuple(sorted(sizes))
+
+
+def _warmup_fused_swiglu_workspaces(
+    model: torch.nn.Module, sizes: tuple[int, ...]
+) -> int:
+    shapes: dict[tuple[int, int, int], tuple[torch.Tensor, torch.Tensor]] = {}
+    for module in model.modules():
+        if not getattr(module, "_mxfp6_sm120_fused_swiglu_prepared", False):
+            continue
+        down = module.down_proj
+        weight = down.mxfp6_sm120_mxfp8_weight_values
+        weight_scale = down.mxfp6_sm120_mxfp8_weight_scales
+        device_index = weight.device.index
+        if device_index is None:
+            device_index = torch.accelerator.current_device_index()
+        shapes.setdefault(
+            (device_index, int(weight.shape[0]), int(weight.shape[1])),
+            (weight, weight_scale),
+        )
+
+    launches = 0
+    for (device_index, n, k), (weight, weight_scale) in shapes.items():
+        device = torch.device("cuda", device_index)
+        for m in sizes:
+            gate_up = torch.zeros(
+                (m, 2 * k), device=device, dtype=torch.bfloat16
+            )
+            torch.ops.vllm.mxfp6_sm120_fused_swiglu_mxfp8_down(
+                gate_up, weight, weight_scale
+            )
+            launches += 1
+    for device_index, _, _ in shapes:
+        torch.accelerator.synchronize(device_index)
+    return launches
 
 
 def _register_op() -> None:
@@ -352,23 +539,36 @@ def prepare_model(model: torch.nn.Module, config) -> int:
         model._mxfp6_sm120_public_native_count = 0
         return 0
 
+    fused_swiglu_count = 0
+    fused_swiglu_launches = 0
+    if hasattr(torch.ops.mxfp6, "silu_and_mul_mxfp8"):
+        _register_fused_swiglu_op()
+        fused_swiglu_count = _tag_fused_swiglu_mlps(model)
+
     sizes = _warmup_sizes(config)
     with torch.inference_mode():
         launches = warmup_mxfp6_sm120_mxfp8_workspaces(
             model, sizes, use_pdl=True
         )
         launches += _warmup_small_workspaces(model, sizes, use_pdl=True)
+        if fused_swiglu_count:
+            fused_swiglu_launches = _warmup_fused_swiglu_workspaces(
+                model, _fused_swiglu_warmup_sizes(config)
+            )
 
     model._mxfp6_sm120_public_native_prepared = True
     model._mxfp6_sm120_public_native_count = count
     logger.info(
         "Enabled common native MXFP8 decode for %d FlashInfer projections "
-        "at M=%d..%d; warmed %d workspace launches for M=%s",
+        "at M=%d..%d; warmed %d workspace launches for M=%s; "
+        "fused SwiGLU/down MLPs=%d, fused warmup launches=%d",
         count,
         _NATIVE_MIN_M,
         _NATIVE_MAX_M,
         launches,
         sizes,
+        fused_swiglu_count,
+        fused_swiglu_launches,
     )
     return count
 
