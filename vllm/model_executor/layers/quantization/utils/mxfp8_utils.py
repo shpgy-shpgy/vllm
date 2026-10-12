@@ -3,6 +3,7 @@
 
 import torch
 
+from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
 
 # MXFP8 constants
@@ -390,11 +391,15 @@ def _build_fused_mxfp8_quant_kernels():
         epsilon,
         GROUPS_PER_ROW: tl.constexpr,
         BLOCK_K: tl.constexpr,
+        launch_pdl: tl.constexpr,
     ):
         row_id = tl.program_id(0).to(tl.int64)
         columns = tl.arange(0, BLOCK_K)
         column_mask = columns < K
         offsets = row_id * K + columns
+
+        if launch_pdl:
+            tl.extra.cuda.gdc_wait()
 
         values = tl.load(input_ptr + offsets, mask=column_mask, other=0.0).to(
             tl.float32
@@ -445,6 +450,9 @@ def _build_fused_mxfp8_quant_kernels():
             scale.to(tl.uint8),
             mask=group_ids < GROUPS_PER_ROW,
         )
+
+        if launch_pdl:
+            tl.extra.cuda.gdc_launch_dependents()
 
     return _silu_and_mul_quant_kernel, _fused_add_rms_norm_quant_kernel
 
@@ -564,6 +572,7 @@ def _fused_add_rms_norm_mxfp8_quant_impl(
         GROUPS_PER_ROW=hidden_size // MXFP8_BLOCK_SIZE,
         BLOCK_K=block_k,
         num_warps=num_warps,
+        launch_pdl=current_platform.is_arch_support_pdl(),
     )
     return output, scales, residual_output
 

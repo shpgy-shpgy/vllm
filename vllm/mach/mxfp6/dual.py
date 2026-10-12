@@ -42,6 +42,12 @@ _SMALL_CAPTURE_M = frozenset(
 )
 _GATEUP_M = _SMALL_CAPTURE_M
 _QKVZ_M = _SMALL_CAPTURE_M
+# The dual producer and both-limb consumer are PDL-capable only for the
+# shape-gated capture bins below.  Keeping this separate from the eligibility
+# sets makes it possible to tune producer/consumer overlap without widening
+# the dual numerical migration itself.
+_GATEUP_PDL_M = _GATEUP_M
+_QKVZ_PDL_M = _QKVZ_M
 
 _OP_REGISTERED = False
 _INSTALLED = False
@@ -144,7 +150,12 @@ def _dual_gemm_impl(
         )
 
     dual = _load_dual_api()
-    high, high_scale, residual, residual_scale = dual.quantize(x)
+    use_pdl = (n == _GATEUP_N and m in _GATEUP_PDL_M) or (
+        n == _QKVZ_N and m in _QKVZ_PDL_M
+    )
+    high, high_scale, residual, residual_scale = dual.quantize(
+        x, use_pdl=use_pdl
+    )
     output = torch.empty(
         (x.shape[0], weight.shape[0]), device=x.device, dtype=torch.bfloat16
     )
@@ -156,7 +167,7 @@ def _dual_gemm_impl(
         residual,
         residual_scale,
         output,
-        use_pdl=False,
+        use_pdl=use_pdl,
     )
     return output
 

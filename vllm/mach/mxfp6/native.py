@@ -31,6 +31,8 @@ _NATIVE_MIN_M = 4
 _NATIVE_MAX_M = 64
 _FUSED_SWIGLU_MIN_M = 1
 _FUSED_SWIGLU_MAX_M = 64
+_FUSED_NORM_GEMM_MIN_M = _NATIVE_MIN_M
+_FUSED_NORM_GEMM_MAX_M = _NATIVE_MAX_M
 
 # The SM120 native kernel is not uniformly best across the four projection
 # shapes.  In particular, the QKVZ/GateUp tile selected for M=32 loses to the
@@ -45,6 +47,7 @@ _FLASHINFER_M_BY_SHAPE = {
 _INSTALLED = False
 _OP_REGISTERED = False
 _FUSED_SWIGLU_OP_REGISTERED = False
+_FUSED_NORM_GEMM_OP_REGISTERED = False
 _ORIGINAL_APPLY: Any = None
 
 
@@ -114,6 +117,19 @@ def _use_native_shape(m: int, n: int, k: int) -> bool:
     return m not in _FLASHINFER_M_BY_SHAPE.get((n, k), ())
 
 
+def _native_mxfp8_quantize_pdl(
+    input_: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize through the PDL-capable native producer.
+
+    The native MXFP8 extension returns the byte storage as ``uint8``.  The
+    GEMM consumes the same storage as FP8, so the view is metadata-only and
+    does not add a conversion or launch between producer and consumer.
+    """
+    values, scales = torch.ops.mxfp6.quantize_mxfp8_pdl(input_)
+    return values.view(torch.float8_e4m3fn), scales
+
+
 def _public_native_impl(
     input_: torch.Tensor,
     weight: torch.Tensor,
@@ -130,15 +146,10 @@ def _public_native_impl(
     if not input_.is_contiguous():
         input_ = input_.contiguous()
 
-    from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
-        mxfp8_e4m3_quantize,
-    )
-
-    input_mxfp8, input_scale = mxfp8_e4m3_quantize(
-        input_, is_sf_swizzled_layout=True
-    )
     m = int(input_.shape[0])
-    if _use_native_shape(m, int(weight.shape[0]), int(weight.shape[1])):
+    n, k = (int(value) for value in weight.shape)
+    if _use_native_shape(m, n, k):
+        input_mxfp8, input_scale = _native_mxfp8_quantize_pdl(input_)
         return torch.ops.vllm.mxfp6_sm120_native_mxfp8_gemm_pdl(
             input_mxfp8,
             weight,
@@ -146,6 +157,13 @@ def _public_native_impl(
             weight_scale,
         )
 
+    from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+        mxfp8_e4m3_quantize,
+    )
+
+    input_mxfp8, input_scale = mxfp8_e4m3_quantize(
+        input_, is_sf_swizzled_layout=True
+    )
     from vllm.utils import flashinfer as vllm_flashinfer
 
     return vllm_flashinfer.mm_mxfp8(
@@ -172,13 +190,86 @@ def _public_native_fake(
     )
 
 
+def _fused_add_gemma_rms_norm_native_gemm_impl(
+    input_: torch.Tensor,
+    residual: torch.Tensor,
+    norm_weight: torch.Tensor,
+    epsilon: float,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fuse Gemma residual RMSNorm, MXFP8 quantization and native GEMM.
+
+    ``fused_add_rms_norm_mxfp8_quant`` already uses one Triton kernel for the
+    residual add, Gemma RMSNorm and MXFP8 conversion.  Keeping that producer
+    and the SM120 GEMM behind this single opaque op prevents Dynamo/Inductor
+    from materializing the intermediate BF16 normalized tensor and keeps the
+    native GEMM workspace management outside the compiled graph.
+    """
+    if input_.ndim != 2 or residual.ndim != 2:
+        raise ValueError("Mach fused norm/GEMM requires 2D input tensors")
+    if not input_.is_contiguous():
+        input_ = input_.contiguous()
+    if not residual.is_contiguous():
+        residual = residual.contiguous()
+    if not norm_weight.is_contiguous():
+        norm_weight = norm_weight.contiguous()
+
+    from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+        fused_add_rms_norm_mxfp8_quant,
+    )
+
+    input_mxfp8, input_scale, residual_output = fused_add_rms_norm_mxfp8_quant(
+        input_, residual, norm_weight, epsilon
+    )
+    output = torch.ops.vllm.mxfp6_sm120_native_mxfp8_gemm_pdl(
+        input_mxfp8,
+        weight,
+        input_scale,
+        weight_scale,
+    )
+    return output, residual_output
+
+
+def _fused_add_gemma_rms_norm_native_gemm_fake(
+    input_: torch.Tensor,
+    residual: torch.Tensor,
+    norm_weight: torch.Tensor,
+    epsilon: float,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    del norm_weight, epsilon, weight_scale
+    return (
+        torch.empty(
+            (input_.shape[0], weight.shape[0]),
+            device=input_.device,
+            dtype=torch.bfloat16,
+        ),
+        torch.empty_like(residual),
+    )
+
+
+def _register_fused_norm_gemm_op() -> None:
+    global _FUSED_NORM_GEMM_OP_REGISTERED
+    if _FUSED_NORM_GEMM_OP_REGISTERED:
+        return
+    direct_register_custom_op(
+        op_name="mxfp6_sm120_fused_add_gemma_rms_norm_mxfp8_gemm",
+        op_func=_fused_add_gemma_rms_norm_native_gemm_impl,
+        mutates_args=[],
+        fake_impl=_fused_add_gemma_rms_norm_native_gemm_fake,
+    )
+    _FUSED_NORM_GEMM_OP_REGISTERED = True
+
+
 def _fused_swiglu_down_impl(
     gate_up: torch.Tensor,
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
 ) -> torch.Tensor:
     """Produce packed MXFP8 SwiGLU output and consume it in native W8A8 GEMM."""
-    input_mxfp8, input_scale = torch.ops.mxfp6.silu_and_mul_mxfp8(gate_up)
+    input_mxfp8, input_scale = torch.ops.mxfp6.silu_and_mul_mxfp8_pdl(gate_up)
     return torch.ops.vllm.mxfp6_sm120_native_mxfp8_gemm_pdl(
         input_mxfp8.view(torch.float8_e4m3fn),
         weight,
@@ -288,6 +379,131 @@ def _tag_fused_swiglu_mlps(model: torch.nn.Module) -> int:
     return count
 
 
+def _fused_norm_mlp_eligible(module: torch.nn.Module) -> bool:
+    """Match the TP1 Qwen3.5 dense post-attention norm -> GateUp path."""
+    if type(module).__name__ != "Qwen3_5DecoderLayer":
+        return False
+    if getattr(module, "layer_type", None) not in (
+        "linear_attention",
+        "full_attention",
+    ):
+        return False
+    if getattr(module, "use_attn_reduce_scatter_for_moe", False):
+        return False
+    if getattr(module, "layer_scale", False):
+        return False
+
+    mlp = getattr(module, "mlp", None)
+    if mlp is None or not getattr(
+        mlp, "_mxfp6_sm120_fused_swiglu_prepared", False
+    ):
+        return False
+    norm = getattr(module, "post_attention_layernorm", None)
+    if type(norm).__name__ != "GemmaRMSNorm":
+        return False
+
+    gate_up = getattr(mlp, "gate_up_proj", None)
+    weight = getattr(gate_up, "mxfp6_sm120_mxfp8_weight_values", None)
+    weight_scale = getattr(gate_up, "mxfp6_sm120_mxfp8_weight_scales", None)
+    return bool(
+        getattr(gate_up, "_mxfp6_sm120_public_native", False)
+        and isinstance(weight, torch.Tensor)
+        and isinstance(weight_scale, torch.Tensor)
+        and tuple(weight.shape) == (_MODEL_INTERMEDIATE_SIZE * 2, _MODEL_HIDDEN_SIZE)
+        and weight.dtype == torch.float8_e4m3fn
+        and weight_scale.dtype == torch.uint8
+    )
+
+
+def _tag_fused_norm_mlps(model: torch.nn.Module) -> int:
+    """Attach the fused post-attention norm/GateUp layer adapter."""
+    count = 0
+    for module in model.modules():
+        if getattr(module, "_mxfp6_sm120_fused_norm_mlp_prepared", False):
+            continue
+        if not _fused_norm_mlp_eligible(module):
+            continue
+
+        norm = module.post_attention_layernorm
+        # GemmaRMSNorm stores gamma-1.  Keep the actual gamma as an inference
+        # tensor so every replay avoids a small weight conversion/allocation.
+        norm._mxfp6_sm120_gemma_weight = (
+            norm.weight.detach().float().add(1.0).contiguous()
+        )
+        original = module.forward
+
+        def forward(
+            this,
+            hidden_states,
+            residual,
+            positions,
+            _original=original,
+            **kwargs,
+        ):
+            if (
+                hidden_states.ndim != 2
+                or residual is None
+                or residual.ndim != 2
+                or hidden_states.dtype != torch.bfloat16
+                or not hidden_states.is_cuda
+                or not (
+                    _FUSED_NORM_GEMM_MIN_M
+                    <= hidden_states.shape[0]
+                    <= _FUSED_NORM_GEMM_MAX_M
+                )
+            ):
+                return _original(hidden_states, residual, positions, **kwargs)
+
+            gate_up = this.mlp.gate_up_proj
+            gate_up_weight = gate_up.mxfp6_sm120_mxfp8_weight_values
+            if not _use_native_shape(
+                int(hidden_states.shape[0]),
+                int(gate_up_weight.shape[0]),
+                int(gate_up_weight.shape[1]),
+            ):
+                return _original(hidden_states, residual, positions, **kwargs)
+
+            # Keep the upstream Qwen3-Next layer ordering.  This adapter is
+            # only admitted for the TP1 dense/no-layer-scale profile above.
+            hidden_states, residual = this.input_layernorm(
+                hidden_states, residual
+            )
+
+            if this.layer_type == "linear_attention":
+                hidden_states = this.linear_attn(hidden_states=hidden_states)
+            elif this.layer_type == "full_attention":
+                hidden_states = this.self_attn(
+                    hidden_states=hidden_states,
+                    positions=positions,
+                )
+            else:
+                raise ValueError("Invalid layer_type")
+
+            hidden_states, residual = (
+                torch.ops.vllm.mxfp6_sm120_fused_add_gemma_rms_norm_mxfp8_gemm(
+                    hidden_states,
+                    residual,
+                    this.post_attention_layernorm._mxfp6_sm120_gemma_weight,
+                    this.post_attention_layernorm.variance_epsilon,
+                    gate_up_weight,
+                    gate_up.mxfp6_sm120_mxfp8_weight_scales,
+                )
+            )
+
+            down = this.mlp.down_proj
+            hidden_states = torch.ops.vllm.mxfp6_sm120_fused_swiglu_mxfp8_down(
+                hidden_states,
+                down.mxfp6_sm120_mxfp8_weight_values,
+                down.mxfp6_sm120_mxfp8_weight_scales,
+            )
+            return hidden_states, residual
+
+        module.forward = types.MethodType(forward, module)
+        module._mxfp6_sm120_fused_norm_mlp_prepared = True
+        count += 1
+    return count
+
+
 def _fused_swiglu_warmup_sizes(config) -> tuple[int, ...]:
     sizes = {
         1,
@@ -348,6 +564,57 @@ def _warmup_fused_swiglu_workspaces(
                 gate_up, weight, weight_scale
             )
             launches += 1
+    for device_index, _, _ in shapes:
+        torch.accelerator.synchronize(device_index)
+    return launches
+
+
+def _warmup_fused_norm_mlp_workspaces(
+    model: torch.nn.Module, sizes: tuple[int, ...]
+) -> int:
+    """Warm the fused post-norm/GateUp producer-consumer path."""
+    shapes: dict[
+        tuple[int, int, int],
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor, float],
+    ] = {}
+    for module in model.modules():
+        if not getattr(module, "_mxfp6_sm120_fused_norm_mlp_prepared", False):
+            continue
+        gate_up = module.mlp.gate_up_proj
+        weight = gate_up.mxfp6_sm120_mxfp8_weight_values
+        weight_scale = gate_up.mxfp6_sm120_mxfp8_weight_scales
+        norm = module.post_attention_layernorm
+        device_index = weight.device.index
+        if device_index is None:
+            device_index = torch.accelerator.current_device_index()
+        shapes.setdefault(
+            (device_index, int(weight.shape[0]), int(weight.shape[1])),
+            (
+                weight,
+                weight_scale,
+                norm._mxfp6_sm120_gemma_weight,
+                norm.variance_epsilon,
+            ),
+        )
+
+    launches = 0
+    for (device_index, n, k), (
+        weight,
+        weight_scale,
+        norm_weight,
+        epsilon,
+    ) in shapes.items():
+        device = torch.device("cuda", device_index)
+        for m in sizes:
+            if not _use_native_shape(m, n, k):
+                continue
+            input_ = torch.zeros((m, k), device=device, dtype=torch.bfloat16)
+            residual = torch.zeros_like(input_)
+            torch.ops.vllm.mxfp6_sm120_fused_add_gemma_rms_norm_mxfp8_gemm(
+                input_, residual, norm_weight, epsilon, weight, weight_scale
+            )
+            launches += 1
+
     for device_index, _, _ in shapes:
         torch.accelerator.synchronize(device_index)
     return launches
@@ -539,9 +806,14 @@ def prepare_model(model: torch.nn.Module, config) -> int:
 
     fused_swiglu_count = 0
     fused_swiglu_launches = 0
+    fused_norm_mlp_count = 0
+    fused_norm_mlp_launches = 0
     if hasattr(torch.ops.mxfp6, "silu_and_mul_mxfp8"):
         _register_fused_swiglu_op()
         fused_swiglu_count = _tag_fused_swiglu_mlps(model)
+        if fused_swiglu_count:
+            _register_fused_norm_gemm_op()
+            fused_norm_mlp_count = _tag_fused_norm_mlps(model)
 
     sizes = _warmup_sizes(config)
     with torch.inference_mode():
@@ -551,6 +823,10 @@ def prepare_model(model: torch.nn.Module, config) -> int:
         launches += _warmup_small_workspaces(model, sizes, use_pdl=True)
         if fused_swiglu_count:
             fused_swiglu_launches = _warmup_fused_swiglu_workspaces(
+                model, _fused_swiglu_warmup_sizes(config)
+            )
+        if fused_norm_mlp_count:
+            fused_norm_mlp_launches = _warmup_fused_norm_mlp_workspaces(
                 model, _fused_swiglu_warmup_sizes(config)
             )
 
@@ -568,6 +844,13 @@ def prepare_model(model: torch.nn.Module, config) -> int:
         fused_swiglu_count,
         fused_swiglu_launches,
     )
+    if fused_norm_mlp_count:
+        logger.info(
+            "Enabled fused Gemma RMSNorm+MXFP8+native GateUp for %d MLPs; "
+            "fused warmup launches=%d",
+            fused_norm_mlp_count,
+            fused_norm_mlp_launches,
+        )
     return count
 
 
