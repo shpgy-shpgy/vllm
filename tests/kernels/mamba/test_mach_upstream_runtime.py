@@ -247,16 +247,32 @@ def test_auto_tied_head_requires_its_full_fallback(
 
 
 @pytest.mark.parametrize("captured", [False, True])
-def test_auto_graph_requires_real_exact2048_capture(auto_worker, monkeypatch, captured):
+@pytest.mark.parametrize(
+    "size,kv_dtype,admitted",
+    [
+        ("4b", "bfloat16", False),
+        ("4b", "float8_e4m3fn", True),
+        ("2b", "bfloat16", True),
+    ],
+)
+def test_auto_graph_requires_real_exact2048_capture(
+    auto_worker, monkeypatch, captured, size, kv_dtype, admitted
+):
+    import torch
+
     from vllm.compilation.cuda_graph import CUDAGraphWrapper
     from vllm.mach.mxfp6 import auto_defaults
 
+    if size == "2b":
+        hf = auto_worker.vllm_config.model_config.hf_text_config
+        hf.hidden_size, hf.intermediate_size, hf.num_hidden_layers = 2048, 6144, 24
     auto_defaults.activate(auto_worker)
     auto_worker.model_runner = SimpleNamespace(
+        kv_cache_dtype=getattr(torch, kv_dtype),
         cudagraph_manager=SimpleNamespace(
             _graphs_captured=True,
             cudagraph_mode=Mode.FULL_AND_PIECEWISE,
-        )
+        ),
     )
     wrapper = SimpleNamespace(
         vllm_config=auto_worker.vllm_config,
@@ -269,7 +285,20 @@ def test_auto_graph_requires_real_exact2048_capture(auto_worker, monkeypatch, ca
     )
     monkeypatch.setattr(CUDAGraphWrapper, "_all_instances", [wrapper])
     auto_defaults.activate_graph(auto_worker)
-    assert envs.VLLM_MACH_MXFP8_GRAPH_POLICY is captured
+    assert envs.VLLM_MACH_MXFP8_GRAPH_POLICY is (captured and admitted)
+
+
+@pytest.mark.parametrize("enabled", ["0", "1"])
+def test_auto_bf16_graph_preserves_explicit_override(auto_worker, monkeypatch, enabled):
+    import torch
+
+    from vllm.mach.mxfp6 import auto_defaults
+
+    auto_defaults.activate(auto_worker)
+    auto_worker.model_runner = SimpleNamespace(kv_cache_dtype=torch.bfloat16)
+    monkeypatch.setenv("VLLM_MACH_MXFP8_GRAPH_POLICY", enabled)
+    auto_defaults.activate_graph(auto_worker)
+    assert envs.VLLM_MACH_MXFP8_GRAPH_POLICY is (enabled == "1")
 
 
 @pytest.mark.parametrize("m", [1, 4, 16, 24, 32, 64, 128, 2048])

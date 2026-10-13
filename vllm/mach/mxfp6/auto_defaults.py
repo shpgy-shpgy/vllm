@@ -181,11 +181,22 @@ def activate_graph(worker):
         return
     if "VLLM_MACH_MXFP8_GRAPH_POLICY" in os.environ:
         return
+    runner = worker.model_runner
+    if (
+        worker._mach_auto_size == "4b"
+        and getattr(runner, "kv_cache_dtype", None) == torch.bfloat16
+    ):
+        # The upstream 4B large-tail policy was qualified with FP8 KV.
+        # On BF16 KV, the same-GPU BS64 ablation favors stock padded graphs
+        # over switching non-2048 prefill tails to uncaptured execution.
+        # Check the resolved dtype so both auto and explicit BF16 are covered.
+        logger.info("Mach auto graph: preserving stock dispatch for 4B BF16 KV")
+        return
     from vllm.compilation.cuda_graph import CUDAGraphWrapper
     from vllm.config import CUDAGraphMode
 
     cfg = worker.vllm_config
-    manager = worker.model_runner.cudagraph_manager
+    manager = runner.cudagraph_manager
     if (
         manager is None
         or not manager._graphs_captured
