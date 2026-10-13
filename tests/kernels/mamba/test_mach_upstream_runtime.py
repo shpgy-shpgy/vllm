@@ -79,6 +79,7 @@ def test_auto_admits_model_specific_kernels_without_environment(auto_worker, siz
     assert ("all" if size == "4b" else "") == envs.VLLM_MACH_MXFP8_4B_NATIVE_POLICY
     assert not envs.VLLM_MXFP6_SM120_MXFP8_DUAL
     assert (size == "4b") == envs.VLLM_MXFP6_SM120_PROJECTION_PARALLEL
+    assert (size == "4b") == envs.VLLM_MACH_MXFP8_NORM_QUANT
     assert not envs.VLLM_MACH_MXFP8_COMPILE_CHOICES
     assert not envs.VLLM_MACH_MXFP8_KV_SCALE_PROFILE
     assert not envs.VLLM_MACH_MXFP8_2B_PDL
@@ -131,6 +132,77 @@ def test_auto_native_dependency_failure_keeps_independent_fusion(
     monkeypatch.setattr(auto_defaults, "_available", lambda *_: False)
     auto_defaults.activate(auto_worker)
     assert auto_worker._mach_auto_defaults == {"VLLM_MACH_MXFP8_SWIGLU_QUANT": True}
+
+
+@pytest.mark.parametrize(
+    "flag,value",
+    [
+        ("VLLM_MACH_MXFP8_NORM_QUANT", "0"),
+        ("VLLM_MACH_MXFP8_SWIGLU_QUANT", "0"),
+        ("VLLM_MXFP6_SM120_MXFP8_NATIVE", "0"),
+        ("VLLM_MACH_MXFP8_4B_NATIVE_POLICY", "0"),
+        ("VLLM_MACH_MXFP8_4B_NATIVE_POLICY", "wide-only"),
+        ("VLLM_MXFP6_SM120_MXFP8_DUAL", "1"),
+    ],
+)
+def test_auto_norm_quant_preserves_overrides_and_dependencies(
+    auto_worker, monkeypatch, flag, value
+):
+    from vllm.mach.mxfp6 import auto_defaults
+
+    monkeypatch.setenv(flag, value)
+    cached = envs._is_envs_cache_enabled()
+    try:
+        envs.enable_envs_cache()
+        auto_defaults.activate(auto_worker)
+        assert not envs.VLLM_MACH_MXFP8_NORM_QUANT
+    finally:
+        if not cached:
+            envs.disable_envs_cache()
+
+
+@pytest.mark.parametrize("rejected", ["default", "dual", "tp", "mtp", "lora"])
+def test_norm_quant_rejects_unsupported_policy_before_model_access(
+    auto_worker, monkeypatch, rejected
+):
+    from vllm.mach.mxfp6.norm_quant import prepare_model
+
+    cfg = auto_worker.vllm_config
+    if rejected != "default":
+        monkeypatch.setenv("VLLM_MACH_MXFP8_NORM_QUANT", "1")
+    if rejected == "dual":
+        monkeypatch.setenv("VLLM_MXFP6_SM120_MXFP8_DUAL", "1")
+    elif rejected == "tp":
+        cfg.parallel_config.tensor_parallel_size = 2
+    elif rejected == "mtp":
+        cfg.speculative_config = object()
+    elif rejected == "lora":
+        cfg.lora_config = object()
+    assert prepare_model(object(), cfg) == 0
+
+
+def test_norm_quant_fake_preserves_gateup_and_residual_contract():
+    import torch
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    from vllm.mach.mxfp6.norm_quant import register
+
+    register()
+    with FakeTensorMode():
+        x = torch.empty((64, 2048), dtype=torch.bfloat16)
+        weight = torch.empty((12288, 2048), dtype=torch.float8_e4m3fn)
+        out, residual = torch.ops.vllm.mach_norm_quant_gateup(
+            x,
+            x,
+            torch.ones(2048),
+            1e-6,
+            weight,
+            torch.empty(12288 * 64, dtype=torch.uint8),
+            True,
+        )
+        assert out.shape == (64, 12288)
+        assert residual.shape == x.shape
+        assert out.dtype == residual.dtype == torch.bfloat16
 
 
 def test_auto_explicit_disables_survive_cache_and_admission(auto_worker, monkeypatch):
@@ -201,6 +273,7 @@ def test_auto_effective_defaults_isolate_aot_compile_cache(auto_worker, monkeypa
     assert enabled != baseline
     assert enabled["VLLM_MACH_MXFP8_4B_NATIVE_POLICY"] == "all"
     assert enabled["VLLM_MACH_MXFP8_SWIGLU_QUANT"] is True
+    assert enabled["VLLM_MACH_MXFP8_NORM_QUANT"] is True
     assert enabled["VLLM_MACH_MXFP8_DUAL_POLICY"] == "mach"
     assert enabled["VLLM_MXFP6_SM120_MXFP8_DUAL"] is False
     monkeypatch.setenv("VLLM_MXFP6_SM120_MXFP8_DUAL", "1")

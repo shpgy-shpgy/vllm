@@ -100,6 +100,12 @@ def activate(worker):
                 if "VLLM_MACH_MXFP8_4B_NATIVE_POLICY" in os.environ
                 else "all"
             )
+            if (
+                policy == "all"
+                and os.getenv("VLLM_MACH_MXFP8_SWIGLU_QUANT") != "0"
+                and not envs.VLLM_MXFP6_SM120_MXFP8_DUAL
+            ):
+                values["VLLM_MACH_MXFP8_NORM_QUANT"] = True
             if policy == "all" and _available("vllm.mach.mxfp6.dual", "_load_dual_api"):
                 # Same-command 4B BS64 ablation favors native without dual.
                 # Keep the Mach policy for explicit opt-in, not auto-enablement.

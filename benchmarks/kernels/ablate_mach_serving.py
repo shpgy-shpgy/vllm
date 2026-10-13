@@ -29,6 +29,8 @@ FLAGS = {
     "graph": "VLLM_MACH_MXFP8_GRAPH_POLICY",
 }
 PROFILES = {"all": {}}
+PROFILES["norm_off"] = {"VLLM_MACH_MXFP8_NORM_QUANT": "0"}
+PROFILES["norm_on"] = {"VLLM_MACH_MXFP8_NORM_QUANT": "1"}
 PROFILES.update({"no_" + name: {flag: "0"} for name, flag in FLAGS.items()})
 PROFILES["legacy"] = {flag: "0" for flag in FLAGS.values()}
 PROFILES["legacy"].update(
@@ -48,6 +50,21 @@ PROFILES["mach_head"] = {
 
 def save(path, data):
     path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+
+
+def token_metrics(port):
+    with urllib.request.urlopen(
+        f"http://127.0.0.1:{port}/metrics", timeout=5
+    ) as response:
+        lines = response.read().decode().splitlines()
+    return {
+        key: sum(
+            float(line.rsplit(" ", 1)[1])
+            for line in lines
+            if line.startswith(key + "{")
+        )
+        for key in ("vllm:generation_tokens_total", "vllm:request_success_total")
+    }
 
 
 def stop_owned(proc):
@@ -75,6 +92,8 @@ def main():
     p.add_argument("--repeats", type=int, default=2)
     p.add_argument("--seed", type=int, default=20261013)
     p.add_argument("--source-root", type=Path, default=ROOT)
+    p.add_argument("--model", help="Model override for isolated 2B/4B comparison")
+    p.add_argument("--tokenizer", default="/data/models/Qwen3.5-4B")
     args = p.parse_args()
     ROOT = args.source_root.resolve()
     if not (ROOT / "vllm/entrypoints/openai/api_server.py").is_file():
@@ -124,6 +143,8 @@ def main():
     env["PYTHONPATH"] = str(ROOT)
     argv[0] = sys.executable
     argv[argv.index("--port") + 1] = str(args.port)
+    if args.model:
+        argv[argv.index("--model") + 1] = args.model
     model_name = argv[argv.index("--served-model-name") + 1]
     save(
         args.output / "manifest.json",
@@ -152,6 +173,7 @@ def main():
         overrides = PROFILES[profile]
         run_env = dict(env, **overrides)
         with socket.socket() as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             s.bind(("127.0.0.1", args.port))
         save(directory / "launch.json", {"argv": argv, "overrides": overrides})
         print(f"START {index} {profile}", flush=True)
@@ -194,7 +216,7 @@ def main():
                             "--dataset-name",
                             "random",
                             "--tokenizer",
-                            "/data/models/Qwen3.5-4B",
+                            args.tokenizer,
                             "--model",
                             model_name,
                             "--random-input-len",
@@ -220,6 +242,7 @@ def main():
                             str(csv_path),
                         ]
                         save(directory / f"r{repeat}-bs{bs}-argv.json", cmd)
+                        before = token_metrics(args.port)
                         with (directory / f"r{repeat}-bs{bs}.log").open("w") as log:
                             subprocess.run(
                                 cmd,
@@ -232,6 +255,17 @@ def main():
                             )
                         with csv_path.open() as f:
                             row = next(csv.DictReader(f))
+                        after = token_metrics(args.port)
+                        save(
+                            directory / f"r{repeat}-bs{bs}-metrics.json",
+                            {
+                                "before": before,
+                                "after": after,
+                                "delta": {
+                                    key: after[key] - before[key] for key in before
+                                },
+                            },
+                        )
                         expected = (5 if bs > 16 else 10) * bs
                         if int(row["completed"]) != expected:
                             raise RuntimeError(f"Incomplete requests: {row}")

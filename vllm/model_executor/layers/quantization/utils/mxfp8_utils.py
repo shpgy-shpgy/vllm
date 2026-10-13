@@ -408,7 +408,8 @@ def _build_fused_mxfp8_quant_kernels():
             tl.float32
         )
         values += residual
-        values = values.to(input_ptr.dtype.element_ty).to(tl.float32)
+        # Match native fused_add_rms_norm: normalize the FP32 sum, and
+        # round only the separately returned residual to the input dtype.
         tl.store(
             residual_output_ptr + offsets,
             values.to(residual_output_ptr.dtype.element_ty),

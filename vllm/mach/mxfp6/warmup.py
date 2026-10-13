@@ -203,6 +203,11 @@ def _prepare_mxfp8_sm120_adapters(model, config, ordered_gdn_enabled: bool) -> N
 
         prepare_swiglu_model(model, config)
 
+    if envs.VLLM_MACH_MXFP8_NORM_QUANT:
+        from .norm_quant import prepare_model as prepare_norm_quant_model
+
+        prepare_norm_quant_model(model, config)
+
 
 def activate_dense_defaults(config) -> None:
     """Restore the serialized decision in spawned workers before model loading."""

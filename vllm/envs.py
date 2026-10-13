@@ -289,6 +289,7 @@ if TYPE_CHECKING:
     VLLM_MXFP6_SM120_MXFP8_NATIVE: bool = True
     VLLM_MXFP6_SM120_PROJECTION_PARALLEL: bool = False
     VLLM_MACH_MXFP8_SWIGLU_QUANT: bool = False
+    VLLM_MACH_MXFP8_NORM_QUANT: bool = False
     VLLM_MACH_MXFP8_2B_BA: bool = False
     VLLM_MACH_MXFP8_2B_NATIVE: bool = False
     VLLM_MACH_MXFP8_2B_PDL: bool = False
@@ -2085,6 +2086,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_MACH_MXFP8_SWIGLU_QUANT": lambda: (
         os.getenv("VLLM_MACH_MXFP8_SWIGLU_QUANT", "0") == "1"
     ),
+    "VLLM_MACH_MXFP8_NORM_QUANT": lambda: (
+        os.getenv("VLLM_MACH_MXFP8_NORM_QUANT", "0") == "1"
+    ),
     # Experimental TP1 Qwen3.5-4B BA/QKVZ fork/join; requires native MXFP8.
     "VLLM_MXFP6_SM120_PROJECTION_PARALLEL": lambda: (
         os.getenv("VLLM_MXFP6_SM120_PROJECTION_PARALLEL", "0") == "1"
@@ -2651,6 +2655,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_MXFP6_SM120_MXFP8_DUAL",
         "VLLM_MXFP6_SM120_PROJECTION_PARALLEL",
         "VLLM_MACH_MXFP8_SWIGLU_QUANT",
+        "VLLM_MACH_MXFP8_NORM_QUANT",
         "VLLM_MACH_MXFP8_2B_BA",
         "VLLM_MACH_MXFP8_2B_NATIVE",
         "VLLM_MACH_MXFP8_2B_PDL",
