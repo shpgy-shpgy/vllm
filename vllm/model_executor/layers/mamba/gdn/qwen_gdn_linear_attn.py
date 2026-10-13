@@ -1099,8 +1099,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # ============================================================
         # Part 1: Input Projection
         # ============================================================
-        mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
-        ba, _ = self.in_proj_ba(hidden_states)
+        if getattr(self, "_mach_projection_parallel", False):
+            mixed_qkvz, ba = torch.ops.vllm.mach_mxfp8_parallel_projection(
+                hidden_states, self.prefix
+            )
+        else:
+            mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
+            ba, _ = self.in_proj_ba(hidden_states)
 
         # SM120 has a dedicated FlashInfer/FLA decode path in _forward_core.
         # The generic post-conv fused wrapper would bypass that path and use

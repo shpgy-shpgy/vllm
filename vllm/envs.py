@@ -287,6 +287,28 @@ if TYPE_CHECKING:
     VLLM_MXFP6_SM120_QWEN35_FASTPATH: bool = True
     VLLM_MXFP6_SM120_BA_GEMV: bool = False
     VLLM_MXFP6_SM120_MXFP8_NATIVE: bool = True
+    VLLM_MXFP6_SM120_PROJECTION_PARALLEL: bool = False
+    VLLM_MACH_MXFP8_SWIGLU_QUANT: bool = False
+    VLLM_MACH_MXFP8_2B_BA: bool = False
+    VLLM_MACH_MXFP8_2B_NATIVE: bool = False
+    VLLM_MACH_MXFP8_2B_PDL: bool = False
+    VLLM_MACH_MXFP8_FULL_HEAD: bool = False
+    VLLM_MACH_MXFP8_GREEDY_HEAD: bool = False
+    VLLM_MACH_MXFP8_DUAL_POLICY: str = "shpgy"
+    VLLM_MACH_FP8_N64: bool = False
+    VLLM_MACH_FP8_ORDERED: bool = False
+    VLLM_MACH_FP8_SILU: bool = False
+    VLLM_MACH_FP8_FA2: bool = False
+    VLLM_MACH_FP8_COMPILE_MODE: str = ""
+    VLLM_MACH_MXFP8_4B_NATIVE_POLICY: str = ""
+    VLLM_MACH_MXFP8_2B_GDN_ORDERED: bool = False
+    VLLM_MACH_MXFP8_4B_GDN_FULL: bool = False
+    VLLM_MACH_MXFP8_2B_GDN_MIXED: bool = False
+    VLLM_MACH_MXFP8_COMPILE_CHOICES: bool = False
+    VLLM_MACH_MXFP8_GRAPH_POLICY: bool = False
+    VLLM_MACH_MXFP8_KV_SCALE_PROFILE: str = ""
+    VLLM_MACH_MXFP8_BF16_SSM_AUDIT: bool = False
+    VLLM_MACH_MXFP8_HEAD_AUDIT: bool = False
     VLLM_MXFP6_SM120_MXFP8_DUAL: bool = False
     VLLM_TUNED_CONFIG_FOLDER: str | None = None
     VLLM_ENABLE_STARTUP_PLAN: bool = False
@@ -431,6 +453,20 @@ def use_mega_aot_artifact():
 
 _mach_dense_defaults = False
 _mach_dense_fp16_defaults = False
+_mach_mxfp8_defaults: dict[str, Any] = {}
+
+
+def set_mach_mxfp8_defaults(values: dict[str, Any]) -> None:
+    """Worker-local defaults; explicit environment values always take priority."""
+    _mach_mxfp8_defaults.clear()
+    _mach_mxfp8_defaults.update(values)
+    if hasattr(__getattr__, "cache_clear"):
+        __getattr__.cache_clear()
+
+
+def mach_mxfp8_native_policy() -> str:
+    value = os.getenv("VLLM_MACH_MXFP8_4B_NATIVE_POLICY", "")
+    return "" if value == "0" else value
 
 
 def set_mach_dense_defaults(enabled: bool, *, fp16: bool = False) -> None:
@@ -1608,11 +1644,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HYBRID_NVFP4_LM_HEAD": lambda: bool(
         int(os.getenv("VLLM_HYBRID_NVFP4_LM_HEAD", "0"))
     ),
-    "VLLM_HYBRID_NVFP4_LM_HEAD_BACKEND": lambda: os.getenv(
-        "VLLM_HYBRID_NVFP4_LM_HEAD_BACKEND", "b12x"
-    )
-    .strip()
-    .lower(),
+    "VLLM_HYBRID_NVFP4_LM_HEAD_BACKEND": lambda: (
+        os.getenv("VLLM_HYBRID_NVFP4_LM_HEAD_BACKEND", "b12x").strip().lower()
+    ),
     "VLLM_HYBRID_NVFP4_LM_HEAD_CANDIDATES": lambda: int(
         os.getenv("VLLM_HYBRID_NVFP4_LM_HEAD_CANDIDATES", "128")
     ),
@@ -1637,11 +1671,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HYBRID_MXFP4_LM_HEAD_ROW_BUCKET_PAD": lambda: bool(
         int(os.getenv("VLLM_HYBRID_MXFP4_LM_HEAD_ROW_BUCKET_PAD", "1"))
     ),
-    "VLLM_HYBRID_MXFP4_LM_HEAD_MIXED_BATCH_MODE": lambda: os.getenv(
-        "VLLM_HYBRID_MXFP4_LM_HEAD_MIXED_BATCH_MODE", "all"
-    )
-    .strip()
-    .lower(),
+    "VLLM_HYBRID_MXFP4_LM_HEAD_MIXED_BATCH_MODE": lambda: (
+        os.getenv("VLLM_HYBRID_MXFP4_LM_HEAD_MIXED_BATCH_MODE", "all").strip().lower()
+    ),
     "VLLM_HYBRID_MXFP8_LM_HEAD": lambda: bool(
         int(os.getenv("VLLM_HYBRID_MXFP8_LM_HEAD", "0"))
     ),
@@ -2000,21 +2032,74 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_MXFP6_SM120_QWEN35_FASTPATH": lambda: bool(
         int(os.getenv("VLLM_MXFP6_SM120_QWEN35_FASTPATH", "1"))
     ),
-    "VLLM_MXFP6_SM120_BA_GEMV": lambda: os.getenv("VLLM_MXFP6_SM120_BA_GEMV", "0")
-    == "1",
+    "VLLM_MXFP6_SM120_BA_GEMV": lambda: (
+        os.getenv("VLLM_MXFP6_SM120_BA_GEMV", "0") == "1"
+    ),
+    # Upstream 2B GEMM backend; preserve FlashInfer quantization, opt-in.
+    "VLLM_MACH_FP8_COMPILE_MODE": lambda: os.getenv("VLLM_MACH_FP8_COMPILE_MODE", ""),
+    "VLLM_MACH_FP8_N64": lambda: os.getenv("VLLM_MACH_FP8_N64", "0") == "1",
+    "VLLM_MACH_FP8_ORDERED": lambda: os.getenv("VLLM_MACH_FP8_ORDERED", "0") == "1",
+    "VLLM_MACH_FP8_SILU": lambda: os.getenv("VLLM_MACH_FP8_SILU", "0") == "1",
+    "VLLM_MACH_FP8_FA2": lambda: os.getenv("VLLM_MACH_FP8_FA2", "0") == "1",
+    "VLLM_MACH_MXFP8_4B_NATIVE_POLICY": mach_mxfp8_native_policy,
+    "VLLM_MACH_MXFP8_2B_PDL": lambda: os.getenv("VLLM_MACH_MXFP8_2B_PDL", "0") == "1",
+    "VLLM_MACH_MXFP8_FULL_HEAD": lambda: (
+        os.getenv("VLLM_MACH_MXFP8_FULL_HEAD", "0") == "1"
+    ),
+    "VLLM_MACH_MXFP8_GREEDY_HEAD": lambda: (
+        os.getenv("VLLM_MACH_MXFP8_GREEDY_HEAD", "0") == "1"
+    ),
+    "VLLM_MACH_MXFP8_DUAL_POLICY": lambda: os.getenv(
+        "VLLM_MACH_MXFP8_DUAL_POLICY", "shpgy"
+    ),
+    "VLLM_MACH_MXFP8_2B_GDN_ORDERED": lambda: (
+        os.getenv("VLLM_MACH_MXFP8_2B_GDN_ORDERED", "0") == "1"
+    ),
+    "VLLM_MACH_MXFP8_2B_GDN_MIXED": lambda: (
+        os.getenv("VLLM_MACH_MXFP8_2B_GDN_MIXED", "0") == "1"
+    ),
+    "VLLM_MACH_MXFP8_4B_GDN_FULL": lambda: (
+        os.getenv("VLLM_MACH_MXFP8_4B_GDN_FULL", "0") == "1"
+    ),
+    "VLLM_MACH_MXFP8_COMPILE_CHOICES": lambda: (
+        os.getenv("VLLM_MACH_MXFP8_COMPILE_CHOICES", "0") == "1"
+    ),
+    "VLLM_MACH_MXFP8_GRAPH_POLICY": lambda: (
+        os.getenv("VLLM_MACH_MXFP8_GRAPH_POLICY", "0") == "1"
+    ),
+    "VLLM_MACH_MXFP8_KV_SCALE_PROFILE": lambda: os.getenv(
+        "VLLM_MACH_MXFP8_KV_SCALE_PROFILE", ""
+    ),
+    "VLLM_MACH_MXFP8_BF16_SSM_AUDIT": lambda: (
+        os.getenv("VLLM_MACH_MXFP8_BF16_SSM_AUDIT", "0") == "1"
+    ),
+    "VLLM_MACH_MXFP8_HEAD_AUDIT": lambda: (
+        os.getenv("VLLM_MACH_MXFP8_HEAD_AUDIT", "0") == "1"
+    ),
+    "VLLM_MACH_MXFP8_2B_NATIVE": lambda: (
+        os.getenv("VLLM_MACH_MXFP8_2B_NATIVE", "0") == "1"
+    ),
+    # Upstream 2B BA: small-M GEMV plus native M16, opt-in.
+    "VLLM_MACH_MXFP8_2B_BA": lambda: os.getenv("VLLM_MACH_MXFP8_2B_BA", "0") == "1",
+    # Upstream 2B/4B SwiGLU quantizer; opt-in until serving qualification.
+    "VLLM_MACH_MXFP8_SWIGLU_QUANT": lambda: (
+        os.getenv("VLLM_MACH_MXFP8_SWIGLU_QUANT", "0") == "1"
+    ),
+    # Experimental TP1 Qwen3.5-4B BA/QKVZ fork/join; requires native MXFP8.
+    "VLLM_MXFP6_SM120_PROJECTION_PARALLEL": lambda: (
+        os.getenv("VLLM_MXFP6_SM120_PROJECTION_PARALLEL", "0") == "1"
+    ),
     # Use the native SM120 MXFP8 kernel for the validated Qwen3.5-4B
     # decode-sized public path. Set to 0 to retain the FlashInfer-only path.
-    "VLLM_MXFP6_SM120_MXFP8_NATIVE": lambda: os.getenv(
-        "VLLM_MXFP6_SM120_MXFP8_NATIVE", "1"
-    )
-    == "1",
+    "VLLM_MXFP6_SM120_MXFP8_NATIVE": lambda: (
+        os.getenv("VLLM_MXFP6_SM120_MXFP8_NATIVE", "1") == "1"
+    ),
     # Opt-in: use the validated small-M dual-limb MXFP8 activation path for
     # Qwen3.5-4B on SM120. The original mxfp6 0.2.1 wheel does not expose
     # the required dual_gemm_out operator.
-    "VLLM_MXFP6_SM120_MXFP8_DUAL": lambda: os.getenv(
-        "VLLM_MXFP6_SM120_MXFP8_DUAL", "0"
-    )
-    == "1",
+    "VLLM_MXFP6_SM120_MXFP8_DUAL": lambda: (
+        os.getenv("VLLM_MXFP6_SM120_MXFP8_DUAL", "0") == "1"
+    ),
     # Experimental: use this to enable MCP tool calling for non harmony models
     "VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT": lambda: bool(
         int(os.getenv("VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT", "0"))
@@ -2190,15 +2275,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_QWEN3_5_FUSED_AR_NORM": lambda: (
         os.getenv("VLLM_QWEN3_5_FUSED_AR_NORM", "1") == "1"
     ),
-    "VLLM_QWEN3_5_FP16_SSM": lambda: os.getenv(
-        "VLLM_QWEN3_5_FP16_SSM", "1" if _mach_dense_fp16_defaults else "0"
-    )
-    == "1",
+    "VLLM_QWEN3_5_FP16_SSM": lambda: (
+        os.getenv("VLLM_QWEN3_5_FP16_SSM", "1" if _mach_dense_fp16_defaults else "0")
+        == "1"
+    ),
     "VLLM_MACH_DENSE_AUTO": lambda: os.getenv("VLLM_MACH_DENSE_AUTO", "1") == "1",
     # Default on for the model-gated Ordered GDN adapter.  The warmup layer
     # only activates it for the validated Qwen3.5-4B SM120 geometry; an
     # explicit VLLM_MACH_GDN_ORDERED=0 remains a hard opt-out.
-    "VLLM_MACH_GDN_ORDERED": lambda: (os.getenv("VLLM_MACH_GDN_ORDERED", "1") == "1"),
+    "VLLM_MACH_GDN_ORDERED": lambda: os.getenv("VLLM_MACH_GDN_ORDERED", "1") == "1",
     "VLLM_MACH_GDN_PERSISTENT": lambda: (
         os.getenv("VLLM_MACH_GDN_PERSISTENT", mach_dense_default()) == "1"
     ),
@@ -2391,6 +2476,8 @@ def __getattr__(name: str):
     initialization), all environment variables will be cached.
     """
     if name in environment_variables:
+        if name not in os.environ and name in _mach_mxfp8_defaults:
+            return _mach_mxfp8_defaults[name]
         return environment_variables[name]()
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
@@ -2562,18 +2649,41 @@ def compile_factors() -> dict[str, object]:
         "VLLM_MXFP6_SM120_BA_GEMV",
         "VLLM_MXFP6_SM120_MXFP8_NATIVE",
         "VLLM_MXFP6_SM120_MXFP8_DUAL",
+        "VLLM_MXFP6_SM120_PROJECTION_PARALLEL",
+        "VLLM_MACH_MXFP8_SWIGLU_QUANT",
+        "VLLM_MACH_MXFP8_2B_BA",
+        "VLLM_MACH_MXFP8_2B_NATIVE",
+        "VLLM_MACH_MXFP8_2B_PDL",
+        "VLLM_MACH_MXFP8_FULL_HEAD",
+        "VLLM_MACH_MXFP8_GREEDY_HEAD",
+        "VLLM_MACH_MXFP8_DUAL_POLICY",
+        "VLLM_MACH_FP8_N64",
+        "VLLM_MACH_FP8_ORDERED",
+        "VLLM_MACH_FP8_SILU",
+        "VLLM_MACH_FP8_FA2",
+        "VLLM_MACH_FP8_COMPILE_MODE",
+        "VLLM_MACH_MXFP8_4B_NATIVE_POLICY",
+        "VLLM_MACH_MXFP8_2B_GDN_ORDERED",
+        "VLLM_MACH_MXFP8_4B_GDN_FULL",
+        "VLLM_MACH_MXFP8_2B_GDN_MIXED",
+        "VLLM_MACH_MXFP8_COMPILE_CHOICES",
+        "VLLM_MACH_MXFP8_GRAPH_POLICY",
+        "VLLM_MACH_MXFP8_KV_SCALE_PROFILE",
+        "VLLM_MACH_MXFP8_BF16_SSM_AUDIT",
+        "VLLM_MACH_MXFP8_HEAD_AUDIT",
         "VLLM_SM120_LOSSLESS_PREFILL",
         "VLLM_SM120_OWNER_PREFILL",
     }
     # Ordered GDN enables the BA adapter as a companion; include the BA
     # decision in that graph's cache factors while preserving the baseline key
     # when neither adapter is active.
-    ba_gemv_enabled = environment_variables["VLLM_MXFP6_SM120_BA_GEMV"]()
-    ordered_gdn_enabled = environment_variables["VLLM_MACH_GDN_ORDERED"]()
+    ba_gemv_enabled = __getattr__("VLLM_MXFP6_SM120_BA_GEMV")
+    ordered_gdn_enabled = __getattr__("VLLM_MACH_GDN_ORDERED")
     if not ba_gemv_enabled and not ordered_gdn_enabled:
         ignored_factors.add("VLLM_MXFP6_SM120_BA_GEMV")
     if not any(
-        environment_variables[name]() not in (False, "0") for name in mach_opt_in_flags
+        __getattr__(name) not in (False, "0", "")
+        for name in mach_opt_in_flags
     ):
         ignored_factors.update(mach_opt_in_flags)
         ignored_factors.update(
@@ -2590,12 +2700,12 @@ def compile_factors() -> dict[str, object]:
     from vllm.config.utils import normalize_value
 
     factors: dict[str, object] = {}
-    for factor, getter in environment_variables.items():
+    for factor in environment_variables:
         if factor in ignored_factors:
             continue
 
         try:
-            raw = getter()
+            raw = __getattr__(factor)
         except Exception as exc:  # pragma: no cover - defensive logging
             logger.warning(
                 "Skipping environment variable %s while hashing compile factors: %s",

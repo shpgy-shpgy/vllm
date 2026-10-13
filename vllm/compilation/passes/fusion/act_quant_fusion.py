@@ -50,7 +50,9 @@ if silu_and_mul_nvfp4_quant_supported:
     FUSED_OPS[kNvfp4Dynamic] = torch.ops._C.silu_and_mul_nvfp4_quant.default  # noqa: E501
 
 if current_platform.is_cuda_alike():
-    FUSED_OPS[kFp8Dynamic128Sym] = torch.ops._C.silu_and_mul_per_block_quant.default
+    from vllm.mach.fp8.activation import get_fused_op
+
+    FUSED_OPS[kFp8Dynamic128Sym] = get_fused_op()
     FUSED_OPS[kFp8Dynamic64Sym] = torch.ops._C.silu_and_mul_per_block_quant.default
 
 

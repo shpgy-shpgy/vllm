@@ -542,7 +542,9 @@ def silu_and_mul_per_block_quant(
         )
 
     # Call the C++ kernel
-    torch.ops._C.silu_and_mul_per_block_quant(
+    from vllm.mach.fp8.activation import get_fused_op
+
+    get_fused_op(group_size)(
         output,
         input,
         scales,

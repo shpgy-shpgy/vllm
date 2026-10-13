@@ -269,6 +269,30 @@ def test_greedy_speculative_sampling_uses_compact_tokens(
     assert captured["input_batch"] is input_batch
 
 
+def test_mach_head_fallback_does_not_reenter_vocab_fast_path(monkeypatch):
+    """Rejected Mach admission must use full logits and the ordinary sampler."""
+    monkeypatch.setattr(envs, "VLLM_MACH_MXFP8_GREEDY_HEAD", True)
+    runner = object.__new__(GPUModelRunner)
+    logits = torch.randn(2, 8)
+    expected = SimpleNamespace(num_sampled="sampled", num_rejected="rejected")
+    batch = SimpleNamespace(logits_indices=torch.arange(2), num_draft_tokens=0)
+
+    class FullSampler:
+        def get_vocab_parallel_sampling_params(self, _):
+            pytest.fail("Mach fallback must not query an alternate sampling path")
+
+        def __call__(self, actual, actual_batch):
+            assert actual is logits
+            assert actual_batch is batch
+            return expected
+
+    runner.sampler = FullSampler()
+    runner.model = SimpleNamespace(compute_logits=lambda _: logits)
+    actual, sampled, rejected = runner.sample(torch.randn(2, 4), batch, None)
+    assert actual is expected
+    assert (sampled, rejected) == ("sampled", "rejected")
+
+
 def test_greedy_speculative_sampling_keeps_bf16_route(monkeypatch) -> None:
     monkeypatch.setattr(envs, "VLLM_HYBRID_MXFP4_LM_HEAD", False)
     monkeypatch.setattr(envs, "VLLM_HYBRID_MXFP8_LM_HEAD", False)

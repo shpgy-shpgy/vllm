@@ -32,6 +32,7 @@ logger = init_logger(__name__)
 HIGH_ROWS = tuple(range(40, 129, 8))
 DEFERRED_ROWS = HIGH_ROWS
 ROWS = DEFERRED_ROWS
+_DECODE = ordered_allm.decode
 _STATS: Counter[str] = Counter()
 _ORIGINAL_CORE = None
 _ORIGINAL_BIND = None
@@ -126,7 +127,7 @@ def _warm_deferred(layer, state, scratch) -> None:
         )
         indices = torch.zeros((rows,), dtype=torch.int32, device=device)
         ordered_m16_deferred.reset_slots(state, indices, scratch)
-        ordered_allm.decode(
+        _DECODE(
             qkv,
             a,
             b,
@@ -172,7 +173,15 @@ def _bind_deferred_scratch(layer) -> None:
     # layout or graph pointer is ever reused across the two pools.
     # Reuse the private padding already present in each mamba cache page.
     # This keeps deferred metadata out of the KV-cache memory budget.
-    scratch = ordered_m16_deferred.from_state(state)
+    if envs.VLLM_MACH_MXFP8_4B_GDN_FULL:
+        # The upstream low-M kernels require dense caller-owned scratch.
+        required = state.shape[0] * (32 * 4 * 128 * 2 + 32 * 4 * 4 + 32 * 4 * 2) * 4
+        free, _ = torch.cuda.mem_get_info(state.device)
+        if free < required + 512 * 2**20:
+            raise RuntimeError("4B full ordered GDN scratch needs 512 MiB free reserve")
+        scratch = ordered_m16_deferred.allocate(state.shape[0], state.device)
+    else:
+        scratch = ordered_m16_deferred.from_state(state)
     scratch.age.zero_()
     scratch.prefix.fill_(1.0)
     layer._mach_ordered_gdn_deferred_state_key = key
@@ -275,7 +284,7 @@ def _dispatch(layer, mixed_qkv, b, a, core_attn_out, metadata) -> None:
     scratch = _layer_scratch(layer)
     if scratch is None:
         raise RuntimeError("high-M Ordered GDN scratch was not bound")
-    ordered_allm.decode(
+    _DECODE(
         mixed_qkv=mixed_qkv,
         a=a,
         b=b,
@@ -412,6 +421,11 @@ def _install_runner_lifecycle() -> None:
 
     @functools.wraps(old_add)
     def ordered_add(self, scheduler_output):
+        if envs.VLLM_MACH_MXFP8_4B_GDN_FULL and any(
+            request.num_computed_tokens != 0
+            for request in scheduler_output.scheduled_new_reqs
+        ):
+            raise RuntimeError("4B deferred state transfer on resume is unsupported")
         result = old_add(self, scheduler_output)
         ids = [
             block
@@ -504,6 +518,13 @@ def _install_core_hook() -> None:
 @torch.inference_mode()
 def prepare(model) -> int:
     """Validate, warm, and install the first Ordered GDN stage."""
+    global DEFERRED_ROWS, ROWS, _DECODE
+
+    if envs.VLLM_MACH_MXFP8_4B_GDN_FULL:
+        from .gdn import champion_ordered_full_m4_m16_deferred_dispatch as champion
+
+        DEFERRED_ROWS = ROWS = champion.ROWS
+        _DECODE = champion.decode
 
     if getattr(model, "_mach_ordered_gdn_prepared", False):
         return int(_STATS.get("prepared_layers", 0))

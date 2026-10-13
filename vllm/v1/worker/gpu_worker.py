@@ -216,6 +216,10 @@ class Worker(WorkerBase):
 
         activate_dense_defaults(vllm_config)
 
+        from vllm.mach.mxfp6.upstream_runtime import before_model_load
+
+        before_model_load(self)
+
         # configure float32 matmul precision according to vLLM env.
         precision = envs.VLLM_FLOAT32_MATMUL_PRECISION
         torch.set_float32_matmul_precision(precision)
@@ -456,6 +460,10 @@ class Worker(WorkerBase):
 
             current_platform.check_if_supports_dtype(self.model_config.dtype)
 
+            from vllm.mach.mxfp6.auto_defaults import activate
+
+            activate(self)
+
             # Initialize the distributed environment BEFORE taking
             # memory snapshot
             # This ensures NCCL buffers are allocated before we measure
@@ -530,6 +538,9 @@ class Worker(WorkerBase):
     # FIXME(youkaichao & ywang96): Use TorchDispatchMode instead of memory pool
     # to hijack tensor allocation.
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
+        from vllm.mach.fp8.runtime import install as install_block_fp8
+
+        install_block_fp8(self)
         with (
             self._maybe_get_memory_pool_context(tag="weights"),
             set_current_vllm_config(self.vllm_config),
@@ -572,6 +583,13 @@ class Worker(WorkerBase):
 
         prepare_model(self.get_model(), self.vllm_config)
 
+        from vllm.mach.mxfp6.upstream_runtime import (
+            before_profile,
+            reserve_state_scratch,
+        )
+
+        before_profile(self)
+
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
             # still need a profile run which compiles the model for
             # max_num_batched_tokens
@@ -591,7 +609,7 @@ class Worker(WorkerBase):
             )
             logger.info(msg)
             return reserve_mm_ipc_gpu_memory(
-                kv_cache_memory_bytes,
+                reserve_state_scratch(self, kv_cache_memory_bytes),
                 self.model_config.multimodal_config,
                 getattr(self.parallel_config, "_api_process_count", 1),
             )
@@ -733,7 +751,7 @@ class Worker(WorkerBase):
                 )
 
         return reserve_mm_ipc_gpu_memory(
-            int(self.available_kv_cache_memory_bytes),
+            reserve_state_scratch(self, int(self.available_kv_cache_memory_bytes)),
             self.model_config.multimodal_config,
             getattr(self.parallel_config, "_api_process_count", 1),
         )
@@ -803,6 +821,10 @@ class Worker(WorkerBase):
 
         if self.model_config.enable_return_routed_experts:
             self.model_runner.init_routed_experts_capturer()
+
+        from vllm.mach.mxfp6.upstream_runtime import after_cache
+
+        after_cache(self)
 
         # Build KV-zero metadata outside the CuMem pool so the bookkeeping
         # GPU tensors (seg_addrs, block-id buffers) use the standard PyTorch
@@ -983,6 +1005,10 @@ class Worker(WorkerBase):
 
             trigger_inductor_lazy_init(self.device)
 
+        from vllm.mach.mxfp6.upstream_runtime import after_compile
+
+        after_compile(self)
+
         # All warmup is done — start monitoring for unexpected JIT
         # compilations that would cause latency spikes during inference.
         from vllm.utils.jit_monitor import activate as activate_jit_monitor
@@ -1012,6 +1038,11 @@ class Worker(WorkerBase):
 
     def reset_mm_cache(self) -> None:
         self.model_runner.reset_mm_cache()
+
+    def mach_upstream_receipt(self) -> dict:
+        from vllm.mach.mxfp6.upstream_runtime import inspect
+
+        return inspect(self)
 
     def reset_encoder_cache(self) -> None:
         self.model_runner.reset_encoder_cache()

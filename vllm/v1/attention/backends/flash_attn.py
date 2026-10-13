@@ -10,6 +10,11 @@ from typing import ClassVar
 import numpy as np
 import torch
 
+from vllm.mach.fp8.attention import (
+    build_split_metadata,
+    mixed_fa2_eligible,
+    mixed_fa2_enabled,
+)
 from vllm.model_executor.layers.attention import Attention
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import (
@@ -280,6 +285,10 @@ class FlashAttentionMetadata:
     num_decode_tokens: int = 0
     num_prefill_tokens: int = 0
 
+    # Narrow backport of LiRunGuo's vLLM PR #58013.
+    num_split_decodes: int = 0
+    prefill_query_start_loc: torch.Tensor | None = None
+
     # Optional aot scheduling
     scheduler_metadata: torch.Tensor | None = None
     prefix_scheduler_metadata: torch.Tensor | None = None
@@ -443,6 +452,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
 
         self.max_num_splits = 0  # No upper bound on the number of splits.
         self.aot_schedule = get_flash_attn_version() == 3
+        self.mach_fp8_fa2 = mixed_fa2_enabled() and get_flash_attn_version() == 2
 
         self.fa4_hd256 = uses_fa4_hd256_kernel(self.headdim) and (
             get_flash_attn_version(
@@ -788,6 +798,8 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             attn_metadata.rswa_window = self.rswa_window
             attn_metadata.rswa_window_tensor = self.persistent_rswa_window_tensor
 
+        if self.mach_fp8_fa2:
+            build_split_metadata(self, common_attn_metadata, attn_metadata)
         return attn_metadata
 
     def update_block_table(
@@ -1158,6 +1170,55 @@ class FlashAttentionImpl(AttentionImpl):
                     max_seqlen_k = num_pages * FA4_HD256_PAGE_SIZE
                     block_table = block_table[:, :num_pages]
                     num_splits = 1
+
+                if attn_metadata.num_split_decodes and mixed_fa2_eligible(
+                    self,
+                    attn_metadata,
+                    query[:num_actual_tokens],
+                    output[:num_actual_tokens],
+                    key_cache,
+                    value_cache,
+                ):
+                    nd = attn_metadata.num_split_decodes
+                    segments = (
+                        (slice(0, nd), cu_seqlens_q[: nd + 1], slice(0, nd), 1),
+                        (
+                            slice(nd, num_actual_tokens),
+                            attn_metadata.prefill_query_start_loc,
+                            slice(nd, None),
+                            max_seqlen_q,
+                        ),
+                    )
+                    for tokens, starts, reqs, qmax in segments:
+                        flash_attn_varlen_func(
+                            q=query[tokens],
+                            k=key_cache,
+                            v=value_cache,
+                            out=output[tokens],
+                            cu_seqlens_q=starts,
+                            max_seqlen_q=qmax,
+                            seqused_k=seqused_k[reqs],
+                            max_seqlen_k=max_seqlen_k,
+                            softmax_scale=self.scale,
+                            causal=causal,
+                            alibi_slopes=self.alibi_slopes,
+                            window_size=sliding_window_size,
+                            block_table=block_table[reqs],
+                            softcap=self.logits_soft_cap,
+                            scheduler_metadata=scheduler_metadata,
+                            fa_version=self.vllm_flash_attn_version,
+                            q_descale=q_descale[reqs]
+                            if q_descale is not None
+                            else None,
+                            k_descale=k_descale[reqs],
+                            v_descale=v_descale[reqs],
+                            dynamic_causal=dynamic_causal,
+                            num_splits=1,
+                            s_aux=self.sinks,
+                            mask_mod=rswa_mask_mod_fn or mm_mask_mod,
+                            aux_tensors=rswa_aux or mm_aux,
+                        )
+                    return output
 
                 flash_attn_varlen_func(
                     q=query[:num_actual_tokens],

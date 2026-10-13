@@ -65,7 +65,8 @@ def _eligible_config(model: torch.nn.Module, config) -> bool:
         and config.model_config is not None
         and config.model_config.dtype == torch.bfloat16
         and config.model_config.quantization == "compressed-tensors"
-        and getattr(config.kernel_config, "linear_backend", None) == "auto"
+        and getattr(config.kernel_config, "linear_backend", None)
+        in ("auto", "flashinfer_cutlass")
         and config.parallel_config.tensor_parallel_size == 1
     ):
         return False
@@ -269,7 +270,12 @@ def _fused_swiglu_down_impl(
     weight_scale: torch.Tensor,
 ) -> torch.Tensor:
     """Produce packed MXFP8 SwiGLU output and consume it in native W8A8 GEMM."""
-    input_mxfp8, input_scale = torch.ops.mxfp6.silu_and_mul_mxfp8_pdl(gate_up)
+    if envs.VLLM_MACH_MXFP8_SWIGLU_QUANT:
+        from .swiglu_quant import quantize
+
+        input_mxfp8, input_scale = quantize(gate_up)
+    else:
+        input_mxfp8, input_scale = torch.ops.mxfp6.silu_and_mul_mxfp8_pdl(gate_up)
     return torch.ops.vllm.mxfp6_sm120_native_mxfp8_gemm_pdl(
         input_mxfp8.view(torch.float8_e4m3fn),
         weight,

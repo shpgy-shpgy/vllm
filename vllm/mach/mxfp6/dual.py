@@ -6,7 +6,7 @@ by computing a high FP8 limb and a BF16-rounded residual limb.  This adapter
 keeps the existing FlashInfer kernel as the fallback and only redirects the
 shapes that were validated for the first migration:
 
-* MoE gate/up projections: small captured M values through 64,
+* MLP gate/up projections: small captured M values through 64,
   N=18432, K=2560
 * GDN QKVZ projections: the same small captured M values through 64,
   N=12288, K=2560
@@ -14,6 +14,9 @@ shapes that were validated for the first migration:
 The policy is intentionally shape-gated: only the validated Qwen3.5-4B
 projection geometry uses the dual kernel, while every other MXFP8 shape keeps
 the existing FlashInfer/native path.
+
+The separate ``mach`` policy reproduces upstream: gate/up M32 and QKVZ M32/64
+use dual without PDL; other rows use native MXFP8. The default stays ``shpgy``.
 """
 
 from __future__ import annotations
@@ -25,6 +28,7 @@ from typing import Any
 
 import torch
 
+from vllm import envs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     MXFP8_SCALE_DTYPE,
@@ -53,6 +57,19 @@ _OP_REGISTERED = False
 _INSTALLED = False
 _DUAL_API: Any = None
 _ORIGINAL_APPLIES: dict[type, Any] = {}
+
+
+def _mach_policy() -> bool:
+    policy = envs.VLLM_MACH_MXFP8_DUAL_POLICY
+    if policy not in ("shpgy", "mach"):
+        raise ValueError("MXFP8 dual policy must be shpgy or mach")
+    return policy == "mach"
+
+
+def dual_selected(m: int, n: int, *, mach: bool) -> bool:
+    if mach:
+        return (n == _GATEUP_N and m == 32) or (n == _QKVZ_N and m in (32, 64))
+    return (n == _GATEUP_N and m in _GATEUP_M) or (n == _QKVZ_N and m in _QKVZ_M)
 
 
 def _load_dual_api():
@@ -91,9 +108,7 @@ def _load_dual_api():
         "bool use_pdl=False",
     )
     if not all(fragment in schema for fragment in required):
-        raise RuntimeError(
-            "Unexpected mxfp8_sm120::dual_gemm_out schema: " f"{schema}"
-        )
+        raise RuntimeError(f"Unexpected mxfp8_sm120::dual_gemm_out schema: {schema}")
 
     # The ordinary and dual Python APIs must resolve to one dispatcher binary.
     # Loading two copies can register duplicate operators and is especially
@@ -127,9 +142,8 @@ def _dual_gemm_impl(
     """Opaque vLLM op: select dual or original FlashInfer by runtime M."""
     m = int(x.shape[0])
     n = int(weight.shape[0])
-    use_dual = (n == _GATEUP_N and m in _GATEUP_M) or (
-        n == _QKVZ_N and m in _QKVZ_M
-    )
+    mach = _mach_policy()
+    use_dual = dual_selected(m, n, mach=mach)
 
     if not use_dual:
         from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
@@ -137,9 +151,11 @@ def _dual_gemm_impl(
         )
         from vllm.utils import flashinfer as vllm_flashinfer
 
-        input_mxfp8, input_scale = mxfp8_e4m3_quantize(
-            x, is_sf_swizzled_layout=True
-        )
+        input_mxfp8, input_scale = mxfp8_e4m3_quantize(x, is_sf_swizzled_layout=True)
+        if mach:
+            return torch.ops.vllm.mxfp6_sm120_native_mxfp8_gemm(
+                input_mxfp8, weight, input_scale, weight_scale
+            )
         return vllm_flashinfer.mm_mxfp8(
             input_mxfp8,
             weight.t(),
@@ -150,12 +166,10 @@ def _dual_gemm_impl(
         )
 
     dual = _load_dual_api()
-    use_pdl = (n == _GATEUP_N and m in _GATEUP_PDL_M) or (
-        n == _QKVZ_N and m in _QKVZ_PDL_M
+    use_pdl = not mach and (
+        (n == _GATEUP_N and m in _GATEUP_PDL_M) or (n == _QKVZ_N and m in _QKVZ_PDL_M)
     )
-    high, high_scale, residual, residual_scale = dual.quantize(
-        x, use_pdl=use_pdl
-    )
+    high, high_scale, residual, residual_scale = dual.quantize(x, use_pdl=use_pdl)
     output = torch.empty(
         (x.shape[0], weight.shape[0]), device=x.device, dtype=torch.bfloat16
     )
@@ -230,6 +244,7 @@ def _install_dispatch() -> None:
     from vllm.model_executor.kernels.linear.mxfp8.flashinfer import (
         FlashInferCutlassMxfp8LinearKernel,
     )
+
     for kernel_cls in (FlashInferCutlassMxfp8LinearKernel,):
         if kernel_cls in _ORIGINAL_APPLIES:
             continue
@@ -287,9 +302,7 @@ def _validate_projection(layer: torch.nn.Module, n: int, name: str) -> None:
         or scale.ndim != 1
         or scale.numel() != n * (_HIDDEN_SIZE // 32)
     ):
-        weight_info = (
-            None if weight is None else (tuple(weight.shape), weight.dtype)
-        )
+        weight_info = None if weight is None else (tuple(weight.shape), weight.dtype)
         scale_info = None if scale is None else (tuple(scale.shape), scale.dtype)
         raise RuntimeError(
             "Dual MXFP8 projection/layout guard failed for "
@@ -331,6 +344,8 @@ def _tag_model(model: torch.nn.Module) -> tuple[int, int]:
 
 def prepare_model(model: torch.nn.Module, config) -> tuple[int, int]:
     """Load, install, tag, and eagerly warm the validated small-M shapes."""
+    if _mach_policy() and getattr(model, "_mach_4b_native_policy", None) != "all":
+        raise ValueError("Mach dual policy requires prepared 4B native=all")
     if getattr(model, "_mxfp6_sm120_dual_prepared", False):
         return (32, 24)
     if not config.use_v2_model_runner:

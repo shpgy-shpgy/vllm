@@ -89,6 +89,23 @@ def _ordered_gdn_auto_eligible(model, config) -> bool:
 
 def _ordered_gdn_enabled(model, config) -> bool:
     """Resolve explicit overrides before the model-specific default."""
+    if envs.VLLM_MACH_MXFP8_4B_GDN_FULL:
+        if (
+            not config.use_v2_model_runner
+            or config.parallel_config.tensor_parallel_size != 1
+            or config.parallel_config.pipeline_parallel_size != 1
+            or config.cache_config.enable_prefix_caching
+            or config.cache_config.use_replayssm
+            or config.cache_config.mamba_cache_mode != "none"
+            or config.kv_transfer_config is not None
+            or getattr(config.cache_config, "kv_offloading_size", None)
+            or getattr(config.model_config, "cpu_offload_gb", 0)
+            or getattr(config.model_config, "enable_sleep_mode", False)
+        ):
+            raise ValueError(
+                "4B full ordered GDN requires V2 TP1 without state sharing/offload"
+            )
+        return True
     raw = os.getenv("VLLM_MACH_GDN_ORDERED")
     if raw is not None:
         return raw == "1"
@@ -99,7 +116,21 @@ def _prepare_mxfp8_sm120_adapters(model, config, ordered_gdn_enabled: bool) -> N
     """Prepare the MXFP6/Ordered GDN adapters before profiling and capture."""
     from .native import prepare_model as prepare_native_model
 
-    native_count = prepare_native_model(model, config)
+    if envs.VLLM_MACH_MXFP8_4B_NATIVE_POLICY:
+        from .four_b_native import prepare_model as prepare_four_b_native
+
+        prepare_four_b_native(model, config)
+        native_count = 0
+    else:
+        native_count = prepare_native_model(model, config)
+    if envs.VLLM_MACH_MXFP8_2B_PDL:
+        from .two_b_pdl import prepare_model as prepare_pdl_model
+
+        prepare_pdl_model(model, config)
+    if envs.VLLM_MACH_MXFP8_2B_NATIVE:
+        from .two_b_native import prepare_model as prepare_two_b_native_model
+
+        prepare_two_b_native_model(model, config)
     if native_count:
         init_logger(__name__).info(
             "Warmed common native MXFP8 decode path for %d projections",
@@ -135,14 +166,42 @@ def _prepare_mxfp8_sm120_adapters(model, config, ordered_gdn_enabled: bool) -> N
     # unquantized [64,2560] BA projection.  Enable the companion GEMV whenever
     # Ordered GDN is selected; the explicit flag remains available for runs
     # that want BA GEMV without Ordered GDN.
-    if envs.VLLM_MXFP6_SM120_BA_GEMV or ordered_gdn_enabled:
+    hf = config.model_config.hf_text_config if config.model_config else None
+    two_b_ba = (
+        envs.VLLM_MACH_MXFP8_2B_BA
+        and hf is not None
+        and config.parallel_config.tensor_parallel_size == 1
+        and config.lora_config is None
+        and config.speculative_config is None
+        and config.model_config.dtype == torch.bfloat16
+        and config.model_config.quantization == "compressed-tensors"
+        and getattr(hf, "model_type", None) == "qwen3_5_text"
+        and getattr(hf, "hidden_size", None) == 2048
+        and getattr(hf, "intermediate_size", None) == 6144
+    )
+    ordered_ba = ordered_gdn_enabled
+    if envs.VLLM_MACH_MXFP8_4B_GDN_FULL and find_spec("b12x") is None:
+        ordered_ba = False
+        init_logger(__name__).warning_once(
+            "4B full GDN is available, but b12x is absent: companion BA uses stock"
+        )
+    if envs.VLLM_MXFP6_SM120_BA_GEMV or ordered_ba or two_b_ba:
         from .ba import prepare_model as prepare_ba_model
 
-        count = prepare_ba_model(model)
+        count = prepare_ba_model(model, include_2b=two_b_ba)
         if ordered_gdn_enabled and count:
             init_logger(__name__).info(
                 "Enabled Ordered GDN companion BA GEMV for %d layers", count
             )
+
+    from .projection_parallel import prepare_model as prepare_parallel_model
+
+    prepare_parallel_model(model, config)
+
+    if envs.VLLM_MACH_MXFP8_SWIGLU_QUANT:
+        from .swiglu_quant import prepare_model as prepare_swiglu_model
+
+        prepare_swiglu_model(model, config)
 
 
 def activate_dense_defaults(config) -> None:

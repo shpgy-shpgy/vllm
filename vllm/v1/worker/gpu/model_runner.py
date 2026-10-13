@@ -1535,6 +1535,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             sampler = getattr(self, "sampler", None)
             if (
                 num_reqs > 0
+                # The Mach wrapper owns greedy admission; its fallback must
+                # materialize full scores through the ordinary sampler.
+                and not envs.VLLM_MACH_MXFP8_GREEDY_HEAD
                 and grammar_output is None
                 and not getattr(input_batch, "has_structured_output_reqs", False)
                 and sampler is not None
