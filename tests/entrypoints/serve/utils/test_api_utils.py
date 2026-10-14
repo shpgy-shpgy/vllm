@@ -1,9 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import asyncio
 from argparse import Namespace
+from types import SimpleNamespace
 
 import pytest
+from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.background import BackgroundTask
 
 from vllm.entrypoints.generate.base.protocol import StreamOptions
 from vllm.entrypoints.serve.utils import api_utils
@@ -12,6 +16,276 @@ from vllm.entrypoints.serve.utils.api_utils import (
     redact_sensitive_args,
     should_include_usage,
 )
+
+
+def _request_for_cancellation(headers=None, receive=None):
+    if receive is None:
+
+        async def receive():
+            await asyncio.sleep(3600)
+
+    return SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(enable_server_load_tracking=False)),
+        state=SimpleNamespace(),
+        headers=headers or {},
+        receive=receive,
+        url=SimpleNamespace(path="/test"),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tracking", [None, False, True])
+@pytest.mark.parametrize("response_kind", ["plain", "json", "stream"])
+@pytest.mark.parametrize("timeout", [None, "0", "-1"])
+async def test_no_deadline_preserves_response_and_load(
+    monkeypatch, tracking, response_kind, timeout
+):
+    """Opt-out requests keep their response and never start a deadline timer."""
+    listener_started = asyncio.Event()
+    listener_closed = asyncio.Event()
+    background_calls: list[str] = []
+
+    async def receive():
+        listener_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            listener_closed.set()
+
+    def unexpected_sleep(*args, **kwargs):
+        pytest.fail("A request without a deadline started a timer")
+
+    async def body():
+        yield b"first"
+        yield b"second"
+
+    expected: dict[str, str] | JSONResponse | StreamingResponse = {"result": "ok"}
+    if response_kind == "json":
+        expected = JSONResponse(expected, status_code=201)
+    elif response_kind == "stream":
+        expected = StreamingResponse(body())
+    if isinstance(expected, (JSONResponse, StreamingResponse)):
+        expected.background = BackgroundTask(background_calls.append, "done")
+
+    async def handler(_, raw_request):
+        await listener_started.wait()
+        return expected
+
+    headers = {} if timeout is None else {"x-upstream-timeout-ms": timeout}
+    request = _request_for_cancellation(headers=headers, receive=receive)
+    if tracking is None:
+        del request.app.state.enable_server_load_tracking
+    else:
+        request.app.state.enable_server_load_tracking = tracking
+    request.app.state.server_load_metrics = 7
+    monkeypatch.setattr(api_utils.asyncio, "sleep", unexpected_sleep)
+    wrapped = api_utils.with_cancellation(api_utils.load_aware_call(handler))
+    result = await wrapped(None, request)
+
+    assert result is expected
+    assert listener_closed.is_set()
+    pending_response = tracking is True and response_kind != "plain"
+    assert request.app.state.server_load_metrics == 7 + int(pending_response)
+    if isinstance(result, StreamingResponse):
+        assert [chunk async for chunk in result.body_iterator] == [b"first", b"second"]
+    if isinstance(result, (JSONResponse, StreamingResponse)):
+        assert result.background is not None
+        await result.background()
+        assert background_calls == ["done"]
+    assert request.app.state.server_load_metrics == 7
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tracking", [False, True])
+async def test_load_aware_without_cancellation_does_not_read_timeout(tracking):
+    class UnreadableHeaders(dict):
+        def get(self, *args, **kwargs):
+            pytest.fail("A route without cancellation inspected timeout headers")
+
+    request = _request_for_cancellation()
+    request.headers = UnreadableHeaders({"x-upstream-timeout-ms": "1"})
+    request.app.state.enable_server_load_tracking = tracking
+    request.app.state.server_load_metrics = 7
+
+    async def handler(_, raw_request):
+        await asyncio.sleep(0.02)
+        return "ok"
+
+    assert await api_utils.load_aware_call(handler)(None, request) == "ok"
+    assert request.app.state.server_load_metrics == 7
+
+
+@pytest.mark.asyncio
+async def test_with_cancellation_timeout_cleans_up_handler():
+    started = asyncio.Event()
+    cleaned_up = asyncio.Event()
+
+    async def handler(_, raw_request):
+        started.set()
+        try:
+            await asyncio.sleep(3600)
+        finally:
+            cleaned_up.set()
+
+    request = _request_for_cancellation(headers={"x-upstream-timeout-ms": "20"})
+    response = await api_utils.with_cancellation(handler)(None, request)
+
+    assert response.status_code == 504
+    assert response.body == (
+        b'{"error":{"message":"Upstream request deadline exceeded",'
+        b'"type":"TimeoutError","code":504}}'
+    )
+    assert started.is_set()
+    assert cleaned_up.is_set()
+
+
+@pytest.mark.asyncio
+async def test_with_cancellation_client_disconnect_propagates_cancellation():
+    started = asyncio.Event()
+    cleaned_up = asyncio.Event()
+
+    async def receive():
+        await started.wait()
+        return {"type": "http.disconnect"}
+
+    async def handler(_, raw_request):
+        started.set()
+        try:
+            await asyncio.sleep(3600)
+        finally:
+            cleaned_up.set()
+
+    request = _request_for_cancellation(receive=receive)
+    with pytest.raises(asyncio.CancelledError, match="Client disconnected"):
+        await api_utils.with_cancellation(handler)(None, request)
+
+    assert cleaned_up.is_set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("headers", [{}, {"x-upstream-timeout-ms": "3600000"}])
+async def test_with_cancellation_outer_cancel_cleans_up_tasks(headers):
+    started = asyncio.Event()
+    handler_cleaned_up = asyncio.Event()
+    listener_cleaned_up = asyncio.Event()
+
+    async def receive():
+        try:
+            await asyncio.sleep(3600)
+        finally:
+            listener_cleaned_up.set()
+
+    async def handler(_, raw_request):
+        started.set()
+        try:
+            await asyncio.sleep(3600)
+        finally:
+            handler_cleaned_up.set()
+
+    request = _request_for_cancellation(headers=headers, receive=receive)
+    baseline_tasks = set(asyncio.all_tasks())
+    wrapper_task = asyncio.create_task(
+        api_utils.with_cancellation(handler)(None, request)
+    )
+    await started.wait()
+    wrapper_task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await wrapper_task
+
+    await asyncio.sleep(0)
+    leaked_tasks = [
+        task
+        for task in asyncio.all_tasks()
+        if task not in baseline_tasks and task is not wrapper_task
+    ]
+    assert handler_cleaned_up.is_set()
+    assert listener_cleaned_up.is_set()
+    assert leaked_tasks == []
+
+
+@pytest.mark.asyncio
+async def test_with_cancellation_ignores_invalid_timeout_header(caplog):
+    async def handler(_, raw_request):
+        return "ok"
+
+    request = _request_for_cancellation(
+        headers={"x-upstream-timeout-ms": "not-an-integer"}
+    )
+    with caplog.at_level("WARNING", logger="vllm.entrypoints.serve.utils.api_utils"):
+        result = await api_utils.with_cancellation(handler)(None, request)
+
+    assert result == "ok"
+    assert "Ignoring invalid x-upstream-timeout-ms header" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_with_cancellation_rejects_oversized_timeout_header(caplog):
+    async def handler(_, raw_request):
+        return "ok"
+
+    request = _request_for_cancellation(headers={"x-upstream-timeout-ms": "9" * 310})
+    with caplog.at_level("WARNING", logger="vllm.entrypoints.serve.utils.api_utils"):
+        result = await api_utils.with_cancellation(handler)(None, request)
+
+    assert result == "ok"
+    assert "Ignoring invalid x-upstream-timeout-ms header" in caplog.text
+    assert "9" * 310 not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_with_cancellation_timeout_releases_server_load():
+    started = asyncio.Event()
+    cleaned_up = asyncio.Event()
+
+    async def handler(_, raw_request):
+        started.set()
+        try:
+            await asyncio.sleep(3600)
+        finally:
+            cleaned_up.set()
+
+    request = _request_for_cancellation(headers={"x-upstream-timeout-ms": "20"})
+    request.app.state.enable_server_load_tracking = True
+    request.app.state.server_load_metrics = 0
+    wrapped = api_utils.with_cancellation(api_utils.load_aware_call(handler))
+
+    response = await wrapped(None, request)
+
+    assert response.status_code == 504
+    assert started.is_set()
+    assert cleaned_up.is_set()
+    assert request.app.state.server_load_metrics == 0
+    assert request.state._vllm_server_load_active == 0
+
+
+@pytest.mark.asyncio
+async def test_with_cancellation_disconnect_releases_server_load():
+    started = asyncio.Event()
+    cleaned_up = asyncio.Event()
+
+    async def receive():
+        await started.wait()
+        return {"type": "http.disconnect"}
+
+    async def handler(_, raw_request):
+        started.set()
+        try:
+            await asyncio.sleep(3600)
+        finally:
+            cleaned_up.set()
+
+    request = _request_for_cancellation(receive=receive)
+    request.app.state.enable_server_load_tracking = True
+    request.app.state.server_load_metrics = 0
+    wrapped = api_utils.with_cancellation(api_utils.load_aware_call(handler))
+
+    with pytest.raises(asyncio.CancelledError, match="Client disconnected"):
+        await wrapped(None, request)
+
+    assert cleaned_up.is_set()
+    assert request.app.state.server_load_metrics == 0
+    assert request.state._vllm_server_load_active == 0
 
 
 @pytest.mark.parametrize(

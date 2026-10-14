@@ -6,6 +6,7 @@ import dataclasses
 import functools
 import os
 from argparse import Namespace
+from http import HTTPStatus
 from logging import Logger
 from string import Template
 from typing import Any
@@ -25,6 +26,12 @@ from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 logger = init_logger(__name__)
 
+# Keep the header and the event-loop delay within a signed 32-bit millisecond
+# range before converting the value to seconds.
+_MAX_UPSTREAM_TIMEOUT_MS = 2**31 - 1
+_MAX_UPSTREAM_TIMEOUT_TEXT = str(_MAX_UPSTREAM_TIMEOUT_MS)
+_SERVER_LOAD_ACTIVE_ATTR = "_vllm_server_load_active"
+
 VLLM_SUBCMD_PARSER_EPILOG = (
     "For full list:            vllm {subcmd} --help=all\n"
     "For a section:            vllm {subcmd} --help=ModelConfig    (case-insensitive)\n"  # noqa: E501
@@ -38,14 +45,30 @@ async def listen_for_disconnect(request: Request) -> None:
     while True:
         message = await request.receive()
         if message["type"] == "http.disconnect":
-            # If load tracking is enabled *and* the counter exists, decrement
-            # it. Combines the previous nested checks into a single condition
-            # to satisfy the linter rule.
-            if getattr(
-                request.app.state, "enable_server_load_tracking", False
-            ) and hasattr(request.app.state, "server_load_metrics"):
-                request.app.state.server_load_metrics -= 1
+            if getattr(request.app.state, "enable_server_load_tracking", False):
+                _decrement_server_load(request, all_active=True)
             break
+
+
+def _increment_server_load(request: Request) -> None:
+    state = request.state
+    setattr(
+        state,
+        _SERVER_LOAD_ACTIVE_ATTR,
+        getattr(state, _SERVER_LOAD_ACTIVE_ATTR, 0) + 1,
+    )
+    request.app.state.server_load_metrics += 1
+
+
+def _decrement_server_load(request: Request, *, all_active: bool = False) -> None:
+    state = request.state
+    active = getattr(state, _SERVER_LOAD_ACTIVE_ATTR, 0)
+    if active <= 0 or not hasattr(request.app.state, "server_load_metrics"):
+        return
+
+    decrement = active if all_active else 1
+    request.app.state.server_load_metrics -= decrement
+    setattr(state, _SERVER_LOAD_ACTIVE_ATTR, active - decrement)
 
 
 def with_cancellation(handler_func):
@@ -77,24 +100,117 @@ def with_cancellation(handler_func):
         # The request is either the second positional arg or `raw_request`
         request = args[1] if len(args) > 1 else kwargs["raw_request"]
 
-        handler_task = asyncio.create_task(handler_func(*args, **kwargs))
-        cancellation_task = asyncio.create_task(listen_for_disconnect(request))
+        timeout_task = None
+        timeout_ms = None
+        timeout_seconds = None
+        raw_timeout_ms = request.headers.get("x-upstream-timeout-ms")
+        if raw_timeout_ms is not None:
+            try:
+                normalized_timeout_ms = raw_timeout_ms.strip()
+                unsigned_timeout_ms = (
+                    normalized_timeout_ms.lstrip("+-").lstrip("0") or "0"
+                )
+                if (
+                    not unsigned_timeout_ms.isascii()
+                    or not unsigned_timeout_ms.isdigit()
+                    or len(unsigned_timeout_ms) > len(_MAX_UPSTREAM_TIMEOUT_TEXT)
+                    or (
+                        len(unsigned_timeout_ms) == len(_MAX_UPSTREAM_TIMEOUT_TEXT)
+                        and unsigned_timeout_ms > _MAX_UPSTREAM_TIMEOUT_TEXT
+                    )
+                ):
+                    raise ValueError("timeout exceeds maximum")
+                timeout_ms = int(normalized_timeout_ms)
+                if timeout_ms > 0:
+                    timeout_seconds = timeout_ms / 1000.0
+            except (AttributeError, TypeError, ValueError, OverflowError):
+                logger.warning("Ignoring invalid x-upstream-timeout-ms header")
+                timeout_ms = None
 
-        done, pending = await asyncio.wait(
-            [handler_task, cancellation_task], return_when=asyncio.FIRST_COMPLETED
-        )
-        for task in pending:
-            task.cancel()
+        tasks = []
+        tasks_cleaned_up = False
+        try:
+            handler_task = asyncio.create_task(handler_func(*args, **kwargs))
+            cancellation_task = asyncio.create_task(listen_for_disconnect(request))
 
-        if handler_task in done:
-            return handler_task.result()
-        return None
+            tasks = [handler_task, cancellation_task]
+            if timeout_seconds is not None:
+                timeout_task = asyncio.create_task(asyncio.sleep(timeout_seconds))
+                tasks.append(timeout_task)
+
+            done, pending = await asyncio.wait(
+                tasks, return_when=asyncio.FIRST_COMPLETED
+            )
+
+            # Normal completion wins a close race with disconnect/deadline.
+            if handler_task in done:
+                if handler_task.cancelled():
+                    _decrement_server_load(request, all_active=True)
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+                tasks_cleaned_up = True
+                return handler_task.result()
+
+            cancel_reason = (
+                "upstream_deadline"
+                if timeout_task is not None and timeout_task in done
+                else "client_disconnect"
+            )
+
+            # Cancelling the handler closes AsyncLLM.generate(); its finally
+            # block aborts the engine request and releases scheduler/KV-cache
+            # resources.
+            if not handler_task.done():
+                handler_task.cancel()
+            for task in pending:
+                if task is not handler_task:
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+            # A disconnect is accounted for by listen_for_disconnect. A
+            # deadline has no disconnect message, so release any tracked load
+            # here.
+            if cancel_reason == "upstream_deadline":
+                _decrement_server_load(request, all_active=True)
+
+            tasks_cleaned_up = True
+            logger.warning(
+                "request cancelled: reason=%s timeout_ms=%s path=%s",
+                cancel_reason,
+                timeout_ms,
+                request.url.path,
+            )
+
+            if cancel_reason == "upstream_deadline":
+                return JSONResponse(
+                    content={
+                        "error": {
+                            "message": "Upstream request deadline exceeded",
+                            "type": "TimeoutError",
+                            "code": HTTPStatus.GATEWAY_TIMEOUT.value,
+                        }
+                    },
+                    status_code=HTTPStatus.GATEWAY_TIMEOUT,
+                )
+
+            # There is no client left to receive a response. Raising
+            # cancellation also avoids FastAPI serializing None as a
+            # misleading HTTP 200/null.
+            raise asyncio.CancelledError("Client disconnected")
+        finally:
+            if not tasks_cleaned_up:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                _decrement_server_load(request, all_active=True)
 
     return wrapper
 
 
 def decrement_server_load(request: Request):
-    request.app.state.server_load_metrics -= 1
+    _decrement_server_load(request)
 
 
 def load_aware_call(func):
@@ -114,11 +230,14 @@ def load_aware_call(func):
         if not hasattr(raw_request.app.state, "server_load_metrics"):
             raw_request.app.state.server_load_metrics = 0
 
-        raw_request.app.state.server_load_metrics += 1
+        _increment_server_load(raw_request)
         try:
             response = await func(*args, **kwargs)
+        except asyncio.CancelledError:
+            _decrement_server_load(raw_request)
+            raise
         except Exception:
-            raw_request.app.state.server_load_metrics -= 1
+            _decrement_server_load(raw_request)
             raise
 
         if isinstance(response, (JSONResponse, StreamingResponse)):
@@ -138,7 +257,7 @@ def load_aware_call(func):
                 tasks.add_task(decrement_server_load, raw_request)
                 response.background = tasks
         else:
-            raw_request.app.state.server_load_metrics -= 1
+            _decrement_server_load(raw_request)
 
         return response
 
