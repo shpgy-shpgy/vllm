@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Complete ordered W4 state lifecycle inside vLLM's existing opaque GDN op.
 
 Imports are CPU only. The composed profile loads kernels after Worker.init_device.
@@ -12,37 +13,44 @@ import inspect
 import os
 import sys
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parent
 GDN_SHA = "d9fb8a2c00cf603237263c632c7a46eccf2cda4a433756670c5161d038c2ffbc"
-RUNNER_SHA = "370c525c2046021b1eb7d62da24df140b732826a59d0d1b785d44bd44842d135"
+# vllm-shpgy carries the request-deadline/cancellation cleanup in the runner;
+# keep the lifecycle guard pinned to that exact local source revision.
+RUNNER_SHA = "bb2fe1945e9d6c5f43eb28dc8e94fb7bbe1d02956147ca5518a99a232b0c4951"
 FLA_SHA = "fe6f1311014809040497aa0a623e7fa97f4b3457cdc7ee1f1f8aed21f326f755"
 W = 4
 PINNED_IDS = os.environ.get("VLLM_MACH_2B_PINNED_IDS", "1") == "1"
 ROWS = (32, 48, 64, 96, 128, 160)
+BF16_ROWS = (1, 2, 4, 8, 16, 24) + ROWS
 GDN_LAYERS = 18
 STATE_HEADS = 16
 QKV_WIDTH = 6144
 QKV_STRIDE = 8192
 MIN_STATE_PAGE_STRIDE = 16 * 128 * 128
-_ELIGIBLE_ROWS = ()
+_ELIGIBLE_ROWS: tuple[int, ...] = ()
 _MAX_NUM_SEQS = None
 _RUN_MODE = None
 _QUALITY_ROW = None
-_PREPARATION_BYTES = {}
+_PREPARATION_BYTES: dict[Any, Any] = {}
 _COMPONENT = None
-_ACTIVE_TARGET = contextvars.ContextVar("two_b_gdn_ordered_target", default=None)
+_ACTIVE_TARGET: contextvars.ContextVar[Any] = contextvars.ContextVar(
+    "two_b_gdn_ordered_target", default=None
+)
 _ORIG_CORE = None
 _ORIG_DECODE = None
 _READY = False
-_OWNER = None
+_OWNER: Any = None
 _CACHE_INITIALIZED = False
+_STATE_GROUP_IDS = None
 _LAYERS = {}
-_VIEW_SCRATCH = {}
-_CAPTURE = {}
-_EAGER = {}
-_FALLBACK = {}
-_PROFILE = {}
+_VIEW_SCRATCH: dict[Any, Any] = {}
+_CAPTURE: dict[Any, Any] = {}
+_EAGER: dict[Any, Any] = {}
+_FALLBACK: dict[Any, Any] = {}
+_PROFILE: dict[Any, Any] = {}
 _ALLOCATION_RESETS = {"new": 0, "cached": 0, "ids": 0}
 
 
@@ -97,10 +105,10 @@ def _check_config(worker):
         or getattr(model, "cpu_offload_gb", 0) not in (None, 0)
         or getattr(model, "enable_sleep_mode", False)
         or model.dtype != torch.bfloat16
-        or cache.mamba_ssm_cache_dtype != "float32"
+        or cache.mamba_ssm_cache_dtype not in ("float32", "bfloat16")
     ):
         raise RuntimeError(
-            "2B ordered GDN requires V2 TP1, FP32 SSM, BF16 model, "
+            "2B ordered GDN requires V2 TP1, FP32/BF16 SSM, BF16 model, "
             "no MTP/LoRA/prefix/ReplaySSM/offload/sleep/connector"
         )
     expected = {
@@ -129,7 +137,7 @@ def _layout(layer, state):
         and layer.num_v_heads == STATE_HEADS
         and layer.head_k_dim == layer.head_v_dim == 128
         and len(layer.kv_cache) == 2
-        and state.dtype == torch.float32
+        and state.dtype in (torch.float32, torch.bfloat16)
         and tuple(state.shape[1:]) == (STATE_HEADS, 128, 128)
         and tuple(state.stride()[1:]) == (16384, 128, 1)
         and state.stride(0) >= MIN_STATE_PAGE_STRIDE
@@ -308,8 +316,8 @@ def _register_gdn():
         )
         return
 
-    GDN._forward_core = core
-    GDN._forward_core_decode_non_spec = decode
+    GDN._forward_core = core  # type: ignore[method-assign]
+    GDN._forward_core_decode_non_spec = decode  # type: ignore[method-assign]
     GDN._two_b_gdn_ordered_installed = True
     from vllm import envs
 
@@ -334,9 +342,9 @@ def _prepare_layers(worker):
     if maximum <= 0 or _MAX_NUM_SEQS is not None:
         raise RuntimeError("invalid/repeated full-M row preparation")
     _MAX_NUM_SEQS = maximum
-    # Quality row4 intentionally has no candidate rows; stock remains usable.
-    # Higher fixed-row modes clip the same high-M candidate set.
-    _ELIGIBLE_ROWS = tuple(m for m in ROWS if m <= maximum)
+    state_dtype = worker.vllm_config.cache_config.mamba_ssm_cache_dtype
+    configured_rows = BF16_ROWS if state_dtype == "bfloat16" else ROWS
+    _ELIGIBLE_ROWS = tuple(m for m in configured_rows if m <= maximum)
     layers = [x for _, x in worker.get_model().named_modules() if isinstance(x, GDN)]
     if len(layers) != GDN_LAYERS or len({x.prefix for x in layers}) != GDN_LAYERS:
         raise RuntimeError("expected 18 unique GDN layers")
@@ -376,7 +384,7 @@ def _prepare_pools(worker):
     if worker.model_runner.kv_connector is not NO_OP_KV_CONNECTOR:
         raise RuntimeError("KV connector/offload path unsupported")
     layers = [x for _, x in worker.get_model().named_modules() if isinstance(x, GDN)]
-    views = {}
+    views: dict[tuple, Any] = {}
     for layer in layers:
         _, state = _pools(layer)
         if not _layout(layer, state):
@@ -394,7 +402,7 @@ def _prepare_pools(worker):
         for name, shape in component.required_shapes(state.shape[0], W).items():
             required += __import__("math").prod(shape) * (4 if name == "age" else 4)
     _PREPARATION_BYTES.update(live_scratch=required, reserve=512 * 2**20)
-    free, total = torch.cuda.mem_get_info(layers[0].A_log.device)
+    free, total = torch.accelerator.get_memory_info(layers[0].A_log.device)
     if free < required + 512 * 2**20:
         raise RuntimeError(
             f"ordered GDN requires {required} B live scratch + 512 MiB reserve; "
@@ -460,17 +468,19 @@ def _prepare_pools(worker):
                 scale=128**-0.5,
             )
             component.materialize_slots(state, idx, scratch)
-    torch.cuda.synchronize(device)
+    torch.accelerator.synchronize(device)
     _READY = True
 
 
-def _flatten_new(blocks):
+def _flatten_new(blocks, group_ids=None):
     if blocks is None:
         return []
     if not isinstance(blocks, tuple):
         raise TypeError("block_ids must be tuple[list[int], ...]")
-    ids = []
-    for group in blocks:
+    ids: list[int] = []
+    selected = range(len(blocks)) if group_ids is None else group_ids
+    for index in selected:
+        group = blocks[index]
         if not isinstance(group, list) or any(type(x) is not int for x in group):
             raise TypeError("block_ids group must contain Python ints")
         ids.extend(x for x in group if x > 0)
@@ -543,7 +553,7 @@ def _install_runner_lifecycle():
         ids = [
             x
             for req in scheduler_output.scheduled_new_reqs
-            for x in _flatten_new(req.block_ids)
+            for x in _flatten_new(req.block_ids, _STATE_GROUP_IDS)
         ]
         _reset_allocated(ids, "new")
         return result
@@ -558,14 +568,14 @@ def _install_runner_lifecycle():
         ids = [
             x
             for block in scheduler_output.scheduled_cached_reqs.new_block_ids
-            for x in _flatten_new(block)
+            for x in _flatten_new(block, _STATE_GROUP_IDS)
         ]
         _reset_allocated(ids, "cached")
         return result
 
-    GPUModelRunner.add_requests = add
-    GPUModelRunner.update_requests = update
-    GPUModelRunner._two_b_gdn_ordered_lifecycle = True
+    GPUModelRunner.add_requests = add  # type: ignore[method-assign]
+    GPUModelRunner.update_requests = update  # type: ignore[method-assign]
+    GPUModelRunner._two_b_gdn_ordered_lifecycle = True  # type: ignore[attr-defined]
 
 
 def inspect_worker(worker):
@@ -587,14 +597,23 @@ def inspect_worker(worker):
         "kv_cache_memory_bytes": budget,
         "production_throughput_profile": False,
         "implementation": "two_b_ordered_highM_w4",
-        "configured_rows": list(ROWS),
-        "low_rows_policy": "materialize_relevant_slots_then_stock",
+        "configured_rows": list(
+            BF16_ROWS
+            if _OWNER.vllm_config.cache_config.mamba_ssm_cache_dtype == "bfloat16"
+            else ROWS
+        ),
+        "low_rows_policy": (
+            "gluon_on_configured_rows_else_materialize_then_stock"
+            if _OWNER.vllm_config.cache_config.mamba_ssm_cache_dtype == "bfloat16"
+            else "materialize_relevant_slots_then_stock"
+        ),
         "adapted_low_kernels_enabled": False,
         "pinned_ids_enabled": PINNED_IDS,
         "eligible_rows": list(_ELIGIBLE_ROWS),
         "scheduler_max_num_seqs": _MAX_NUM_SEQS,
         "warm_index_capacity": max(_ELIGIBLE_ROWS, default=1),
         "preparation_required_bytes": dict(_PREPARATION_BYTES),
+        "state_dtype": _OWNER.vllm_config.cache_config.mamba_ssm_cache_dtype,
         "component_module": component.__name__,
         "component_sha256": _sha(component.__file__),
         "coeff_semantics": "raw_alpha_ordered_replay_highM_W4",
@@ -661,7 +680,7 @@ def install_runtime(worker):
 
 def initialize_cache(worker):
     """Validate the final state binding before allocating scratch."""
-    global _CACHE_INITIALIZED
+    global _CACHE_INITIALIZED, _STATE_GROUP_IDS
     _claim_worker(worker)
     if _READY or _CACHE_INITIALIZED or len(_LAYERS) != GDN_LAYERS:
         raise RuntimeError(
@@ -675,6 +694,14 @@ def initialize_cache(worker):
     for _, layer in worker.get_model().named_modules():
         if isinstance(layer, GDN) and not _layout(layer, _pools(layer)[1]):
             raise RuntimeError(f"unsupported initialized GDN state: {layer.prefix}")
+    groups = worker.model_runner.kv_cache_config.kv_cache_groups
+    _STATE_GROUP_IDS = tuple(
+        i for i, group in enumerate(groups) if _LAYERS.keys() & set(group.layer_names)
+    )
+    if not _STATE_GROUP_IDS:
+        raise RuntimeError("ordered GDN layers have no bound state cache group")
+    # Attention-only allocations cannot own a live GDN slot in the shared
+    # block pool. Reset on GDN allocation (including reuse), not KV growth.
     _CACHE_INITIALIZED = True
 
 
@@ -688,7 +715,7 @@ def _idle_boundary(worker):
         )
     if worker.model_runner.req_states.req_id_to_index:
         raise RuntimeError("drain requests before explicit state lifecycle operations")
-    torch.cuda.synchronize(worker.device)
+    torch.accelerator.synchronize(worker.device)
 
 
 def materialize_state(worker):
@@ -702,7 +729,7 @@ def materialize_state(worker):
         state = views[key]
         ids = torch.arange(1, state.shape[0], dtype=torch.int32, device=state.device)
         component.materialize_slots(state, ids, scratch)
-    torch.cuda.synchronize(worker.device)
+    torch.accelerator.synchronize(worker.device)
     return {"materialized_views": len(_VIEW_SCRATCH), "synchronized": True}
 
 
@@ -723,7 +750,7 @@ def reset_state(worker, *, zero_base=False):
         state = views[key]
         ids = torch.arange(1, state.shape[0], dtype=torch.int32, device=state.device)
         component.reset_slots(state, ids, scratch, zero_base=zero_base)
-    torch.cuda.synchronize(worker.device)
+    torch.accelerator.synchronize(worker.device)
     return {
         "reset_views": len(_VIEW_SCRATCH),
         "zero_base": zero_base,

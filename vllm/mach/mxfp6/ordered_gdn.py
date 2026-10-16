@@ -80,7 +80,7 @@ def _eligible_layer(layer) -> bool:
         _, state_dtype = layer.get_state_dtype()
     except Exception:
         return False
-    return state_dtype == torch.float32
+    return state_dtype in (torch.float32, torch.bfloat16)
 
 
 def _state_key(state: torch.Tensor) -> tuple:
@@ -154,7 +154,7 @@ def _bind_deferred_scratch(layer) -> None:
         state.ndim != 4
         or tuple(state.shape[1:])
         != (ordered_m16_deferred.HV, ordered_m16_deferred.V, ordered_m16_deferred.K)
-        or state.dtype != torch.float32
+        or state.dtype not in (torch.float32, torch.bfloat16)
         or not state.is_cuda
         or state.stride(-1) != 1
         or state.stride(-2) != ordered_m16_deferred.K
@@ -173,10 +173,10 @@ def _bind_deferred_scratch(layer) -> None:
     # layout or graph pointer is ever reused across the two pools.
     # Reuse the private padding already present in each mamba cache page.
     # This keeps deferred metadata out of the KV-cache memory budget.
-    if envs.VLLM_MACH_MXFP8_4B_GDN_FULL:
+    if envs.VLLM_MACH_MXFP8_4B_GDN_FULL or state.dtype == torch.bfloat16:
         # The upstream low-M kernels require dense caller-owned scratch.
         required = state.shape[0] * (32 * 4 * 128 * 2 + 32 * 4 * 4 + 32 * 4 * 2) * 4
-        free, _ = torch.cuda.mem_get_info(state.device)
+        free, _ = torch.accelerator.get_memory_info(state.device)
         if free < required + 512 * 2**20:
             raise RuntimeError("4B full ordered GDN scratch needs 512 MiB free reserve")
         scratch = ordered_m16_deferred.allocate(state.shape[0], state.device)
@@ -246,7 +246,7 @@ def _target(layer, metadata: Any, mixed_qkv, b, a) -> bool:
     indices = metadata.non_spec_state_indices_tensor[:rows]
     return (
         conv.dtype == torch.bfloat16
-        and state.dtype == torch.float32
+        and state.dtype in (torch.float32, torch.bfloat16)
         and tuple(state.shape[1:])
         == (ordered_m16_deferred.HV, ordered_m16_deferred.V, ordered_m16_deferred.K)
         and state.stride(-1) == 1
@@ -520,7 +520,22 @@ def prepare(model) -> int:
     """Validate, warm, and install the first Ordered GDN stage."""
     global DEFERRED_ROWS, ROWS, _DECODE
 
-    if envs.VLLM_MACH_MXFP8_4B_GDN_FULL:
+    gdn_layers = [
+        layer
+        for layer in model.modules()
+        if type(layer).__name__ == "QwenGatedDeltaNetAttention"
+    ]
+    bf16_state = False
+    for layer in gdn_layers:
+        try:
+            _, state_dtype = layer.get_state_dtype()
+        except Exception:
+            continue
+        bf16_state |= state_dtype == torch.bfloat16
+
+    # The upstream BF16 path is qualified for every graph row and uses
+    # caller-owned scratch.  Keep FP32's measured high-M route unchanged.
+    if envs.VLLM_MACH_MXFP8_4B_GDN_FULL or bf16_state:
         from .gdn import champion_ordered_full_m4_m16_deferred_dispatch as champion
 
         DEFERRED_ROWS = ROWS = champion.ROWS
@@ -543,7 +558,7 @@ def prepare(model) -> int:
     if not gdn_layers or len(layers) != len(gdn_layers):
         raise ValueError(
             "Ordered GDN requires every GDN layer to be the Qwen3.5-4B "
-            "TP1 SM120 FP32-state geometry"
+            "TP1 SM120 FP32/BF16-state geometry"
         )
     if not layers:
         raise ValueError("Ordered GDN found no eligible Qwen3.5-4B GDN layers")

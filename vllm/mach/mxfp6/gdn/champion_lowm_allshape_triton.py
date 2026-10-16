@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Ordered raw-alpha FP32 GDN kernels for the frozen TP1 SM120 profile.
 
 Caller-owned W4 scratch; arithmetic and launch configurations are fixed.
 """
+
+from typing import Any
 
 import torch
 
@@ -18,7 +21,7 @@ validate = ordered.validate
 reset_slots = ordered.reset_slots
 materialize_slots = ordered.materialize_slots
 _LAST_KERNEL = None
-_COMPILED = {}
+_COMPILED: dict[Any, Any] = {}
 
 
 @triton.jit
@@ -91,6 +94,8 @@ def _lowm_ordered_decode(
             # update. Pin the same FMA operand order for replay/materialize.
             scaled = b_h * old_alpha
             b_h = tl.fma(old_d[:, None], old_k[None, :], scaled)
+            if base.dtype.element_ty == tl.bfloat16:
+                b_h = b_h.to(tl.bfloat16).to(tl.float32)
 
     ptr_mixed = mixed_qkv + it * stride_mixed
     b_q = tl.load(ptr_mixed + ik * K + ok).to(tl.float32)
@@ -164,6 +169,24 @@ def decode(mixed_qkv, a, b, A_log, dt_bias, base, out, indices, scratch, scale=K
         raise ValueError("out contiguous BF16 [M,1,32,128], indices[M] required")
     if not ordered.math_isfinite_positive(scale):
         raise ValueError("scale must be positive finite")
+    if base.dtype == torch.bfloat16 and exp is tl.exp:
+        from .bf16_small_gluon import decode as bf16_decode
+        from .bf16_small_gluon import supports_shape
+
+        if supports_shape(m, HV):
+            bf16_decode(
+                mixed_qkv,
+                a,
+                b,
+                A_log,
+                dt_bias,
+                base,
+                out,
+                indices,
+                scratch,
+                scale,
+            )
+            return out
     global _LAST_KERNEL
     _LAST_KERNEL = _lowm_ordered_decode[(NV, HV * m)](
         mixed_qkv,

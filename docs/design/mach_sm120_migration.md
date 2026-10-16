@@ -211,3 +211,59 @@ MXFP6_AUTOTUNE=off
 Keep the normal compiled/prefill-graph policy; leave the Dense-only adapters
 off. FP16 SSM and hybrid NVFP4 head remain independent precision/sampling
 choices, not silently enabled by either group of flags.
+
+## Qwen3.5-2B MXFP8 BF16 GDN follow-up (2026-10-15)
+
+The BF16 ordered port needs the mixed decode companion as well as pure decode.
+With only pure decode enabled, a batch containing both prefill and decode
+materializes pending state for all requests and falls back to stock recurrence.
+The companion retains ordered history for decode requests while preserving the
+stock convolution and prefill branch. The mixed kernel must round state to
+BF16 after every replayed token, matching a stock state store/load boundary;
+that upstream rounding step was missing from the original local mixed port.
+Allocation hooks now reset metadata only for blocks assigned to GDN groups,
+not attention-only KV growth.
+
+Automatic admission selects ordered and mixed together for the validated
+SM120 Qwen3.5-2B MXFP8 native profile: V2, TP1, BF16 model/SSM/KV,
+FLASHINFER, 64 maximum sequences, no prefix caching, ReplaySSM, MTP, LoRA,
+offload, transfer connector or fixed block-count override. Explicitly setting
+either `VLLM_MACH_MXFP8_2B_GDN_ORDERED=0` or
+`VLLM_MACH_MXFP8_2B_GDN_MIXED=0` suppresses this automatic pair. Other profiles
+retain their previous behavior; in particular 4B does not acquire this default.
+
+Same-GPU6 sequential comparisons used the unchanged 3000/1000 benchmark,
+one complete warmup sweep and two scored sweeps each, with BF16 SSM and default
+BF16 KV. The server retained the original capture sizes and launch arguments.
+
+| 2B BS64 route | Run 1 output tok/s | Run 2 output tok/s | Mean |
+| --- | ---: | ---: | ---: |
+| Stock GDN | 10189.95 | 10136.69 | 10163.32 |
+| Ordered, mixed off | 9951.52 | 9848.78 | 9900.15 |
+| Ordered + BF16-correct mixed | 10556.54 | 10560.93 | 10558.74 |
+
+The complete pair improves BS64 by 3.89% over stock and 6.65% over pure-only
+ordered. Mean ITL changes from 5.868 to 5.649 ms versus stock. Small-batch
+throughput is essentially unchanged; this is not an all-batch speedup claim.
+The benchmark retokenizes output text, so elapsed time and ITL were also
+checked: BS64 mean elapsed time changes from 31.476 to 30.306 seconds.
+Requests use the benchmark's unchanged random seed policy and clocks are not
+locked, so these are repeated serving measurements, not a statistical bound.
+
+A subsequent unchanged-command run with neither GDN switch in the environment
+confirmed automatic admission and mixed branch hits. Its scored BS64 duration
+corresponds to 10617.43 generated tokens/s (320000 tokens); the CSV reports
+10716.80 because output retokenization counted 322995 tokens. This run verifies
+default routing, rather than establishing an additional optimization gain.
+The unchanged 4B GPU3 command, using
+`/data/models/Qwen3.5-4B-MXFP8-test`, scored 4855.76 output tokens/s at BS64
+(4855.89 from fixed generated tokens and elapsed time). Its worker receipt
+shows neither 2B ordered/mixed defaults nor ordered scratch reservation.
+The earlier same-GPU3 stock runs were about 4861 tokens/s, so this single
+4B confirmation run does not indicate a material regression.
+
+Kernel/lifecycle/default-routing regression passes 176 cases, including
+129-step FP32/BF16 mixed recurrence, pure/mixed handoffs, graph replay,
+materialization and slot reuse. This is not a new task-accuracy evaluation.
+Raw commands, manifests, CSVs and diagnostic findings are under
+`/data/luyufan/gdn_bf16_20261014/` on the validation host.

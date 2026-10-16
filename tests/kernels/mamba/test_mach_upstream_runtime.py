@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Routing, safe defaults and actual mixed-core splice admission."""
 
 import ast
@@ -122,6 +123,87 @@ def test_auto_checks_quantization_not_just_model_name(auto_worker):
     mc.hf_config.quantization_config["format"] = "pack-quantized"
     auto_defaults.activate(auto_worker)
     assert not auto_worker._mach_auto_defaults
+
+
+def test_two_b_ordered_gdn_requires_explicit_opt_in(auto_worker, monkeypatch):
+    from vllm.mach.mxfp6 import auto_defaults, upstream_runtime
+
+    hf = auto_worker.vllm_config.model_config.hf_text_config
+    hf.hidden_size, hf.intermediate_size, hf.num_hidden_layers = 2048, 6144, 24
+    auto_defaults.activate(auto_worker)
+    assert not upstream_runtime._two_b_ordered_enabled(auto_worker)
+    monkeypatch.setenv("VLLM_MACH_MXFP8_2B_GDN_ORDERED", "1")
+    assert upstream_runtime._two_b_ordered_enabled(auto_worker)
+    monkeypatch.setenv("VLLM_MACH_MXFP8_2B_GDN_ORDERED", "0")
+    assert not upstream_runtime._two_b_ordered_enabled(auto_worker)
+
+
+@pytest.fixture
+def bf16_two_b_worker(auto_worker):
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+    cfg = auto_worker.vllm_config
+    hf = cfg.model_config.hf_text_config
+    hf.hidden_size, hf.intermediate_size, hf.num_hidden_layers = 2048, 6144, 24
+    cfg.cache_config = SimpleNamespace(
+        mamba_ssm_cache_dtype="bfloat16",
+        mamba_cache_dtype="auto",
+        cache_dtype="auto",
+        mamba_cache_mode="none",
+        enable_prefix_caching=False,
+    )
+    cfg.scheduler_config = SimpleNamespace(max_num_seqs=64)
+    cfg.attention_config = SimpleNamespace(backend=AttentionBackendEnum.FLASHINFER)
+    return auto_worker
+
+
+def test_two_b_bf16_defaults_enable_pure_and_mixed_together(bf16_two_b_worker):
+    from vllm.mach.mxfp6 import auto_defaults
+
+    auto_defaults.activate(bf16_two_b_worker)
+    assert envs.VLLM_MACH_MXFP8_2B_GDN_ORDERED
+    assert envs.VLLM_MACH_MXFP8_2B_GDN_MIXED
+
+
+@pytest.mark.parametrize(
+    "section,key,value",
+    [
+        ("cache_config", "mamba_ssm_cache_dtype", "float32"),
+        ("cache_config", "mamba_cache_dtype", "float32"),
+        ("cache_config", "cache_dtype", "fp8"),
+        ("cache_config", "mamba_cache_mode", "align"),
+        ("cache_config", "enable_prefix_caching", True),
+        ("cache_config", "use_replayssm", True),
+        ("cache_config", "kv_offloading_size", 1),
+        ("cache_config", "num_gpu_blocks_override", 512),
+        ("scheduler_config", "max_num_seqs", 160),
+        ("attention_config", "backend", None),
+        ("attention_config", "backend_per_kind", {"attention": "TRITON_ATTN"}),
+        (None, "kv_transfer_config", object()),
+    ],
+)
+def test_two_b_bf16_defaults_reject_other_profiles(
+    bf16_two_b_worker, section, key, value
+):
+    from vllm.mach.mxfp6 import auto_defaults
+
+    cfg = bf16_two_b_worker.vllm_config
+    setattr(getattr(cfg, section) if section else cfg, key, value)
+    auto_defaults.activate(bf16_two_b_worker)
+    assert not envs.VLLM_MACH_MXFP8_2B_GDN_ORDERED
+    assert not envs.VLLM_MACH_MXFP8_2B_GDN_MIXED
+
+
+@pytest.mark.parametrize("suffix", ["ORDERED", "MIXED"])
+def test_two_b_bf16_defaults_respect_disabling_either_companion(
+    bf16_two_b_worker, monkeypatch, suffix
+):
+    from vllm.mach.mxfp6 import auto_defaults
+
+    monkeypatch.setenv("VLLM_MACH_MXFP8_2B_GDN_" + suffix, "0")
+    auto_defaults.activate(bf16_two_b_worker)
+    assert not envs.VLLM_MACH_MXFP8_2B_GDN_ORDERED
+    assert not envs.VLLM_MACH_MXFP8_2B_GDN_MIXED
 
 
 def test_auto_native_dependency_failure_keeps_independent_fusion(
@@ -489,6 +571,7 @@ def test_mixed_splice_preserves_current_core_except_recurrent_branch(monkeypatch
     source = textwrap.dedent(inspect.getsource(original))
     tree = ast.parse(source)
     fn = tree.body[0]
+    assert isinstance(fn, ast.FunctionDef)
     branches = [
         node
         for node in fn.body
@@ -509,3 +592,14 @@ def test_two_b_reset_ids_are_strict_and_keep_zero_sentinel_out():
         _flatten_new(([True],))
     with pytest.raises(TypeError):
         _flatten_new([[1]])
+
+
+def test_two_b_attention_growth_does_not_reset_pending_recurrent_state():
+    from vllm.mach.mxfp6.two_b_ordered_gdn import _flatten_new
+
+    # Two state groups share the global allocator with one attention group.
+    assert _flatten_new(([11, 12], [], []), (1, 2)) == []
+    assert _flatten_new(([11], [0, 20], [30]), (1, 2)) == [20, 30]
+    # A recycled attention ID must be reset when allocated to a state group.
+    assert _flatten_new(([], [11], []), (1, 2)) == [11]
+    assert _flatten_new(None, (1, 2)) == []

@@ -1,13 +1,52 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Independent lifecycle entrypoints for the remaining Mach ports.
 
 No serving profile, model asset, dependency or capture-size override is applied.
 """
 
+from typing import Any
+
 from vllm import envs
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
+
+
+def _is_qwen35_shape(config, shape: tuple[int, int, int]) -> bool:
+    model = getattr(config, "model_config", None)
+    text = getattr(model, "hf_text_config", None)
+    return (
+        getattr(text, "model_type", None) == "qwen3_5_text"
+        and tuple(
+            getattr(text, name, None)
+            for name in ("hidden_size", "intermediate_size", "num_hidden_layers")
+        )
+        == shape
+    )
+
+
+def _two_b_ordered_enabled(worker) -> bool:
+    """Use the explicit override or the profile-qualified pure/mixed default."""
+
+    return envs.VLLM_MACH_MXFP8_2B_GDN_ORDERED
+
+
+def _four_b_bf16_scratch_enabled(worker) -> bool:
+    """Reserve scratch for the model-gated 4B BF16 ordered route."""
+
+    if not getattr(worker.get_model(), "_mach_ordered_gdn_prepared", False):
+        return False
+    if envs.VLLM_MACH_MXFP8_4B_GDN_FULL:
+        # Explicit full-M FP32 also owns a separate deferred scratch pool.
+        return True
+    config = worker.vllm_config
+    return (
+        _is_qwen35_shape(config, (2560, 9216, 32))
+        and config.use_v2_model_runner
+        and config.parallel_config.tensor_parallel_size == 1
+        and config.cache_config.mamba_ssm_cache_dtype == "bfloat16"
+    )
 
 
 def reserve_state_scratch(worker, available: int) -> int:
@@ -16,8 +55,8 @@ def reserve_state_scratch(worker, available: int) -> int:
     Plan on copies with the original budget, then reserve that upper bound.
     The real (smaller) pool cannot require more scratch than this plan.
     """
-    two_b = envs.VLLM_MACH_MXFP8_2B_GDN_ORDERED
-    four_b = envs.VLLM_MACH_MXFP8_4B_GDN_FULL
+    two_b = _two_b_ordered_enabled(worker)
+    four_b = _four_b_bf16_scratch_enabled(worker)
     if not (two_b or four_b):
         return available
     from copy import copy, deepcopy
@@ -45,7 +84,12 @@ def reserve_state_scratch(worker, available: int) -> int:
     plan = get_kv_cache_configs(
         planning, [deepcopy(worker.get_kv_cache_spec())], [available]
     )[0]
-    heads, layers = (16, 18) if two_b else (32, 24)
+    if _is_qwen35_shape(cfg, (2048, 6144, 24)):
+        heads, layers = 16, 18
+    elif _is_qwen35_shape(cfg, (2560, 9216, 32)):
+        heads, layers = 32, 24
+    else:
+        heads, layers = (16, 18) if two_b else (32, 24)
     per_page = heads * (4 * 128 * 2 + 4 * 4 + 4 * 2) * 4
     pages = plan.num_blocks + cfg.scheduler_config.max_num_seqs + 1
     reserved = pages * per_page * layers
@@ -99,12 +143,12 @@ def before_profile(worker):
 
         if not hasattr(worker, kv_scales._STATE):
             kv_scales.install_scales(worker, envs.VLLM_MACH_MXFP8_KV_SCALE_PROFILE)
-    if envs.VLLM_MACH_MXFP8_2B_GDN_MIXED and not envs.VLLM_MACH_MXFP8_2B_GDN_ORDERED:
+    if envs.VLLM_MACH_MXFP8_2B_GDN_MIXED and not _two_b_ordered_enabled(worker):
         raise ValueError("2B mixed GDN requires 2B ordered GDN")
 
 
 def after_cache(worker):
-    if envs.VLLM_MACH_MXFP8_2B_GDN_ORDERED:
+    if _two_b_ordered_enabled(worker):
         from . import two_b_ordered_gdn as gdn
 
         # Install after memory profiling: profiling uses the unchanged stock
@@ -149,7 +193,7 @@ def after_compile(worker):
 
 def inspect(worker):
     """Host counters describe dispatch/capture construction, not graph replays."""
-    result = {}
+    result: dict[str, Any] = {}
     if getattr(worker, "_mach_auto_defaults", None):
         result["automatic_defaults"] = dict(worker._mach_auto_defaults)
     model = worker.model_runner.model
@@ -221,7 +265,7 @@ def inspect(worker):
         result["compile_choices"] = compile_choices.verify_coverage(
             require_complete=False
         )
-    if envs.VLLM_MACH_MXFP8_2B_GDN_ORDERED:
+    if _two_b_ordered_enabled(worker):
         from . import two_b_ordered_gdn
 
         result["ordered_gdn"] = two_b_ordered_gdn.inspect_worker(worker)

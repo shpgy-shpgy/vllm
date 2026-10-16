@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Model-scoped automatic admission, without changing serving configuration.
 
-Calibration, fixed compiler recipes, PDL and state-pool replacements remain
-explicit: a matching model shape alone does not qualify those policies.
+Calibration, fixed compiler recipes and PDL remain explicit. Deferred GDN
+requires a qualified serving profile, not just a matching model shape.
 """
 
 import importlib
@@ -64,7 +65,11 @@ def model_size(cfg):
             "num_hidden_layers",
         )
     )
-    return {(2048, 6144, 24): "2b", (2560, 9216, 32): "4b"}.get(shape)
+    if shape == (2048, 6144, 24):
+        return "2b"
+    if shape == (2560, 9216, 32):
+        return "4b"
+    return None
 
 
 def _available(module, function=None):
@@ -78,6 +83,35 @@ def _available(module, function=None):
         return False
 
 
+def _two_b_bf16_gdn_profile(cfg):
+    """Admit the paired pure/mixed route only in the qualified serving profile."""
+    cache = getattr(cfg, "cache_config", None)
+    scheduler = getattr(cfg, "scheduler_config", None)
+    attention = getattr(cfg, "attention_config", None)
+    backend = getattr(attention, "backend", None)
+    return (
+        getattr(cache, "mamba_ssm_cache_dtype", None) == "bfloat16"
+        and getattr(cache, "mamba_cache_dtype", None) in ("auto", "bfloat16")
+        and getattr(cache, "cache_dtype", None) in ("auto", "bfloat16")
+        and getattr(cache, "mamba_cache_mode", None) == "none"
+        and getattr(cache, "enable_prefix_caching", True) is False
+        and not getattr(cache, "use_replayssm", False)
+        and getattr(cache, "kv_offloading_size", None) in (None, 0)
+        and getattr(cache, "num_gpu_blocks_override", None) is None
+        and getattr(cfg, "kv_transfer_config", None) is None
+        and getattr(scheduler, "max_num_seqs", None) == 64
+        and getattr(backend, "name", None) == "FLASHINFER"
+        and not getattr(attention, "backend_per_kind", {})
+        and all(
+            os.getenv(name) != "0"
+            for name in (
+                "VLLM_MACH_MXFP8_2B_GDN_ORDERED",
+                "VLLM_MACH_MXFP8_2B_GDN_MIXED",
+            )
+        )
+    )
+
+
 def activate(worker):
     # Called after selecting the worker GPU, before constructing/loading a model.
     envs.set_mach_mxfp8_defaults({})
@@ -86,7 +120,7 @@ def activate(worker):
     size = model_size(worker.vllm_config)
     if size is None or torch.cuda.get_device_capability(worker.device) != (12, 0):
         return
-    values = {"VLLM_MACH_MXFP8_SWIGLU_QUANT": True}
+    values: dict[str, bool | str] = {"VLLM_MACH_MXFP8_SWIGLU_QUANT": True}
     native = envs.VLLM_MXFP6_SM120_MXFP8_NATIVE and _available(
         "vllm.model_executor.kernels.linear.mxfp8.mxfp6_sm120",
         "load_mxfp6_sm120_mxfp8_libraries",
@@ -113,6 +147,11 @@ def activate(worker):
                 values["VLLM_MACH_MXFP8_DUAL_POLICY"] = "mach"
         else:
             values["VLLM_MACH_MXFP8_2B_NATIVE"] = True
+            if _two_b_bf16_gdn_profile(worker.vllm_config):
+                # Pure-only W4 regressed continuous batching. Keep the mixed
+                # companion together with BF16 replay rounding and slot resets.
+                values["VLLM_MACH_MXFP8_2B_GDN_ORDERED"] = True
+                values["VLLM_MACH_MXFP8_2B_GDN_MIXED"] = True
     if _available("vllm.mach.mxfp6.ba_gemv"):
         if size == "4b":
             values["VLLM_MXFP6_SM120_BA_GEMV"] = True

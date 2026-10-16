@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Mixed decode with ordered FP32 state; retain stock convolution and prefill.
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Mixed decode with ordered FP32/BF16 state; retain stock conv and prefill.
 
 The source-pinned vLLM core is cloned once at worker setup. Only its mixed
 recurrent branch changes. Prefill slots are materialized; decode slots keep
@@ -13,11 +14,12 @@ import textwrap
 from collections import Counter
 from functools import wraps
 from pathlib import Path
+from typing import Any
 
 PROTOCOL = "mixed-lean-stockmath-w4-v1"
-_COUNTS = {}
+_COUNTS: dict[Any, Any] = {}
 _VALIDATED = {}
-_LAYER_CACHE = {}
+_LAYER_CACHE: dict[Any, Any] = {}
 _CLONE_SHA = None
 _ORIGINAL_SHA = None
 
@@ -58,6 +60,8 @@ else:
 """).body[0]
     edited = ast.parse(original_source)
     edited_fn = edited.body[0]
+    assert isinstance(edited_fn, ast.FunctionDef)
+    assert isinstance(edited_fn, ast.FunctionDef)
     edited_fn.body[index] = replacement
     for i, (before, after) in enumerate(zip(fn.body, edited_fn.body, strict=True)):
         if i != index:

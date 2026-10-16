@@ -124,8 +124,8 @@ def from_state(base: torch.Tensor) -> DeferredScratch:
 def validate(base: torch.Tensor, scratch: DeferredScratch) -> tuple[int, int]:
     if base.ndim != 4 or tuple(base.shape[1:]) != (HV, V, K):
         raise ValueError("base must be [P,32,128,128]")
-    if base.dtype != torch.float32 or not base.is_cuda:
-        raise ValueError("base must be CUDA FP32")
+    if base.dtype not in (torch.float32, torch.bfloat16) or not base.is_cuda:
+        raise ValueError("base must be CUDA FP32 or BF16")
     if base.stride(3) != 1 or base.stride(2) != K or base.stride(1) != V * K:
         raise ValueError("base inner head,V,K dimensions must be dense")
     if base.stride(0) < HV * V * K:
@@ -242,6 +242,8 @@ def _ordered_decode(
             old_d = tl.load(pd_tile + j * BV + ov_local).to(tl.float32)
             scaled = b_h * old_alpha
             b_h = tl.fma(old_d[:, None], old_k[None, :], scaled)
+            if base.dtype.element_ty == tl.bfloat16:
+                b_h = b_h.to(tl.bfloat16).to(tl.float32)
 
     ptr_mixed = mixed_qkv + it * stride_mixed
     b_q = tl.load(ptr_mixed + ik * K + ok).to(tl.float32)
@@ -332,6 +334,8 @@ def _ordered_materialize(
             old_d = tl.load(pd_tile + j * BV + ov_local).to(tl.float32)
             scaled = b_h * old_alpha
             b_h = tl.fma(old_d[:, None], old_k[None, :], scaled)
+            if base.dtype.element_ty == tl.bfloat16:
+                b_h = b_h.to(tl.bfloat16).to(tl.float32)
     tl.store(ptr_base, b_h)
     tl.store(prefix + state_idx * stride_prefix_page + meta, 1.0)
     tl.store(age + meta_ptr, 0)

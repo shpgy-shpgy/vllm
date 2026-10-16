@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Mixed-decode W4 kernel with stock mixed-branch FP32 operation order.
 
 Pure decode and mixed decode have different stock normalizations. Keep this
@@ -8,30 +9,11 @@ materialization implementation are shared.
 
 from vllm.triton_utils import tl, triton
 
-from .two_b_ordered import (
-    BV as BV,
-)
-from .two_b_ordered import (
-    HV as HV,
-)
-from .two_b_ordered import (
-    NV as NV,
-)
-from .two_b_ordered import (
-    H as H,
-)
-from .two_b_ordered import (
-    K as K,
-)
-from .two_b_ordered import (
-    V as V,
-)
-from .two_b_ordered import (
-    W as W,
-)
-from .two_b_ordered import (
-    validate as validate,
-)
+from . import two_b_ordered as ordered
+from .two_b_ordered import validate as validate
+
+BV, HV, NV = ordered.BV, ordered.HV, ordered.NV
+H, K, V, W = ordered.H, ordered.K, ordered.V, ordered.W
 
 
 @triton.jit
@@ -104,6 +86,10 @@ def _ordered_decode(
             # update. Pin the same FMA operand order for replay/materialize.
             scaled = b_h * old_alpha
             b_h = tl.fma(old_d[:, None], old_k[None, :], scaled)
+            # Stock stores state after every token, including mixed batches.
+            # Replay must reproduce that BF16 boundary before the next update.
+            if base.dtype.element_ty == tl.bfloat16:
+                b_h = b_h.to(tl.bfloat16).to(tl.float32)
 
     ptr_mixed = mixed_qkv + it * stride_mixed
     b_q = tl.load(ptr_mixed + ik * K + ok).to(tl.float32)

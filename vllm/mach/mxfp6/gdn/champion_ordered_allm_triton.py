@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Ordered raw-alpha FP32 GDN kernels for the frozen TP1 SM120 profile.
 
 Caller-owned W4 scratch; arithmetic and launch configurations are fixed.
@@ -43,8 +44,8 @@ def required_shapes(pages: int, window: int) -> dict:
 def validate(base: torch.Tensor, scratch: DeferredScratch) -> tuple[int, int]:
     if base.ndim != 4 or tuple(base.shape[1:]) != (HV, V, K):
         raise ValueError("base must be [P,32,128,128]")
-    if base.dtype != torch.float32 or not base.is_cuda:
-        raise ValueError("base must be CUDA FP32")
+    if base.dtype not in (torch.float32, torch.bfloat16) or not base.is_cuda:
+        raise ValueError("base must be CUDA FP32 or BF16")
     if base.stride(3) != 1 or base.stride(2) != K or base.stride(1) != V * K:
         raise ValueError("base inner head,V,K dimensions must be dense")
     if base.stride(0) < HV * V * K:
@@ -135,6 +136,8 @@ def _ordered_decode(
             # update. Pin the same FMA operand order for replay/materialize.
             scaled = b_h * old_alpha
             b_h = tl.fma(old_d[:, None], old_k[None, :], scaled)
+            if base.dtype.element_ty == tl.bfloat16:
+                b_h = b_h.to(tl.bfloat16).to(tl.float32)
 
     ptr_mixed = mixed_qkv + it * stride_mixed
     b_q = tl.load(ptr_mixed + ik * K + ok).to(tl.float32)
@@ -220,6 +223,8 @@ def _ordered_materialize(
             old_d = tl.load(pd_tile + j * BV + ov_local).to(tl.float32)
             scaled = b_h * old_alpha
             b_h = tl.fma(old_d[:, None], old_k[None, :], scaled)
+            if base.dtype.element_ty == tl.bfloat16:
+                b_h = b_h.to(tl.bfloat16).to(tl.float32)
     tl.store(ptr_base, b_h)
     tl.store(prefix + meta, 1.0)
     tl.store(age + meta, 0)
@@ -328,6 +333,24 @@ def decode(
         raise ValueError("out contiguous BF16 [M,1,32,128], indices [M]")
     if not math_isfinite_positive(scale):
         raise ValueError("scale must be finite and positive")
+    if base.dtype == torch.bfloat16 and exp is tl.exp:
+        from .bf16_small_gluon import decode as bf16_decode
+        from .bf16_small_gluon import supports_shape
+
+        if supports_shape(m, HV):
+            bf16_decode(
+                mixed_qkv,
+                a,
+                b,
+                A_log,
+                dt_bias,
+                base,
+                out,
+                indices,
+                scratch,
+                scale,
+            )
+            return out
     global _LAST_KERNEL
     _LAST_KERNEL = _ordered_decode[(NV, HV, m)](
         mixed_qkv,
