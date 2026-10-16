@@ -3,6 +3,7 @@
 
 import torch
 
+from vllm import envs
 from vllm._custom_ops import scaled_fp4_quant
 from vllm.model_executor.layers.fusion.quant_activation import (
     QuantizedActivation,
@@ -123,6 +124,13 @@ class FlashInferCutlassNvFp4LinearKernel(NvFp4LinearKernel):
         return True, None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # Keep the pre-quantized activation contract (including SiLU fusion).
+        # This experiment only changes the GEMM consumer for measured shapes.
+        layer.nvfp4_b12x_decode = (
+            envs.VLLM_NVFP4_SM120_B12X_DECODE
+            and current_platform.is_device_capability_family(120)
+            and has_flashinfer_b12x_gemm()
+        )
         layer.weight_scale = torch.nn.Parameter(
             swizzle_blockscale(layer.weight_scale.data), requires_grad=False
         )
@@ -159,6 +167,10 @@ class FlashInferCutlassNvFp4LinearKernel(NvFp4LinearKernel):
                 padded_n=x.shape[-1] + weights_padding_bytes * 2,
             )
 
+        backend = (
+            "b12x-decode" if getattr(layer, "nvfp4_b12x_decode", False) else "cutlass"
+        )
+
         out = flashinfer_scaled_fp4_mm(
             x_fp4,
             layer.weight,
@@ -166,7 +178,7 @@ class FlashInferCutlassNvFp4LinearKernel(NvFp4LinearKernel):
             layer.weight_scale,
             layer.alpha,
             output_dtype,
-            backend="cutlass",
+            backend=backend,
         )
 
         out = slice_nvfp4_output(out, output_size)
@@ -316,8 +328,10 @@ class FlashInferB12xNvFp4LinearKernel(NvFp4LinearKernel):
             return True, None
         return (
             False,
-            "FlashInfer b12x requires SM120+ and FlashInfer "
-            "with Sm120BlockScaledDenseGemmKernel",
+            (
+                "FlashInfer b12x requires SM120+ and FlashInfer "
+                "with Sm120BlockScaledDenseGemmKernel"
+            ),
         )
 
     @classmethod

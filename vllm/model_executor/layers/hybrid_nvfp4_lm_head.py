@@ -5,7 +5,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from threading import Lock
 from time import perf_counter
+from weakref import ref
 
 import torch
 import torch.nn.functional as F
@@ -44,6 +46,87 @@ _STATE_NAME = "_hybrid_nvfp4_lm_head_state"
 _SHARED_STATE_NAME = "_hybrid_nvfp4_lm_head_shared_state"
 _BUFFER_NAMES = (_WEIGHT_NAME, _SCALE_NAME, _GLOBAL_SCALE_NAME)
 _DEFAULT_AUTOTUNE_MAX_ROWS = 2048
+
+
+class _HybridHeadGraphs:
+    """Startup-captured hybrid stages, sharing a pool on one execution stream."""
+
+    @staticmethod
+    def signature(state):
+        return (
+            state.weight.data_ptr(),
+            state.scale.data_ptr(),
+            state.global_scale.data_ptr(),
+            state.candidates,
+            state.backend,
+            envs.VLLM_HYBRID_NVFP4_LM_HEAD_USE_FLASHINFER_TOPK,
+        )
+
+    def __init__(self, state, bf16_weight: torch.Tensor, max_rows: int):
+        self.weight = ref(bf16_weight)
+        self.weight_ptr = bf16_weight.data_ptr()
+        self.state_signature = self.signature(state)
+        self.stream = torch.cuda.current_stream(bf16_weight.device)
+        self.lock = Lock()
+        self.hidden = torch.zeros(
+            (max_rows, state.input_size),
+            dtype=torch.bfloat16,
+            device=bf16_weight.device,
+        )
+        self.graphs = {}
+        pool = torch.cuda.graph_pool_handle()
+
+        def run(hidden, mode, top_k):
+            coarse = state.coarse_logits(hidden, None)
+            if mode == "coarse":
+                return (coarse,)
+            indices = state.select_candidates(coarse, top_k=top_k)
+            logits = state.refine_logits(hidden, bf16_weight, indices, None)
+            if mode == "greedy":
+                return (indexed_argmax_triton(logits, indices, index_offset=0)[1],)
+            return logits, indices
+
+        widths = {state.candidate_count_for_topk(k): k for k in (1, 32, 64, 128)}
+        modes = [
+            ("candidates", k, width) for width, k in widths.items() if width <= 1024
+        ]
+        modes += [("greedy", 1, 0), ("coarse", 1, 0)]
+        # Replay is serialized, and returned tensors own their storage.
+        for rows in range(max_rows, 0, -1):
+            hidden = self.hidden[:rows]
+            for mode, top_k, width in modes:
+                run(hidden, mode, top_k)
+                torch.accelerator.synchronize(bf16_weight.device)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, pool=pool):
+                    outputs = run(hidden, mode, top_k)
+                self.graphs[mode, rows, width] = graph, outputs
+
+    def replay(self, state, hidden, bf16_weight, mode="greedy", width=0):
+        entry = self.graphs.get((mode, hidden.shape[0], width))
+        if (
+            entry is None
+            or bf16_weight is None
+            or hidden.dtype != self.hidden.dtype
+            or hidden.device != self.hidden.device
+            or hidden.ndim != 2
+            or hidden.shape[1] != self.hidden.shape[1]
+            or self.weight_ptr != bf16_weight.data_ptr()
+            or self.weight() is not bf16_weight
+            or self.state_signature != self.signature(state)
+            or torch.cuda.is_current_stream_capturing()
+            or torch.cuda.current_stream(hidden.device) != self.stream
+            or not self.lock.acquire(blocking=False)
+        ):
+            return None
+        try:
+            self.hidden[: hidden.shape[0]].copy_(hidden)
+            graph, outputs = entry
+            graph.replay()
+            # A later replay, including a different row count, reuses the pool.
+            return tuple(output.clone() for output in outputs)
+        finally:
+            self.lock.release()
 
 
 @triton.jit(do_not_specialize=["N"])
@@ -123,10 +206,36 @@ class HybridNvfp4LmHead:
     candidates: int
     max_rows: int
     backend: str = "b12x"
+    _head_graphs: _HybridHeadGraphs | None = field(default=None, init=False, repr=False)
     can_use_failure_counts: dict[str, int] = field(
         default_factory=dict,
         repr=False,
     )
+
+    @torch.inference_mode()
+    def capture_head_graphs(self, bf16_weight: torch.Tensor, max_rows: int) -> None:
+        max_rows = min(max_rows, 64, self.max_rows or 64)
+        if max_rows > 0 and self.candidate_count_for_topk(1) <= 1024:
+            self._head_graphs = None
+            self._head_graphs = _HybridHeadGraphs(self, bf16_weight, max_rows)
+            logger.info("Captured hybrid NVFP4 head stages for rows 1..%d", max_rows)
+
+    def replay_greedy(self, hidden, bf16_weight) -> torch.Tensor | None:
+        if self._head_graphs is None:
+            return None
+        result = self._head_graphs.replay(self, hidden, bf16_weight)
+        return None if result is None else result[0]
+
+    def replay_candidates(self, hidden, bf16_weight, top_k):
+        if self._head_graphs is None:
+            return None
+        return self._head_graphs.replay(
+            self,
+            hidden,
+            bf16_weight,
+            "candidates",
+            self.candidate_count_for_topk(top_k),
+        )
 
     def _record_can_use_failure(
         self,
@@ -218,6 +327,15 @@ class HybridNvfp4LmHead:
         hidden_states: torch.Tensor,
         bias: torch.Tensor | None,
     ) -> torch.Tensor:
+        if self._head_graphs is not None:
+            result = self._head_graphs.replay(
+                self, hidden_states, self._head_graphs.weight(), "coarse"
+            )
+            if result is not None:
+                logits = result[0]
+                if bias is not None:
+                    logits += bias
+                return logits
         hidden_global_scale = _global_scale(hidden_states)
         hidden_q, hidden_scale = flashinfer_nvfp4_quantize_128x4(
             hidden_states,

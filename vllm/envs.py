@@ -190,10 +190,12 @@ if TYPE_CHECKING:
     VLLM_HUMMING_USE_F16_ACCUM: bool = False
     VLLM_HUMMING_MOE_GEMM_TYPE: Literal["indexed", "grouped", "auto"] | None = None
     VLLM_B12X_MOE_FP4_FORCE_A16: bool = False
+    VLLM_NVFP4_SM120_B12X_DECODE: bool = False
     VLLM_DEEPEPLL_NVFP4_DISPATCH: bool = False
     # Experimental hybrid lm-head paths.  These settings are intentionally
     # exposed through envs.py so model loading and tests use the same values.
     VLLM_HYBRID_NVFP4_LM_HEAD: bool = False
+    VLLM_HYBRID_NVFP4_LM_HEAD_CUDAGRAPH: bool = True
     VLLM_HYBRID_NVFP4_LM_HEAD_BACKEND: Literal["b12x", "auto"] = "b12x"
     VLLM_HYBRID_NVFP4_LM_HEAD_CANDIDATES: int = 128
     VLLM_HYBRID_NVFP4_LM_HEAD_MAX_ROWS: int = 0
@@ -1645,6 +1647,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HYBRID_NVFP4_LM_HEAD": lambda: bool(
         int(os.getenv("VLLM_HYBRID_NVFP4_LM_HEAD", "0"))
     ),
+    # Capture hybrid head stages during startup, outside decoder graphs.
+    "VLLM_HYBRID_NVFP4_LM_HEAD_CUDAGRAPH": lambda: bool(
+        int(os.getenv("VLLM_HYBRID_NVFP4_LM_HEAD_CUDAGRAPH", "1"))
+    ),
     "VLLM_HYBRID_NVFP4_LM_HEAD_BACKEND": lambda: (
         os.getenv("VLLM_HYBRID_NVFP4_LM_HEAD_BACKEND", "b12x").strip().lower()
     ),
@@ -1772,6 +1778,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # This uses TensorRT-LLM kernels and requires SM90+ (Hopper).
     "VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER": lambda: bool(
         int(os.getenv("VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER", "1"))
+    ),
+    # Experimental shape-specific NVFP4 GEMM routing; preserves act-quant fusion.
+    "VLLM_NVFP4_SM120_B12X_DECODE": lambda: bool(
+        int(os.getenv("VLLM_NVFP4_SM120_B12X_DECODE", "0"))
     ),
     # Force b12x FP4 MoE to use BF16 activations.
     "VLLM_B12X_MOE_FP4_FORCE_A16": lambda: bool(
@@ -2686,10 +2696,7 @@ def compile_factors() -> dict[str, object]:
     ordered_gdn_enabled = __getattr__("VLLM_MACH_GDN_ORDERED")
     if not ba_gemv_enabled and not ordered_gdn_enabled:
         ignored_factors.add("VLLM_MXFP6_SM120_BA_GEMV")
-    if not any(
-        __getattr__(name) not in (False, "0", "")
-        for name in mach_opt_in_flags
-    ):
+    if not any(__getattr__(name) not in (False, "0", "") for name in mach_opt_in_flags):
         ignored_factors.update(mach_opt_in_flags)
         ignored_factors.update(
             {

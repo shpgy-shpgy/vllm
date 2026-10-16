@@ -780,6 +780,25 @@ if has_flashinfer():
     ) -> torch.Tensor:
         from flashinfer import mm_fp4 as flashinfer_mm_fp4_
 
+        if backend == "b12x-decode":
+            # Keep shape dispatch opaque to Dynamo: prefill and decode share
+            # a compiled graph, but must select their backend at execution time.
+            m, packed_k = A.shape
+            n = B.shape[1]
+            backend = "cutlass"
+            if (
+                use_nvfp4
+                and block_size == 16
+                and not use_8x4_sf_layout
+                and dtype == torch.bfloat16
+                and (
+                    (1 <= m <= 64 and (n, packed_k) == (2048, 1024))
+                    or (16 <= m <= 64 and (n, packed_k) == (2048, 3072))
+                    or (m == 64 and (n, packed_k) in ((12288, 1024), (5120, 1024)))
+                )
+            ):
+                backend = "b12x"
+
         return flashinfer_mm_fp4_(
             A,
             B,
@@ -1067,7 +1086,7 @@ def flashinfer_scaled_fp4_mm(
     if alpha is None:
         alpha = torch.ones(1, dtype=torch.float32, device=a.device)
 
-    if backend in ("cutlass", "cudnn"):
+    if backend in ("cutlass", "cudnn", "b12x-decode"):
         block_scale_a = block_scale_a.view(torch.uint8)
         block_scale_b = block_scale_b.view(torch.uint8)
 

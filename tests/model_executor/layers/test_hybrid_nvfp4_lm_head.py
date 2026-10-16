@@ -229,3 +229,159 @@ def test_logits_processor_accepts_nvfp4_state() -> None:
     assert indices.shape == (1, 2)
     assert vocab_start == 0
     assert shard_token_ids is None
+
+
+@pytest.mark.skipif(
+    not hybrid_nvfp4.current_platform.is_device_capability_family(120)
+    or not hybrid_nvfp4.has_flashinfer_b12x_gemm(),
+    reason="requires SM120 with FlashInfer b12x",
+)
+@torch.inference_mode()
+def test_greedy_graph_replay_preserves_outputs_and_falls_back(monkeypatch):
+    """Replay must use new inputs and own outputs across shared-pool replays."""
+    from types import SimpleNamespace
+
+    torch.manual_seed(42)
+    layer = torch.nn.Module()
+    layer.weight = torch.nn.Parameter(
+        torch.randn(512, 256, device="cuda", dtype=torch.bfloat16),
+        requires_grad=False,
+    )
+    assert prepare_hybrid_nvfp4_lm_head(layer, candidates=128)
+    state = hybrid_nvfp4.get_hybrid_nvfp4_lm_head(layer)
+    state.capture_head_graphs(layer.weight, 8)
+    processor = LogitsProcessor(vocab_size=512)
+    layer.tp_size = 1
+    layer.shard_indices = SimpleNamespace(
+        org_vocab_start_index=0,
+        org_vocab_end_index=512,
+        num_elements_padded=512,
+        num_org_vocab_padding=0,
+        num_added_elements_padded=0,
+    )
+    retained = []
+    for rows in (1, 8, 3, 8, 1, 9):
+        hidden = torch.randn(rows, 256, device="cuda", dtype=torch.bfloat16)
+        graphs = state._head_graphs
+        with monkeypatch.context() as patch:
+            patch.setattr(state, "_head_graphs", None)
+            expected = processor.get_top_tokens(layer, hidden)
+        if rows <= 8:
+            # Ensure the public path really replays, not an eager fallback.
+            with monkeypatch.context() as patch:
+                patch.setattr(
+                    state, "coarse_logits", lambda *a, **k: pytest.fail("eager head")
+                )
+                actual = processor.get_top_tokens(layer, hidden)
+        else:
+            assert state.replay_greedy(hidden, layer.weight) is None
+            actual = processor.get_top_tokens(layer, hidden)
+        assert state._head_graphs is graphs
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        retained.append((actual, expected))
+    for actual, expected in retained:
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    hidden = torch.randn(3, 256, device="cuda", dtype=torch.bfloat16)
+    assert state.replay_greedy(hidden, layer.weight.clone()) is None
+    with monkeypatch.context() as patch:
+        patch.setattr(state, "candidates", 64)
+        assert state.replay_greedy(hidden, layer.weight) is None
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        assert state.replay_greedy(hidden, layer.weight) is None
+    with torch.cuda.graph(torch.cuda.CUDAGraph()):
+        assert state.replay_greedy(hidden, layer.weight) is None
+    # A concurrent caller must never overwrite the static input buffer.
+    with state._head_graphs.lock:
+        assert state.replay_greedy(hidden, layer.weight) is None
+
+    # Bias and padded vocab cannot use the full-vocab, bias-free captured head.
+    with monkeypatch.context() as patch:
+        patch.setattr(state, "replay_greedy", lambda *a: pytest.fail("graph replay"))
+        processor.get_top_tokens(layer, hidden, torch.zeros_like(layer.weight[:, 0]))
+        layer.shard_indices.num_org_vocab_padding = 1
+        processor.get_top_tokens(layer, hidden)
+
+
+@pytest.mark.skipif(
+    not hybrid_nvfp4.current_platform.is_device_capability_family(120)
+    or not hybrid_nvfp4.has_flashinfer_b12x_gemm(),
+    reason="requires SM120 with FlashInfer b12x",
+)
+@torch.inference_mode()
+def test_head_graph_topk_sampling_and_presence_match_eager(monkeypatch):
+    """Candidate graphs preserve processors; replay never freezes sampling RNG."""
+    from types import SimpleNamespace
+
+    torch.manual_seed(42)
+    layer = torch.nn.Module()
+    layer.weight = torch.nn.Parameter(
+        torch.randn(512, 256, device="cuda", dtype=torch.bfloat16),
+        requires_grad=False,
+    )
+    layer.tp_size = 1
+    layer.shard_indices = SimpleNamespace(
+        org_vocab_start_index=0,
+        org_vocab_end_index=512,
+        num_elements_padded=512,
+        num_org_vocab_padding=0,
+        num_added_elements_padded=0,
+    )
+    assert prepare_hybrid_nvfp4_lm_head(layer, candidates=128)
+    state = hybrid_nvfp4.get_hybrid_nvfp4_lm_head(layer)
+    state.capture_head_graphs(layer.weight, 3)
+    processor = LogitsProcessor(vocab_size=512)
+    for rows, k, scale, soft_cap, penalty in (
+        (3, 20, 1.0, None, False),
+        (1, 40, 0.7, 10.0, False),
+        (3, 128, 1.0, None, False),
+        (3, 20, -1.0, 10.0, True),
+    ):
+        hidden = torch.randn(rows, 256, device="cuda", dtype=torch.bfloat16)
+        processor.scale, processor.soft_cap = scale, soft_cap
+        kwargs = dict(top_k=k, top_p=0.9, temperature=0.7)
+        if penalty:
+            kwargs.update(
+                presence_penalties=torch.full((rows,), 1.5, device="cuda"),
+                output_token_counts=torch.randint(
+                    0, 2, (rows, 512), device="cuda", dtype=torch.int32
+                ),
+                presence_request_indices=torch.arange(rows, device="cuda"),
+                embedding_bias=torch.randn(512, device="cuda", dtype=torch.bfloat16),
+            )
+        with monkeypatch.context() as patch:
+            patch.setattr(state, "_head_graphs", None)
+            expected = processor.get_topk_candidates(layer, hidden, **kwargs)
+            torch.manual_seed(123)
+            expected_sample = processor.sample_topk_tokens(layer, hidden, **kwargs)
+        with monkeypatch.context() as patch:
+            # Neither fused candidates nor coarse-only replay may launch GEMM eagerly.
+            patch.setattr(
+                hybrid_nvfp4,
+                "flashinfer_scaled_fp4_mm",
+                lambda *a, **k: pytest.fail("eager GEMM"),
+            )
+            actual = processor.get_topk_candidates(layer, hidden, **kwargs)
+            torch.manual_seed(123)
+            actual_sample = processor.sample_topk_tokens(layer, hidden, **kwargs)
+
+        # FlashInfer returns an unsorted set: tied BF16 logits can exchange
+        # slots. Compare the resulting token distribution, not tie ordering.
+        def distribution(pair):
+            values, ids = pair
+            probs = torch.zeros(values.shape[0], 512, device="cuda")
+            return probs.scatter_(1, ids.long(), values.softmax(-1))
+
+        torch.testing.assert_close(
+            distribution(actual), distribution(expected), rtol=0, atol=0
+        )
+        assert (
+            distribution(expected).gather(1, actual_sample.long().view(-1, 1)) > 0
+        ).all()
+        assert (
+            distribution(expected).gather(1, expected_sample.long().view(-1, 1)) > 0
+        ).all()
+        rng_before = torch.cuda.get_rng_state()
+        processor.sample_topk_tokens(layer, hidden, **kwargs)
+        assert not torch.equal(rng_before, torch.cuda.get_rng_state())

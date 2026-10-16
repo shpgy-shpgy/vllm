@@ -39,6 +39,135 @@ SEEDS = [42]
 CUDA_DEVICES = ["cuda:0"]
 
 
+@pytest.mark.parametrize("m", [1, 4, 16, 32, 64, 65])
+@pytest.mark.parametrize(
+    "n,k", [(12288, 2048), (2048, 6144), (5120, 2048), (2048, 2048)]
+)
+@torch.inference_mode()
+def test_nvfp4_decode_routing_preserves_prequantized_activation(m, n, k, monkeypatch):
+    """Changing the GEMM consumer must not quantize fused activations twice."""
+    if (
+        not current_platform.is_device_capability_family(120)
+        or not has_flashinfer_b12x_gemm()
+    ):
+        pytest.skip("requires SM120 with FlashInfer b12x")
+    from types import SimpleNamespace
+
+    from vllm.model_executor.kernels.linear.nvfp4 import flashinfer as kernels
+    from vllm.model_executor.kernels.linear.nvfp4.base import NvFp4LinearLayerConfig
+    from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
+
+    torch.manual_seed(42)
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+    xs = 2688 / x.float().abs().max()
+    ws = 2688 / weight.float().abs().max()
+    packed_weight, scale = ops.scaled_fp4_quant(weight, ws)
+    kernel = kernels.FlashInferCutlassNvFp4LinearKernel(NvFp4LinearLayerConfig())
+    layer = SimpleNamespace(
+        output_size_per_partition=n,
+        weight=packed_weight,
+        weight_scale=scale,
+        input_global_scale_inv=xs,
+        alpha=1 / (xs * ws),
+        nvfp4_b12x_decode=False,
+    )
+    bias = torch.randn(n, device="cuda", dtype=torch.bfloat16)
+    expected = kernel.apply_weights(layer, x, bias)
+    layer.nvfp4_b12x_decode = True
+    actual = kernel.apply_weights(layer, x, bias)
+    torch.testing.assert_close(actual, expected, rtol=0.016, atol=0.125)
+    data, blockscale = ops.scaled_fp4_quant(x, xs)
+    qa = QuantizedActivation(
+        data, blockscale, x.dtype, x.shape, kernel.input_quant_key()
+    )
+
+    def unexpected_quant(*args, **kwargs):
+        raise AssertionError("pre-quantized input must not be quantized again")
+
+    monkeypatch.setattr(kernels, "scaled_fp4_quant", unexpected_quant)
+    torch.testing.assert_close(
+        kernel.apply_weights(layer, qa, bias), actual, rtol=0, atol=0
+    )
+
+
+@torch.inference_mode()
+def test_nvfp4_decode_dispatch_survives_prefill_compile_and_graph_replay(monkeypatch):
+    """A prefill trace must not freeze the backend of later decode graphs."""
+    if (
+        not current_platform.is_device_capability_family(120)
+        or not has_flashinfer_b12x_gemm()
+    ):
+        pytest.skip("requires SM120 with FlashInfer b12x")
+    from types import SimpleNamespace
+
+    import flashinfer
+
+    from vllm.model_executor.kernels.linear.nvfp4 import flashinfer as kernels
+    from vllm.model_executor.kernels.linear.nvfp4.base import NvFp4LinearLayerConfig
+
+    torch.manual_seed(42)
+    w = torch.randn(2048, 2048, device="cuda", dtype=torch.bfloat16)
+    ws = 2688 / w.float().abs().max()
+    weight, scale = ops.scaled_fp4_quant(w, ws)
+    xs = torch.tensor(512.0, device="cuda")
+    layer = SimpleNamespace(
+        weight=weight,
+        weight_scale=scale,
+        input_global_scale_inv=xs,
+        alpha=1 / (xs * ws),
+        output_size_per_partition=2048,
+        nvfp4_b12x_decode=True,
+    )
+    kernel = kernels.FlashInferCutlassNvFp4LinearKernel(NvFp4LinearLayerConfig())
+    calls, graphs = [], []
+    original = flashinfer.mm_fp4
+
+    def record_backend(*args, **kwargs):
+        calls.append(kwargs["backend"])
+        return original(*args, **kwargs)
+
+    def compile_backend(gm, inputs):
+        graphs.append(gm)
+        return gm.forward
+
+    monkeypatch.setattr(flashinfer, "mm_fp4", record_backend)
+
+    def run(x):
+        return kernel.apply_weights(layer, x)
+
+    compiled = torch.compile(run, backend=compile_backend, dynamic=True, fullgraph=True)
+    for m in (128, 16, 64, 2, 65):
+        x = torch.randn(m, 2048, device="cuda", dtype=torch.bfloat16)
+        calls.clear()
+        actual = compiled(x)
+        assert calls == ["b12x" if m <= 64 else "cutlass"]
+        torch.testing.assert_close(actual, run(x), rtol=0, atol=0)
+    # Quantization buffer shapes may specialize; backend selection must not.
+    for gm in graphs:
+        mm_nodes = [
+            node
+            for node in gm.graph.nodes
+            if node.target == torch.ops.vllm.flashinfer_mm_fp4.default
+        ]
+        assert mm_nodes
+        assert all(node.kwargs["backend"] == "b12x-decode" for node in mm_nodes)
+
+    x = torch.randn(16, 2048, device="cuda", dtype=torch.bfloat16)
+    compiled(x)
+    torch.accelerator.synchronize()
+    calls.clear()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = compiled(x)
+    assert calls == ["b12x"]
+    x.normal_()
+    calls.clear()
+    graph.replay()
+    assert not calls  # Replay uses the captured GPU kernel, without Python dispatch.
+    torch.testing.assert_close(actual, run(x), rtol=0, atol=0)
+
+
 def get_ref_results(
     a_fp4,
     b_fp4,

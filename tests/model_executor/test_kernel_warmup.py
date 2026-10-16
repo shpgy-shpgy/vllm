@@ -94,6 +94,33 @@ def test_mxfp8_decode_warmup_covers_dispatch_boundary(monkeypatch) -> None:
     assert _flashinfer_autotune_token_counts(runner) == (16,)
 
 
+@pytest.mark.parametrize(
+    "enabled,installed", [(False, True), (True, False), (True, True)]
+)
+def test_nvfp4_decode_consumer_is_tuned_before_capture(monkeypatch, enabled, installed):
+    from vllm.model_executor.kernels.linear.mxfp8 import flashinfer
+    from vllm.model_executor.warmup import kernel_warmup as warmup
+
+    monkeypatch.setattr(flashinfer, "use_qwen35_mxfp8_decode", lambda _: False)
+    monkeypatch.setattr(warmup.envs, "VLLM_NVFP4_SM120_B12X_DECODE", enabled)
+    model = torch.nn.Linear(2, 2)
+    model.nvfp4_b12x_decode = installed
+    runner = SimpleNamespace(
+        get_model=lambda: model,
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=2048),
+        vllm_config=SimpleNamespace(
+            kernel_config=SimpleNamespace(linear_backend="auto")
+        ),
+    )
+    expected: tuple[int, ...] = (
+        (2048, 1, 4, 16, 32, 64) if enabled and installed else (2048,)
+    )
+    assert warmup._flashinfer_autotune_token_counts(runner) == expected
+    runner.scheduler_config.max_num_batched_tokens = 16
+    expected = (16, 1, 4) if enabled and installed else (16,)
+    assert warmup._flashinfer_autotune_token_counts(runner) == expected
+
+
 @pytest.mark.parametrize("rows", [33, 36, 40, 48, 56, 64, 128])
 def test_mxfp8_decode_high_batch_range_stays_cutlass(rows: int) -> None:
     from vllm.utils.flashinfer import _qwen35_mxfp8_backend

@@ -307,6 +307,17 @@ def _flashinfer_autotune_token_counts(runner: "GPUModelRunner") -> tuple[int, ..
 
     if use_qwen35_mxfp8_decode(runner.vllm_config):
         return tuple(dict.fromkeys((max_tokens, min(max_tokens, 32))))
+    if envs.VLLM_NVFP4_SM120_B12X_DECODE and any(
+        getattr(layer, "nvfp4_b12x_decode", False)
+        for layer in runner.get_model().modules()
+    ):
+        # Reach each decode-only b12x tactic before graph capture; the prefill
+        # run alone otherwise leaves small batches on an untuned fallback.
+        return tuple(
+            dict.fromkeys(
+                (max_tokens, *(m for m in (1, 4, 16, 32, 64) if m <= max_tokens))
+            )
+        )
     linear_backend = runner.vllm_config.kernel_config.linear_backend
     if (
         linear_backend == "flashinfer_cutedsl"

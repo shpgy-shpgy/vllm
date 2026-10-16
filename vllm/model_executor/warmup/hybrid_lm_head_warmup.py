@@ -15,12 +15,8 @@ from time import perf_counter
 import torch
 
 import vllm.envs as envs
+from vllm.config.compilation import CUDAGraphMode
 from vllm.logger import init_logger
-from vllm.model_executor.layers.hybrid_nvfp4_lm_head import (
-    autotune_hybrid_nvfp4_lm_head,
-    get_hybrid_nvfp4_lm_head,
-    warmup_hybrid_nvfp4_lm_head_kernels,
-)
 from vllm.model_executor.layers.hybrid_mxfp4_lm_head import (
     autotune_hybrid_mxfp4_lm_head,
     get_hybrid_mxfp4_lm_head,
@@ -31,6 +27,11 @@ from vllm.model_executor.layers.hybrid_mxfp8_lm_head import (
     autotune_row_buckets,
     get_hybrid_mxfp8_lm_head,
     warmup_hybrid_mxfp8_lm_head_kernels,
+)
+from vllm.model_executor.layers.hybrid_nvfp4_lm_head import (
+    autotune_hybrid_nvfp4_lm_head,
+    get_hybrid_nvfp4_lm_head,
+    warmup_hybrid_nvfp4_lm_head_kernels,
 )
 
 logger = init_logger(__name__)
@@ -56,16 +57,14 @@ def _warmup_row_shapes(worker, max_rows: int) -> tuple[int, ...]:
             size
             for size in capture_sizes
             if isinstance(size, int)
-            and 0 < size
+            and size > 0
             and (max_rows <= 0 or size <= max_rows)
         }
     )
     if not row_shapes:
         # No CUDA graph capture sizes (eager or capture disabled): fall back
         # to FlashInfer's own tactic buckets so first runtime use can't tune.
-        row_shapes = list(
-            autotune_row_buckets(max_rows or _DEFAULT_WARMUP_MAX_ROWS)
-        )
+        row_shapes = list(autotune_row_buckets(max_rows or _DEFAULT_WARMUP_MAX_ROWS))
     if row_shapes[0] != 1:
         # Draft bs1 steps always sample a single row.
         row_shapes.insert(0, 1)
@@ -130,6 +129,21 @@ def hybrid_lm_head_warmup(worker) -> None:
                 layer.weight,
                 tp_size=getattr(layer, "tp_size", 1),
             )
+            config = worker.vllm_config
+            if (
+                envs.VLLM_HYBRID_NVFP4_LM_HEAD_CUDAGRAPH
+                and config.use_v2_model_runner
+                and not config.model_config.enforce_eager
+                and not config.model_config.enable_sleep_mode
+                and not config.offload_config.uva.cpu_offload_gb
+                and config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+                and config.lora_config is None
+                and config.speculative_config is None
+                and not config.offload_config.prefetch.offload_group_size
+            ):
+                nvfp4_state.capture_head_graphs(
+                    layer.weight, config.scheduler_config.max_num_seqs
+                )
             logger.debug("Hybrid NVFP4 lm-head tuned row shapes: %s", tuned_shapes)
         elif mxfp4_state is not None:
             warmup_hybrid_mxfp4_lm_head_kernels(
