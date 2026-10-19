@@ -400,11 +400,17 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 prefill_query_start_loc_cpu = non_spec_query_start_loc_cpu
                 prefill_state_indices = non_spec_state_indices_tensor
 
-            chunk_indices, chunk_offsets = self._build_chunk_metadata(
-                prefill_query_start_loc,
-                prefill_query_start_loc_cpu,
-                query_start_loc.device,
-            )
+            if self.gdn_prefill_backend == "flashinfer":
+                # FlashInfer uses cu_seqlens but not FLA chunk metadata. Convert
+                # once per batch instead of allocating/copying in every layer.
+                assert prefill_query_start_loc is not None
+                prefill_query_start_loc = prefill_query_start_loc.to(torch.int64)
+            else:
+                chunk_indices, chunk_offsets = self._build_chunk_metadata(
+                    prefill_query_start_loc,
+                    prefill_query_start_loc_cpu,
+                    query_start_loc.device,
+                )
 
         if num_prefills > 0:
             context_lens_tensor = m.compute_num_computed_tokens()

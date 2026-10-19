@@ -221,3 +221,40 @@ def test_full_cudagraph_spec_metadata_uses_request_count():
     assert meta.spec_query_start_loc.shape == (batch.batch_size + 1,)
     assert meta.num_accepted_tokens is not None
     assert meta.num_accepted_tokens.shape == (batch.batch_size,)
+
+
+@pytest.mark.parametrize("backend", ["flashinfer", "triton"])
+@pytest.mark.parametrize(
+    "seq_lens,query_lens,expected_starts",
+    [
+        ([10, 20], [1, 1], None),
+        ([9, 15], [9, 7], [0, 9, 16]),
+        ([10, 20, 9, 15], [1, 1, 9, 7], [0, 9, 16]),
+    ],
+)
+def test_prefill_metadata_matches_backend_requirements(
+    backend, seq_lens, query_lens, expected_starts, monkeypatch
+):
+    """Reuse FlashInfer offsets; retain FLA chunk indices on the Triton path."""
+    builder = _create_gdn_builder()
+    builder.gdn_prefill_backend = backend
+    if backend == "flashinfer":
+
+        def unexpected_chunk_metadata(*args, **kwargs):
+            pytest.fail("FlashInfer must not build unused FLA chunk metadata")
+
+        monkeypatch.setattr(builder, "_build_chunk_metadata", unexpected_chunk_metadata)
+    meta = _build(builder, BatchSpec(seq_lens=seq_lens, query_lens=query_lens))
+    if expected_starts is None:
+        assert meta.prefill_query_start_loc is None
+        assert meta.chunk_indices is None and meta.chunk_offsets is None
+        return
+    starts = meta.prefill_query_start_loc
+    assert starts is not None and starts.tolist() == expected_starts
+    if backend == "flashinfer":
+        assert starts.dtype == torch.int64
+        assert starts.to(torch.int64).data_ptr() == starts.data_ptr()
+        assert meta.chunk_indices is None and meta.chunk_offsets is None
+    else:
+        assert starts.dtype == torch.int32
+        assert meta.chunk_indices is not None and meta.chunk_offsets is not None
