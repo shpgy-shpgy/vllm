@@ -561,6 +561,43 @@ def test_new_features_default_off(monkeypatch):
         assert not envs.environment_variables[name]()
 
 
+@pytest.mark.parametrize("mixed", [False, True])
+@pytest.mark.parametrize("drift", [False, True])
+def test_ordered_registration_accepts_current_source_and_rejects_drift(
+    monkeypatch, mixed, drift
+):
+    """Exercise the startup SHA gate, not only the mixed-core AST splice."""
+    import vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn as gdn
+    from vllm.mach.mxfp6 import two_b_ordered_gdn as ordered
+
+    cls = gdn.QwenGatedDeltaNetAttention
+    original = cls._forward_core
+    for name in ("_forward_core", "_forward_core_decode_non_spec"):
+        monkeypatch.setattr(cls, name, getattr(cls, name))
+    for name in ("_two_b_gdn_ordered_installed", "_mach_2b_mixed_gdn_installed"):
+        monkeypatch.setattr(cls, name, False, raising=False)
+    for name in ("_ORIG_CORE", "_ORIG_DECODE"):
+        monkeypatch.setattr(ordered, name, None)
+    for name in ("_CLONE_SHA", "_ORIGINAL_SHA"):
+        monkeypatch.setattr(two_b_mixed_gdn, name, None)
+    monkeypatch.setattr(ordered, "_READY", False)
+    monkeypatch.setattr(ordered, "_VIEW_SCRATCH", {})
+    monkeypatch.setattr(envs, "VLLM_MACH_MXFP8_2B_GDN_MIXED", mixed)
+    if drift:
+        monkeypatch.setattr(ordered, "GDN_SHA", "0" * 64)
+        with pytest.raises(RuntimeError, match="live GDN source SHA drift"):
+            ordered._register_gdn()
+        assert cls._forward_core is original
+    else:
+        ordered._register_gdn()
+        assert ordered._ORIG_CORE is original
+        assert cls._two_b_gdn_ordered_installed
+        assert cls._mach_2b_mixed_gdn_installed is mixed
+        registered = cls._forward_core
+        ordered._register_gdn()
+        assert cls._forward_core is registered
+
+
 def test_mixed_splice_preserves_current_core_except_recurrent_branch(monkeypatch):
     import vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn as gdn
 
