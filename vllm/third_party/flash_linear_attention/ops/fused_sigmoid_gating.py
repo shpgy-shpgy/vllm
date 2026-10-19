@@ -47,6 +47,11 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     V: tl.constexpr,
     BK: tl.constexpr,
     BV: tl.constexpr,
+    stride_q: tl.constexpr,
+    stride_k: tl.constexpr,
+    stride_v: tl.constexpr,
+    stride_a: tl.constexpr,
+    stride_b: tl.constexpr,
     stride_init_state_token: tl.constexpr,
     stride_final_state_token: tl.constexpr,
     stride_indices_seq: tl.constexpr,
@@ -80,19 +85,19 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     o_k = i_k * BK + tl.arange(0, BK)
     o_v = i_v * BV + tl.arange(0, BV)
 
-    p_q = q + (bos * H + i_h) * K + o_k
-    p_k = k + (bos * H + i_h) * K + o_k
-    p_v = v + (bos * HV + i_hv) * V + o_v
+    p_q = q + bos * stride_q + i_h * K + o_k
+    p_k = k + bos * stride_k + i_h * K + o_k
+    p_v = v + bos * stride_v + i_hv * V + o_v
 
     p_A_log = A_log + i_hv
     if not IS_KDA:
-        p_a = a + bos * HV + i_hv
+        p_a = a + bos * stride_a + i_hv
         p_dt_bias = dt_bias + i_hv
     else:
         p_a = a + (bos * HV + i_hv) * K + o_k
         p_dt_bias = dt_bias + i_hv * K + o_k
 
-    p_b = b + bos * HV + i_hv
+    p_b = b + bos * stride_b + i_hv
     p_o = o + ((i_k * all + bos) * HV + i_hv) * V + o_v
 
     mask_k = o_k < K
@@ -170,12 +175,12 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
             tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
 
         # Update pointers for next timestep
-        p_q += H * K
-        p_k += H * K
+        p_q += stride_q
+        p_k += stride_k
         p_o += HV * V
-        p_v += HV * V
-        p_b += HV
-        p_a += HV
+        p_v += stride_v
+        p_b += stride_b
+        p_a += stride_a
 
 
 def fused_sigmoid_gating_delta_rule_update(
@@ -196,6 +201,7 @@ def fused_sigmoid_gating_delta_rule_update(
     num_accepted_tokens: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = False,
     is_kda: bool = False,
+    output: torch.Tensor | None = None,
 ):
     """
     Fused triton implementation of sigmoid gating delta rule update.
@@ -222,7 +228,22 @@ def fused_sigmoid_gating_delta_rule_update(
     else:
         assert scale > 0, "scale must be positive"
 
-    o = q.new_empty(NK, *v.shape)
+    if output is None:
+        q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
+        a, b = a.contiguous(), b.contiguous()
+        o = q.new_empty(NK, *v.shape)
+        stride_q, stride_k, stride_v = H * K, H * K, HV * V
+        stride_a, stride_b = HV, HV
+    else:
+        # Mixed decode uses row-packed inputs and a caller-owned output slice.
+        assert cu_seqlens is not None and not is_kda
+        assert output.shape == v.shape and output.is_contiguous()
+        assert output.dtype == v.dtype and output.device == v.device
+        assert all(x.stride(-1) == 1 for x in (q, k, v, a, b))
+        assert q.stride(-2) == k.stride(-2) == K and v.stride(-2) == V
+        o = output.unsqueeze(0)
+        stride_q, stride_k, stride_v = q.stride(1), k.stride(1), v.stride(1)
+        stride_a, stride_b = a.stride(0), b.stride(0)
     if inplace_final_state:
         final_state = initial_state
     else:
@@ -241,14 +262,14 @@ def fused_sigmoid_gating_delta_rule_update(
     grid = (NK, NV, N * HV)
     fused_sigmoid_gating_delta_rule_update_kernel[grid](
         A_log=A_log,
-        a=a.contiguous(),
-        b=b.contiguous(),
+        a=a,
+        b=b,
         dt_bias=dt_bias,
         beta=beta,
         threshold=threshold,
-        q=q.contiguous(),
-        k=k.contiguous(),
-        v=v.contiguous(),
+        q=q,
+        k=k,
+        v=v,
         o=o,
         h0=initial_state,
         ht=final_state,
@@ -265,6 +286,11 @@ def fused_sigmoid_gating_delta_rule_update(
         V=V,
         BK=BK,
         BV=BV,
+        stride_q=stride_q,
+        stride_k=stride_k,
+        stride_v=stride_v,
+        stride_a=stride_a,
+        stride_b=stride_b,
         stride_init_state_token=stride_init_state_token,
         stride_final_state_token=stride_final_state_token,
         stride_indices_seq=stride_indices_seq,

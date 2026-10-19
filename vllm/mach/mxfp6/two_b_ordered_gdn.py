@@ -18,7 +18,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent
 # Includes the 3D normalization and indexed BF16 prefill state-pool paths.
 # The wrappers materialize pending state before delegating to that prefill.
-GDN_SHA = "527129188bf20d9aaea05f62432b38a419f4fb4a77ad91fd1194b6be6cced31c"
+GDN_SHA = "ea5a6a65ebcc2e485ccd7b68798bcd2baab93703a0f40ede5624ba518860e8a0"
 # vllm-shpgy carries the request-deadline/cancellation cleanup in the runner;
 # keep the lifecycle guard pinned to that exact local source revision.
 RUNNER_SHA = "bb2fe1945e9d6c5f43eb28dc8e94fb7bbe1d02956147ca5518a99a232b0c4951"

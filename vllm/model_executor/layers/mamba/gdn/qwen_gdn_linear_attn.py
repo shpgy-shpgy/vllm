@@ -1751,10 +1751,24 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             core_attn_out_spec, last_recurrent_state = None, None
 
         # 2.2: Process non-spec-decode part
+        strided_decode = (
+            split_non_spec
+            and self._is_sm120
+            and self.tp_size == 1
+            and self.num_k_heads == self.num_v_heads == 16
+            and self.head_k_dim == self.head_v_dim == 128
+            and mixed_qkv_non_spec is not None
+            and ssm_state.dtype == mixed_qkv_non_spec.dtype == torch.bfloat16
+            and mixed_qkv_non_spec.stride(-1) == 1
+            and a.stride(-1) == b.stride(-1) == 1
+            and core_attn_out.is_contiguous()
+        )
         if split_non_spec:
-            query_decode, key_decode, value_decode = self.rearrange_mixed_qkv(
-                mixed_qkv_non_spec[:num_decode_tokens]  # type: ignore[index]
-            )
+            query_decode, key_decode, value_decode = (
+                self.rearrange_mixed_qkv_flashinfer
+                if strided_decode
+                else self.rearrange_mixed_qkv
+            )(mixed_qkv_non_spec[:num_decode_tokens])  # type: ignore[index]
             core_attn_out_decode, _ = fused_sigmoid_gating_delta_rule_update(
                 A_log=self.A_log,
                 a=a[:num_decode_tokens],
@@ -1770,6 +1784,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 ],
                 ssm_state_indices=non_spec_state_indices_tensor,
                 use_qk_l2norm_in_kernel=True,
+                output=(
+                    core_attn_out[:num_decode_tokens].unsqueeze(0)
+                    if strided_decode
+                    else None
+                ),
             )
         else:
             core_attn_out_decode = None
