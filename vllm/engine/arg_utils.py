@@ -2978,7 +2978,7 @@ class EngineArgs:
 class AsyncEngineArgs(EngineArgs):
     """Arguments for asynchronous vLLM engine."""
 
-    enable_log_requests: bool = False
+    enable_log_requests: bool = True
 
     @staticmethod
     def add_cli_args(
