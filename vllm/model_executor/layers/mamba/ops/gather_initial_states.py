@@ -81,3 +81,55 @@ def gather_initial_states(
         launch_pdl=current_platform.is_arch_support_pdl(),
     )
     return output
+
+
+@triton.jit
+def _zero_uninitialized_states_kernel(
+    state_ptr,
+    indices_ptr,
+    has_initial_state_ptr,
+    stride_state_batch: tl.constexpr,
+    stride_indices: tl.constexpr,
+    stride_has_initial_state: tl.constexpr,
+    row_size: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offsets = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    if not tl.load(has_initial_state_ptr + row * stride_has_initial_state):
+        slot = tl.load(indices_ptr + row * stride_indices).to(tl.int64)
+        tl.store(
+            state_ptr + slot * stride_state_batch + offsets,
+            0,
+            mask=offsets < row_size,
+        )
+
+
+def zero_uninitialized_states(
+    state: torch.Tensor,
+    indices: torch.Tensor,
+    has_initial_state: torch.Tensor,
+) -> None:
+    """Zero new sequence slots in place; indices must be unique and valid.
+
+    Inner state rows must be dense. Page padding and cached slots are preserved.
+    """
+    assert state.is_cuda and state.ndim >= 2
+    assert indices.ndim == 1 and has_initial_state.shape == indices.shape
+    assert indices.device == state.device == has_initial_state.device
+    assert indices.dtype in (torch.int32, torch.int64)
+    assert has_initial_state.dtype == torch.bool
+    row_size = 1
+    for size, stride in zip(reversed(state.shape[1:]), reversed(state.stride()[1:])):
+        assert stride == row_size
+        row_size *= size
+    _zero_uninitialized_states_kernel[(indices.numel(), triton.cdiv(row_size, 1024))](
+        state,
+        indices,
+        has_initial_state,
+        state.stride(0),
+        indices.stride(0),
+        has_initial_state.stride(0),
+        row_size,
+        1024,
+    )

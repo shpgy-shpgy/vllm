@@ -3,6 +3,7 @@
 """Inference-only Qwen3-Next/Qwen3.5 model."""
 
 import functools
+import inspect
 import os
 from typing import Literal
 
@@ -39,6 +40,9 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
 from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
+)
+from vllm.model_executor.layers.mamba.ops.gather_initial_states import (
+    zero_uninitialized_states,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.auto_awq import AutoAWQConfig
@@ -288,6 +292,17 @@ def _log_gdn_backend_decision(
         )
 
 
+@functools.cache
+def _flashinfer_supports_indexed_prefill_state() -> bool:
+    from flashinfer.gdn_prefill import chunk_gated_delta_rule
+
+    try:
+        parameters = inspect.signature(chunk_gated_delta_rule).parameters
+    except (TypeError, ValueError):
+        return False
+    return "state_indices" in parameters and "output_state" in parameters
+
+
 def fi_chunk_gated_delta_rule(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -299,6 +314,7 @@ def fi_chunk_gated_delta_rule(
     cu_seqlens: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = True,
     output: torch.Tensor | None = None,
+    state_indices: torch.Tensor | None = None,
 ):
     from flashinfer.gdn_prefill import (
         chunk_gated_delta_rule as chunk_gated_delta_rule_fi,
@@ -315,7 +331,15 @@ def fi_chunk_gated_delta_rule(
 
     g = g.squeeze(0).contiguous()
     beta = beta.squeeze(0).contiguous()
-    fi_state = initial_state.to(torch.float32)
+    # Indexed SM120 prefill reads and writes the BF16 cache directly.
+    fi_state = (
+        initial_state if state_indices is not None else initial_state.to(torch.float32)
+    )
+    state_kwargs = (
+        {"state_indices": state_indices, "output_state": initial_state}
+        if state_indices is not None
+        else {}
+    )
     fi_g = g.to(torch.float32)
     fi_beta = beta.to(torch.float32)
     if cu_seqlens is not None:
@@ -330,6 +354,7 @@ def fi_chunk_gated_delta_rule(
         output_final_state=output_final_state,
         cu_seqlens=cu_seqlens,
         output=output,
+        **state_kwargs,
     )
     # FlashInfer returns (output, state) when output_final_state=True,
     # or just output when output_final_state=False.
@@ -639,6 +664,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         self.chunk_gated_delta_rule = ChunkGatedDeltaRule()
         self.gdn_prefill_backend = self.chunk_gated_delta_rule.gdn_prefill_backend
+        self._use_indexed_prefill_state = (
+            self._is_sm120
+            and self.gdn_prefill_backend == "flashinfer"
+            and _flashinfer_supports_indexed_prefill_state()
+        )
         self._prefill_kernels_warmed_up = False
         self.enable_packed_recurrent_decode = (
             envs.VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE
@@ -1039,12 +1069,18 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         The RMSNormGated + quant sequence is eligible for fusion
         by the compilation pass when fuse_norm_quant is enabled.
         """
-        z_shape_og = z.shape
-        core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
-        z = z.reshape(-1, z.shape[-1])
-        core_attn_out = self.norm(core_attn_out, z)
-        core_attn_out = core_attn_out.reshape(z_shape_og)
-        core_attn_out = core_attn_out.flatten(-2)  # ... h d -> ... (h d)
+        if current_platform.is_cuda() and core_attn_out.ndim == z.ndim == 3:
+            # Keep the head axis through normalization: flattening it first
+            # can make Inductor materialize an identity copy before out_proj.
+            core_attn_out = self.norm(core_attn_out, z)
+            core_attn_out = core_attn_out.reshape(-1, self.value_dim // self.tp_size)
+        else:
+            z_shape_og = z.shape
+            core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
+            z = z.reshape(-1, z.shape[-1])
+            core_attn_out = self.norm(core_attn_out, z)
+            core_attn_out = core_attn_out.reshape(z_shape_og)
+            core_attn_out = core_attn_out.flatten(-2)  # ... h d -> ... (h d)
         output, _ = self.out_proj(core_attn_out)
         return output
 
@@ -1748,8 +1784,24 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             prefill_has_initial_state = attn_metadata.prefill_has_initial_state
             assert prefill_state_indices is not None
             assert prefill_has_initial_state is not None
-            initial_state = ssm_state[prefill_state_indices]
-            initial_state[~prefill_has_initial_state, ...] = 0
+            indexed_prefill_state = (
+                self._use_indexed_prefill_state
+                and spec_sequence_masks is None
+                and query_non_spec.dtype == torch.bfloat16
+                and tuple(query_non_spec.shape[-2:]) == (16, 128)
+                and ssm_state.dtype == torch.bfloat16
+                and tuple(ssm_state.shape[1:]) == (16, 128, 128)
+                and tuple(ssm_state.stride()[1:]) == (16384, 128, 1)
+                and prefill_state_indices.is_contiguous()
+            )
+            if indexed_prefill_state:
+                zero_uninitialized_states(
+                    ssm_state, prefill_state_indices, prefill_has_initial_state
+                )
+                initial_state = ssm_state
+            else:
+                initial_state = ssm_state[prefill_state_indices]
+                initial_state[~prefill_has_initial_state, ...] = 0
 
             # For a non-speculative batch the prefill rows are contiguous in
             # the caller-owned output.  Let the chunk kernel write there
@@ -1763,25 +1815,44 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 prefill_output = core_attn_out[prefill_start:num_actual_tokens]
             else:
                 prefill_output = None
-            (
-                core_attn_out_non_spec,
-                last_recurrent_state,
-            ) = self.chunk_gated_delta_rule(
-                q=query_non_spec,
-                k=key_non_spec,
-                v=value_non_spec,
-                g=g_non_spec,
-                beta=beta_non_spec,
-                initial_state=initial_state,
-                output_final_state=True,
-                cu_seqlens=attn_metadata.prefill_query_start_loc,
-                chunk_indices=attn_metadata.chunk_indices,
-                chunk_offsets=attn_metadata.chunk_offsets,
-                use_qk_l2norm_in_kernel=False,
-                core_attn_out=prefill_output,
-            )
-            # Init cache
-            ssm_state[prefill_state_indices] = last_recurrent_state.to(ssm_state.dtype)
+            if indexed_prefill_state:
+                core_attn_out_non_spec, last_recurrent_state = (
+                    fi_chunk_gated_delta_rule(
+                        q=query_non_spec,
+                        k=key_non_spec,
+                        v=value_non_spec,
+                        g=g_non_spec,
+                        beta=beta_non_spec,
+                        initial_state=initial_state,
+                        output_final_state=True,
+                        cu_seqlens=attn_metadata.prefill_query_start_loc,
+                        use_qk_l2norm_in_kernel=False,
+                        output=prefill_output,
+                        state_indices=prefill_state_indices,
+                    )
+                )
+            else:
+                (
+                    core_attn_out_non_spec,
+                    last_recurrent_state,
+                ) = self.chunk_gated_delta_rule(
+                    q=query_non_spec,
+                    k=key_non_spec,
+                    v=value_non_spec,
+                    g=g_non_spec,
+                    beta=beta_non_spec,
+                    initial_state=initial_state,
+                    output_final_state=True,
+                    cu_seqlens=attn_metadata.prefill_query_start_loc,
+                    chunk_indices=attn_metadata.chunk_indices,
+                    chunk_offsets=attn_metadata.chunk_offsets,
+                    use_qk_l2norm_in_kernel=False,
+                    core_attn_out=prefill_output,
+                )
+                # Init cache
+                ssm_state[prefill_state_indices] = last_recurrent_state.to(
+                    ssm_state.dtype
+                )
 
             if split_non_spec:
                 # The runner already keeps non-spec requests decode-first.  Write
