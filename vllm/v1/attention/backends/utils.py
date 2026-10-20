@@ -1154,6 +1154,12 @@ def mamba_get_block_table_tensor(
         return block_table
     else:
         assert isinstance(kv_cache_spec, MambaSpec)
+        if block_table.is_cuda and seq_lens.is_cuda:
+            from vllm.v1.attention.ops.mamba_state_indices import (
+                get_aligned_mamba_block_table,
+            )
+
+            return get_aligned_mamba_block_table(block_table, seq_lens, kv_cache_spec)
         # NOTE: For 0-length requests in CUDA graph, use a start_index of 0
         # to handle the invalid block table.
         start_indices = (seq_lens - 1) // kv_cache_spec.block_size
